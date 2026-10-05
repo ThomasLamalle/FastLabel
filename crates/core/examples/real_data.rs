@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use fastlabel_core::coco::CocoFile;
-use fastlabel_core::matching::{Thresholds, evaluate};
+use fastlabel_core::matching::evaluate;
 use fastlabel_core::{Project, versions};
 
 fn main() {
@@ -35,7 +35,7 @@ fn main() {
     }
     if let Some(preds) = &project.predictions {
         let t = Instant::now();
-        let ev = evaluate(&project.dataset, preds, Thresholds::default());
+        let ev = evaluate(&project.dataset, preds);
         println!("evaluate {} predictions in {:?}: {:?}", preds.len(), t.elapsed(), ev.counts);
     }
 }

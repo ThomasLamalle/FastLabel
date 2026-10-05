@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use fastlabel_core::matching::{Thresholds, evaluate};
+use fastlabel_core::matching::evaluate;
 use fastlabel_core::project::SaveReport;
 use fastlabel_core::{AnnMark, Evaluation, Op, PredMark, Project};
 use fastlabel_core::{PredRef, Predictions};
@@ -44,7 +44,6 @@ pub struct PendingCounts {
 pub struct Workspace {
     pub project: Project,
     pub eval: Option<Evaluation>,
-    pub thresholds: Thresholds,
     pub opts: ViewOptions,
     pub crops: Vec<Crop>,
     pub selected: usize,
@@ -60,18 +59,12 @@ pub struct Workspace {
 pub type ActionResult = Result<(), String>;
 
 impl Workspace {
-    pub fn open(
-        dir: &Path,
-        opts: ViewOptions,
-        thresholds: Thresholds,
-        columns: usize,
-    ) -> anyhow::Result<Self> {
+    pub fn open(dir: &Path, opts: ViewOptions, columns: usize) -> anyhow::Result<Self> {
         let project = Project::open(dir)?;
         let uniformity = Uniformity::load(&project.state_dir().join(metrics::METRICS_FILE));
         let mut ws = Self {
             project,
             eval: None,
-            thresholds,
             opts,
             crops: Vec::new(),
             selected: 0,
@@ -93,8 +86,7 @@ impl Workspace {
     pub fn rebuild(&mut self) {
         let keep = self.selected_crop().map(|c| c.id);
         let p = &self.project;
-        self.eval =
-            p.predictions.as_ref().map(|preds| evaluate(&p.dataset, preds, self.thresholds));
+        self.eval = p.predictions.as_ref().map(|preds| evaluate(&p.dataset, preds));
         if !self.has_predictions() {
             self.opts.fp_only = false;
             self.opts.fn_only = false;
@@ -239,14 +231,12 @@ impl Workspace {
         if mark == Mark::Frame {
             return Ok(self.frame_delete_ops(crop.image_id));
         }
+        let op = Self::op_for(crop, mark).ok_or("R needs a GT box paired with a prediction")?;
+        // Deciding on a box of a frame marked F keeps the frame after all.
         if self.project.log.state().is_frame_deleted(crop.image_id) {
-            return Err(
-                "This frame is marked for deletion (F); press F on it to unmark it first".into()
-            );
+            return Ok(vec![Op::FrameDelete { image: crop.image_id }, op]);
         }
-        Self::op_for(crop, mark)
-            .map(|op| vec![op])
-            .ok_or_else(|| "R needs a GT box with a matched prediction".into())
+        Ok(vec![op])
     }
 
     fn record_all(&mut self, mut ops: Vec<Op>) -> ActionResult {
@@ -286,7 +276,7 @@ impl Workspace {
     }
 
     /// Toggles `mark` on each crop from the selection to the end of its row
-    /// (each frame once for F; crops of deleted frames are skipped for D / G),
+    /// (each frame once for F; D / G / R unmark frames marked F),
     /// as one undo step, then selects the first crop of the next row.
     pub fn mark_row(&mut self, mark: Mark) -> ActionResult {
         if self.crops.is_empty() {
@@ -298,15 +288,16 @@ impl Workspace {
         let mut frames = Vec::new();
         for i in self.selected..end {
             let crop = self.crops[i];
-            if mark == Mark::Frame {
-                if frames.contains(&crop.image_id) {
-                    continue;
-                }
-                frames.push(crop.image_id);
-            } else if self.project.log.state().is_frame_deleted(crop.image_id) {
+            let first_of_frame = !frames.contains(&crop.image_id);
+            frames.push(crop.image_id);
+            if mark == Mark::Frame && !first_of_frame {
                 continue;
             }
-            if let Ok(o) = self.ops_for(&crop, mark) {
+            if let Ok(mut o) = self.ops_for(&crop, mark) {
+                // Unmark a frame only once, even with several crops on it.
+                if !first_of_frame {
+                    o.retain(|op| !matches!(op, Op::FrameDelete { .. }));
+                }
                 ops.extend(o);
             }
         }
@@ -516,9 +507,7 @@ mod tests {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, b"x").unwrap();
         }
-        let ws =
-            Workspace::open(dir.path(), ViewOptions::default(), Thresholds::default(), columns)
-                .unwrap();
+        let ws = Workspace::open(dir.path(), ViewOptions::default(), columns).unwrap();
         (dir, ws)
     }
 
@@ -604,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_deletion_excludes_box_marks() {
+    fn frame_deletion_and_box_marks_exclude_each_other() {
         let (_d, mut ws) = open_fixture(2);
         ws.mark_selected(Mark::Good).unwrap(); // #1 confirmed
         ws.select(3);
@@ -614,13 +603,22 @@ mod tests {
         assert!(ws.marks_of(&ws.crops[0]).frame_deleted);
         assert_eq!(ws.marks_of(&ws.crops[0]).mark, None, "F cleared the G mark");
         assert_eq!(ws.marks_of(&ws.crops[3]).mark, None, "and the accepted prediction");
+
+        // D on a box of the deleted frame: applied, and the frame is kept.
         ws.select(1);
-        assert!(ws.mark_selected(Mark::Delete).is_err(), "D refused on a deleted frame");
-        assert!(ws.mark_selected(Mark::Good).is_err());
-        ws.undo().unwrap(); // one step restores the marks
-        assert_eq!(ws.marks_of(&ws.crops[0]).mark, Some(Mark::Good));
-        assert_eq!(ws.marks_of(&ws.crops[3]).mark, Some(Mark::Good));
+        ws.mark_selected(Mark::Delete).unwrap();
+        assert_eq!(ws.marks_of(&ws.crops[1]).mark, Some(Mark::Delete));
+        assert!(!ws.marks_of(&ws.crops[1]).frame_deleted);
+        ws.undo().unwrap(); // one step: frame deleted again, no D
+        assert!(ws.marks_of(&ws.crops[1]).frame_deleted);
+        assert_eq!(ws.marks_of(&ws.crops[1]).mark, None);
+
+        // A row action unmarks the frame once and marks every crop.
+        ws.select(0);
+        ws.mark_row(Mark::Delete).unwrap();
         assert!(!ws.marks_of(&ws.crops[0]).frame_deleted);
+        assert_eq!(ws.marks_of(&ws.crops[0]).mark, Some(Mark::Delete));
+        assert_eq!(ws.marks_of(&ws.crops[1]).mark, Some(Mark::Delete));
     }
 
     #[test]
@@ -686,17 +684,6 @@ mod tests {
         assert_eq!(preds.model, "m2");
         assert_eq!(preds.of(0).unwrap().len(), 0);
         assert_eq!(ws.opts.sort, crops::SortKey::Iou);
-    }
-
-    #[test]
-    fn thresholds_change_classification() {
-        let (_d, mut ws) = open_fixture(2);
-        assert_eq!(ws.crops[0].status, crate::crops::CropStatus::Tp);
-        ws.thresholds.match_iou = 0.95; // TP had IoU 0.82
-        ws.rebuild();
-        assert_eq!(ws.crops[0].status, crate::crops::CropStatus::Fn);
-        // The once-matched prediction is now an extra FP crop.
-        assert_eq!(ws.crops.iter().filter(|c| c.is_pred()).count(), 2);
     }
 
     #[test]

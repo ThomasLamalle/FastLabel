@@ -429,7 +429,6 @@ fn stress_100k() {
     assert!(!h.state().ws().project.log.is_dirty());
 
     let t = std::time::Instant::now();
-    h.state_mut().ws_mut().thresholds.match_iou = 0.9;
     h.state_mut().ws_mut().rebuild();
     println!("re-evaluate + rebuild 200k crops: {:?}", t.elapsed());
     println!("RSS after scrolling: +{:.0} MB", rss_mb() - base);

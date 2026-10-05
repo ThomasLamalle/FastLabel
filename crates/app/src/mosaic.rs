@@ -159,9 +159,10 @@ fn tooltip(ws: &Workspace, crop: &Crop, slot: Option<&Slot>) -> String {
     let b = crop.primary();
     let mut lines = vec![img.file_name.clone(), format!("{:.0} × {:.0} px", b.w, b.h)];
     let status = match crop.status {
-        CropStatus::Tp => "TP",
-        CropStatus::Fn => "FN",
-        CropStatus::Fp => "FP (prediction only)",
+        CropStatus::Matched => "paired with a prediction",
+        CropStatus::Fn => "FN: no prediction overlaps this box",
+        CropStatus::Fp => "FP: overlaps no GT box",
+        CropStatus::Extra => "extra: overlaps a box already paired (duplicate?)",
         CropStatus::Unpredicted => "not predicted",
     };
     match crop.iou {
@@ -305,9 +306,10 @@ fn paint_cell(
         left_color,
     );
     let status = match crop.status {
-        CropStatus::Tp => format!("TP {:.2}", crop.iou.unwrap_or(0.0)),
+        CropStatus::Matched => format!("IoU {:.2}", crop.iou.unwrap_or(0.0)),
         CropStatus::Fn => "FN".into(),
         CropStatus::Fp => "FP".into(),
+        CropStatus::Extra => "extra".into(),
         CropStatus::Unpredicted => String::new(),
     };
     let right =

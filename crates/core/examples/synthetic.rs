@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use fastlabel_core::coco::{CocoAnnotation, CocoCategory, CocoFile, CocoImage};
 use fastlabel_core::commit::apply;
-use fastlabel_core::matching::{Thresholds, evaluate};
+use fastlabel_core::matching::evaluate;
 use fastlabel_core::review::ReviewState;
 use fastlabel_core::{AnnMark, BBox, Dataset, EditLog, Op, PredRef, Predictions};
 use serde_json::Map;
@@ -65,7 +65,7 @@ fn main() {
     println!("index        {:?}", t.elapsed());
 
     let t = Instant::now();
-    let ev = evaluate(&ds, &preds, Thresholds::default());
+    let ev = evaluate(&ds, &preds);
     println!("evaluate     {:?} {:?}", t.elapsed(), ev.counts);
 
     let mut log = EditLog::new(ds.coco.next_annotation_id());

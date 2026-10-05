@@ -92,9 +92,7 @@ impl Workspace {
 
     /// D / G on the editor selection.
     pub fn mark_sel(&mut self, mark: Mark) -> ActionResult {
-        if self.frame.sel.is_some() && self.is_frame_deleted(self.frame.image_idx) {
-            return Err("This frame is marked for deletion (F); press F to unmark it first".into());
-        }
+        let keep_frame = self.frame.sel.is_some() && self.is_frame_deleted(self.frame.image_idx);
         let op = match (self.frame.sel, mark) {
             (Some(Sel::Gt(ann)), Mark::Delete) => Op::AnnMark { ann, mark: AnnMark::Delete },
             (Some(Sel::Gt(ann)), Mark::Good) => Op::AnnMark { ann, mark: AnnMark::Confirm },
@@ -103,6 +101,11 @@ impl Workspace {
             (None, _) => return Err("Select a box first".into()),
             _ => return Ok(()),
         };
+        if keep_frame {
+            // Deciding on a box of a frame marked F keeps the frame after all.
+            let image = self.project.dataset.images()[self.frame.image_idx].id;
+            return self.record(Op::Group { ops: vec![Op::FrameDelete { image }, op] });
+        }
         self.record(op)
     }
 
@@ -226,7 +229,6 @@ impl Workspace {
 mod tests {
     use super::*;
     use crate::crops::ViewOptions;
-    use fastlabel_core::matching::Thresholds;
     use std::fs;
 
     fn open() -> (tempfile::TempDir, Workspace) {
@@ -239,8 +241,7 @@ mod tests {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(p, b"x").unwrap();
         }
-        let ws =
-            Workspace::open(dir.path(), ViewOptions::default(), Thresholds::default(), 2).unwrap();
+        let ws = Workspace::open(dir.path(), ViewOptions::default(), 2).unwrap();
         (dir, ws)
     }
 
@@ -311,8 +312,8 @@ mod tests {
         ws.mark_sel(Mark::Good).unwrap();
         ws.toggle_frame_delete().unwrap();
         assert_eq!(ws.frame_boxes(0)[0].mark, None, "F cleared the mark");
-        assert!(ws.mark_sel(Mark::Delete).is_err());
-        ws.toggle_frame_delete().unwrap();
         ws.mark_sel(Mark::Delete).unwrap();
+        assert!(!ws.is_frame_deleted(0), "D unmarked the frame");
+        assert_eq!(ws.frame_boxes(0)[0].mark, Some(Mark::Delete));
     }
 }

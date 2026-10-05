@@ -49,8 +49,8 @@ All D/F/G marks are **toggles** (press again to undo the mark) and **auto-advanc
 
 - 'D' : on a GT crop, mark the annotation for deletion. On a prediction crop, reject the prediction (persisted, so it does not come back after the next model run). Display a red 'D' on the top right of the crop.
 - 'G' : on a prediction crop, accept the prediction into the dataset. On a GT crop, confirm it as good. Display a green 'G' on the top right corner of the crop.
-- 'F' : delete the frame associated with the crop. Display 'F' on all crops of this frame. Advances to the next undecided crop of a different frame. F is exclusive with D/G/R: marking a frame clears the D/G/R marks of its crops (same undo step), and D/G/R are refused on a frame marked F.
-- 'R' : on a TP crop, replace the GT box geometry with the prediction's box (tightens sloppy boxes). Display an orange 'R'.
+- 'F' : delete the frame associated with the crop. Display 'F' on all crops of this frame. Advances to the next undecided crop of a different frame. F is exclusive with D/G/R: marking a frame clears the D/G/R marks of its crops, and D/G/R on a crop of a frame marked F applies the mark and unmarks the frame (each in one undo step).
+- 'R' : on a paired crop (GT + prediction), replace the GT box geometry with the prediction's box (tightens sloppy boxes). Display an orange 'R'.
 - Shift + D/F/G : toggle the shortcut for each crop from the selected one to the end of the row (each frame once for F), then select the first crop of the next row.
 - D/F/G/R do not trigger instant deletion/acceptance, otherwise it would be laggy and constantly change the mosaic layout. The actual change is applied when saving.
 - 'U' / Ctrl+Z : undo the last action (Ctrl+Shift+Z / Ctrl+Y : redo). Undo history covers everything since the last save.
@@ -84,21 +84,12 @@ Others:
 ### Filters
 
 Similar to sorting, toggle buttons allow to:
-- display only FP: predictions with no intersection with a GT annotation, or with best IoU below a tunable threshold (default **0.3**)
-- display only FN: GT with no intersection with a prediction, or with best IoU below a tunable threshold (default **0.3**)
+- display only FP: predictions overlapping no GT box (IoU 0 with all of them)
+- display only FN: GT boxes overlapping no prediction
 - hide reviewed crops
 - filter by split
 
-Thresholds (all adjustable in the UI, remembered between sessions):
-
-| Threshold | Default | Role |
-|---|---:|---|
-| Match IoU | 0.5 | One-to-one greedy GT↔prediction matching (TP / IoU sort) |
-| FP filter IoU | 0.3 | Prediction whose best IoU with any GT is below → FP filter |
-| FN filter IoU | 0.3 | GT whose best IoU with any prediction is below → FN filter |
-| Inference confidence | 0.10 | Minimum score kept when running the model |
-
-The 0.3 filter defaults isolate real misses; loose-but-overlapping boxes (0.3–0.5) are found with the IoU ascending sort.
+No thresholds to tune. Each GT box is paired with its best-overlapping prediction (any overlap); the pair is shown in one crop with its IoU, and loose boxes are found with the IoU ascending sort. An unpaired prediction overlapping an already paired GT (a duplicate) is labelled "extra".
 
 
 ## Frame mode

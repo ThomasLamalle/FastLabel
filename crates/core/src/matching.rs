@@ -1,66 +1,68 @@
-//! GT ↔ prediction comparison.
+//! GT ↔ prediction comparison, without thresholds.
 //!
-//! Matching is one-to-one, same category, greedy by highest IoU, accepting
-//! pairs with IoU ≥ `match_iou` (TP). Independently, each box records its best
-//! IoU against any box of the other kind, which drives the FP / FN filters.
-
-use serde::{Deserialize, Serialize};
+//! Each GT box is paired one-to-one with a same-category prediction, highest
+//! IoU first, as long as they overlap at all (IoU > 0). Then:
+//! - FP: a prediction that overlaps no GT box (IoU 0 with all of them);
+//! - FN: a GT box that overlaps no prediction;
+//! - extra: an unpaired prediction overlapping a GT already paired with a
+//!   better prediction (a duplicate), and symmetrically an unpaired GT.
+//!
+//! How well a pair agrees is its IoU, used for sorting.
 
 use crate::dataset::Dataset;
 use crate::predictions::Predictions;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Thresholds {
-    pub match_iou: f64,
-    pub fp_iou: f64,
-    pub fn_iou: f64,
-}
-
-impl Default for Thresholds {
-    fn default() -> Self {
-        Self { match_iou: 0.5, fp_iou: 0.3, fn_iou: 0.3 }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GtStatus {
+    /// Paired with a prediction.
+    Matched,
+    /// Overlaps no prediction.
+    Fn,
+    /// Overlaps only predictions paired with other GT boxes.
+    Unmatched,
+    /// The image has no evaluated predictions.
+    Unpredicted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GtStatus {
-    Tp,
-    Fn,
-    /// The image has no evaluated predictions.
-    Unpredicted,
+pub enum PredStatus {
+    Matched,
+    /// Overlaps no GT box.
+    Fp,
+    /// Overlaps only GT boxes paired with other predictions (duplicate).
+    Extra,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GtEval {
     pub status: GtStatus,
-    /// Index of the matched prediction within its image.
+    /// Index of the paired prediction within its image.
     pub matched: Option<usize>,
-    /// Matched IoU (TP), 0 (FN) or `None` (unpredicted).
+    /// Paired IoU, 0 when unpaired, `None` when unpredicted.
     pub iou: Option<f64>,
-    /// Best IoU against any same-category prediction, `None` when unpredicted.
-    pub best_iou: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PredEval {
-    /// Index of the matched annotation in `Dataset::annotations()`.
+    pub status: PredStatus,
+    /// Index of the paired annotation in `Dataset::annotations()`.
     pub matched: Option<usize>,
-    /// Matched IoU, 0 when unmatched.
+    /// Paired IoU, 0 when unpaired.
     pub iou: f64,
-    pub best_iou: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
-    pub tp: usize,
+    pub matched: usize,
     pub fp: usize,
     pub fn_: usize,
+    /// Unpaired predictions and GT boxes that still overlap something.
+    pub extra: usize,
     pub unpredicted_images: usize,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Evaluation {
-    pub thresholds: Thresholds,
     /// Indexed like `Dataset::annotations()`.
     pub gt: Vec<GtEval>,
     /// Per image index, per prediction (empty for unpredicted images).
@@ -69,18 +71,17 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
-    pub fn is_fp_candidate(&self, image_idx: usize, pred_idx: usize) -> bool {
-        self.preds[image_idx][pred_idx].best_iou < self.thresholds.fp_iou
+    pub fn is_fp(&self, image_idx: usize, pred_idx: usize) -> bool {
+        self.preds[image_idx][pred_idx].status == PredStatus::Fp
     }
 
-    pub fn is_fn_candidate(&self, ann_idx: usize) -> bool {
-        self.gt[ann_idx].best_iou.is_some_and(|b| b < self.thresholds.fn_iou)
+    pub fn is_fn(&self, ann_idx: usize) -> bool {
+        self.gt[ann_idx].status == GtStatus::Fn
     }
 }
 
-pub fn evaluate(ds: &Dataset, preds: &Predictions, thresholds: Thresholds) -> Evaluation {
-    let unpredicted =
-        GtEval { status: GtStatus::Unpredicted, matched: None, iou: None, best_iou: None };
+pub fn evaluate(ds: &Dataset, preds: &Predictions) -> Evaluation {
+    let unpredicted = GtEval { status: GtStatus::Unpredicted, matched: None, iou: None };
     let mut gt = vec![unpredicted; ds.annotations().len()];
     let mut per_image = Vec::with_capacity(ds.images().len());
     let mut counts = Counts::default();
@@ -92,53 +93,54 @@ pub fn evaluate(ds: &Dataset, preds: &Predictions, thresholds: Thresholds) -> Ev
             per_image.push(Vec::new());
             continue;
         };
-        let anns: Vec<(usize, _)> = ds
-            .annotations_of(image_idx)
-            .map(|a| (ds.ann_idx(a.id).expect("indexed annotation"), a))
-            .collect();
+        let anns: Vec<(usize, _)> =
+            ds.annotations_of(image_idx).map(|a| (ds.ann_idx(a.id).expect("indexed"), a)).collect();
         let mut pevals =
-            vec![PredEval { matched: None, iou: 0.0, best_iou: 0.0 }; image_preds.len()];
-        for &(ai, _) in &anns {
-            gt[ai] =
-                GtEval { status: GtStatus::Fn, matched: None, iou: Some(0.0), best_iou: Some(0.0) };
-        }
-
+            vec![PredEval { status: PredStatus::Fp, matched: None, iou: 0.0 }; image_preds.len()];
+        let mut gt_overlaps = vec![false; anns.len()];
         pairs.clear();
-        for (ai, ann) in &anns {
+        for (k, (ai, ann)) in anns.iter().enumerate() {
             for (pi, pred) in image_preds.iter().enumerate() {
                 if pred.category_id != ann.category_id {
                     continue;
                 }
                 let iou = ann.bbox.iou(&pred.bbox);
-                let g = &mut gt[*ai];
-                g.best_iou = Some(g.best_iou.unwrap_or(0.0).max(iou));
-                pevals[pi].best_iou = pevals[pi].best_iou.max(iou);
-                if iou >= thresholds.match_iou && iou > 0.0 {
+                if iou > 0.0 {
+                    gt_overlaps[k] = true;
+                    pevals[pi].status = PredStatus::Extra;
                     pairs.push((iou, *ai, pi));
                 }
             }
         }
         pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        for (k, (ai, _)) in anns.iter().enumerate() {
+            let status = if gt_overlaps[k] { GtStatus::Unmatched } else { GtStatus::Fn };
+            gt[*ai] = GtEval { status, matched: None, iou: Some(0.0) };
+        }
         for &(iou, ai, pi) in &pairs {
             if gt[ai].matched.is_none() && pevals[pi].matched.is_none() {
-                gt[ai].status = GtStatus::Tp;
-                gt[ai].matched = Some(pi);
-                gt[ai].iou = Some(iou);
-                pevals[pi].matched = Some(ai);
-                pevals[pi].iou = iou;
+                gt[ai] = GtEval { status: GtStatus::Matched, matched: Some(pi), iou: Some(iou) };
+                pevals[pi] = PredEval { status: PredStatus::Matched, matched: Some(ai), iou };
             }
         }
-        for &(ai, _) in &anns {
-            match gt[ai].status {
-                GtStatus::Tp => counts.tp += 1,
+        for (ai, _) in &anns {
+            match gt[*ai].status {
+                GtStatus::Matched => counts.matched += 1,
                 GtStatus::Fn => counts.fn_ += 1,
+                GtStatus::Unmatched => counts.extra += 1,
                 GtStatus::Unpredicted => {}
             }
         }
-        counts.fp += pevals.iter().filter(|p| p.matched.is_none()).count();
+        for p in &pevals {
+            match p.status {
+                PredStatus::Fp => counts.fp += 1,
+                PredStatus::Extra => counts.extra += 1,
+                PredStatus::Matched => {}
+            }
+        }
         per_image.push(pevals);
     }
-    Evaluation { thresholds, gt, preds: per_image, counts }
+    Evaluation { gt, preds: per_image, counts }
 }
 
 #[cfg(test)]
@@ -163,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_tp_fn_fp_and_unpredicted() {
+    fn classifies_matched_fp_fn_and_unpredicted() {
         let a = BBox::new(0.0, 0.0, 10.0, 10.0);
         let far = BBox::new(50.0, 50.0, 10.0, 10.0);
         let ds = dataset(2, &[(1, a), (1, far), (2, a)]);
@@ -172,38 +174,35 @@ mod tests {
             &[(0, BBox::new(1.0, 0.0, 10.0, 10.0)), (0, BBox::new(80.0, 80.0, 5.0, 5.0))],
             &[0],
         );
-        let ev = evaluate(&ds, &preds, Thresholds::default());
-        assert_eq!(ev.gt[0].status, GtStatus::Tp);
+        let ev = evaluate(&ds, &preds);
+        assert_eq!(ev.gt[0].status, GtStatus::Matched);
         assert!((ev.gt[0].iou.unwrap() - 90.0 / 110.0).abs() < 1e-9);
-        assert_eq!(ev.gt[1].status, GtStatus::Fn);
+        assert!(ev.is_fn(1));
         assert_eq!(ev.gt[2].status, GtStatus::Unpredicted);
-        assert_eq!(ev.counts, Counts { tp: 1, fp: 1, fn_: 1, unpredicted_images: 1 });
-        assert!(ev.is_fp_candidate(0, 1));
-        assert!(!ev.is_fp_candidate(0, 0));
-        assert!(ev.is_fn_candidate(1));
-        assert!(!ev.is_fn_candidate(2), "unpredicted is never FN");
+        assert!(!ev.is_fn(2), "unpredicted is never FN");
+        assert!(ev.is_fp(0, 1));
+        assert!(!ev.is_fp(0, 0));
+        assert_eq!(
+            ev.counts,
+            Counts { matched: 1, fp: 1, fn_: 1, extra: 0, unpredicted_images: 1 }
+        );
     }
 
     #[test]
-    fn matching_is_one_to_one_highest_iou_first() {
+    fn any_overlap_pairs_and_duplicates_are_extra() {
         let gt = BBox::new(0.0, 0.0, 10.0, 10.0);
         let ds = dataset(1, &[(1, gt)]);
-        let preds = preds_for(&ds, &[(0, BBox::new(2.0, 0.0, 10.0, 10.0)), (0, gt)], &[0]);
-        let ev = evaluate(&ds, &preds, Thresholds::default());
-        assert_eq!(ev.gt[0].matched, Some(1));
-        assert_eq!(ev.preds[0][0].matched, None, "duplicate stays FP even though it overlaps");
-        assert!(!ev.is_fp_candidate(0, 0), "but it is not an FP-filter candidate (best IoU ≥ 0.3)");
-        assert_eq!(ev.counts.fp, 1);
-    }
+        // A loose box (IoU 0.05) still pairs: it is reviewed through the IoU sort.
+        let loose = preds_for(&ds, &[(0, BBox::new(9.0, 0.0, 10.0, 10.0))], &[0]);
+        let ev = evaluate(&ds, &loose);
+        assert_eq!(ev.gt[0].status, GtStatus::Matched);
+        assert!(ev.gt[0].iou.unwrap() < 0.1);
 
-    #[test]
-    fn loose_overlap_is_fn_but_not_filter_candidate() {
-        let ds = dataset(1, &[(1, BBox::new(0.0, 0.0, 10.0, 10.0))]);
-        // IoU = 60/140 ≈ 0.43: below match, above filter threshold.
-        let preds = preds_for(&ds, &[(0, BBox::new(4.0, 0.0, 10.0, 10.0))], &[0]);
-        let ev = evaluate(&ds, &preds, Thresholds::default());
-        assert_eq!(ev.gt[0].status, GtStatus::Fn);
-        assert!(!ev.is_fn_candidate(0));
-        assert!(!ev.is_fp_candidate(0, 0));
+        let dup = preds_for(&ds, &[(0, BBox::new(2.0, 0.0, 10.0, 10.0)), (0, gt)], &[0]);
+        let ev = evaluate(&ds, &dup);
+        assert_eq!(ev.gt[0].matched, Some(1), "best overlap wins");
+        assert_eq!(ev.preds[0][0].status, PredStatus::Extra);
+        assert!(!ev.is_fp(0, 0));
+        assert_eq!(ev.counts.extra, 1);
     }
 }

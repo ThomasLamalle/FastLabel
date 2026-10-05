@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use fastlabel_core::matching::GtStatus;
+use fastlabel_core::matching::{GtStatus, PredStatus};
 use fastlabel_core::review::ReviewState;
 use fastlabel_core::{
     AnnId, BBox, CategoryId, Dataset, Evaluation, ImageId, PredRef, Predictions, Split,
@@ -71,12 +71,15 @@ pub enum CropId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropStatus {
-    /// GT matched by a prediction.
-    Tp,
-    /// GT without a matching prediction.
+    /// GT paired with a prediction (both shown).
+    Matched,
+    /// GT overlapping no prediction.
     Fn,
-    /// Prediction without a matching GT.
+    /// Prediction overlapping no GT.
     Fp,
+    /// Unpaired box overlapping a box already paired with another one
+    /// (typically a duplicate prediction).
+    Extra,
     /// GT on an image the model was not run on.
     Unpredicted,
 }
@@ -92,9 +95,9 @@ pub struct Crop {
     /// The matched prediction (TP crops) or the prediction itself (FP crops).
     pub pred: Option<PredRef>,
     pub status: CropStatus,
-    /// Matched IoU for TP, 0 for FN / FP, `None` when unpredicted.
+    /// IoU with the paired box, 0 when unpaired, `None` when unpredicted.
     pub iou: Option<f64>,
-    /// Shown by the FP-only / FN-only filters.
+    /// FP (prediction) or FN (GT): shown by the FP-only / FN-only filters.
     pub filter_candidate: bool,
     /// Grayscale standard deviation inside the box, once computed.
     pub uniformity: Option<f32>,
@@ -166,12 +169,13 @@ pub fn build(
         for ann in ds.annotations_of(image_idx) {
             let ann_idx = ds.ann_idx(ann.id).expect("indexed");
             let gt_eval = eval.map(|e| e.gt[ann_idx]);
-            let (status, iou, pred) = match gt_eval {
-                Some(g) if g.status == GtStatus::Tp => {
+            let (status, iou, pred) = match gt_eval.map(|g| (g, g.status)) {
+                Some((g, GtStatus::Matched)) => {
                     let pred = g.matched.and_then(|pi| image_preds.map(|p| p[pi]));
-                    (CropStatus::Tp, g.iou, pred)
+                    (CropStatus::Matched, g.iou, pred)
                 }
-                Some(g) if g.status == GtStatus::Fn => (CropStatus::Fn, g.iou, None),
+                Some((g, GtStatus::Fn)) => (CropStatus::Fn, g.iou, None),
+                Some((g, GtStatus::Unmatched)) => (CropStatus::Extra, g.iou, None),
                 _ => (CropStatus::Unpredicted, None, None),
             };
             crops.push(Crop {
@@ -183,16 +187,18 @@ pub fn build(
                 pred,
                 status,
                 iou,
-                filter_candidate: eval.is_some_and(|e| e.is_fn_candidate(ann_idx)),
+                filter_candidate: eval.is_some_and(|e| e.is_fn(ann_idx)),
                 uniformity: uniformity.get(metrics::key(&img.file_name, &ann.bbox)),
                 date: dates.and_then(|d| d[image_idx]),
             });
         }
         if let (Some(image_preds), Some(e)) = (image_preds, eval) {
             for (pi, p) in image_preds.iter().enumerate() {
-                if e.preds[image_idx][pi].matched.is_some() {
-                    continue;
-                }
+                let status = match e.preds[image_idx][pi].status {
+                    PredStatus::Matched => continue,
+                    PredStatus::Fp => CropStatus::Fp,
+                    PredStatus::Extra => CropStatus::Extra,
+                };
                 crops.push(Crop {
                     id: CropId::Pred(*p),
                     image_idx,
@@ -200,9 +206,9 @@ pub fn build(
                     category_id: p.category_id,
                     gt: None,
                     pred: Some(*p),
-                    status: CropStatus::Fp,
+                    status,
                     iou: Some(0.0),
-                    filter_candidate: e.is_fp_candidate(image_idx, pi),
+                    filter_candidate: status == CropStatus::Fp,
                     uniformity: uniformity.get(metrics::key(&img.file_name, &p.bbox)),
                     date: dates.and_then(|d| d[image_idx]),
                 });
@@ -242,7 +248,7 @@ pub fn build(
 pub(crate) mod tests {
     use super::*;
     use fastlabel_core::coco::{CocoAnnotation, CocoCategory, CocoFile, CocoImage};
-    use fastlabel_core::matching::{Thresholds, evaluate};
+    use fastlabel_core::matching::evaluate;
     use serde_json::Map;
     use std::path::{Path, PathBuf};
 
@@ -299,7 +305,7 @@ pub(crate) mod tests {
                 pred(1, BBox::new(150.0, 10.0, 8.0, 8.0), 0.4),
             ],
         );
-        let ev = evaluate(&ds, &preds, Thresholds::default());
+        let ev = evaluate(&ds, &preds);
         (ds, preds, ev)
     }
 
@@ -326,7 +332,7 @@ pub(crate) mod tests {
             &ViewOptions::default(),
         );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3", "P150"]);
-        assert_eq!(crops[0].status, CropStatus::Tp);
+        assert_eq!(crops[0].status, CropStatus::Matched);
         assert_eq!(crops[0].pred.unwrap().score, 0.9);
         assert_eq!(crops[1].status, CropStatus::Fn);
         assert_eq!(crops[2].status, CropStatus::Unpredicted);

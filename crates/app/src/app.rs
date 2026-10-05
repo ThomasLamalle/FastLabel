@@ -123,7 +123,7 @@ impl FastLabelApp {
 
     fn open(&mut self, ctx: &egui::Context, dir: &Path, restore_selection: bool) {
         let s = &self.session;
-        match Workspace::open(dir, s.view.clone(), s.thresholds, s.columns) {
+        match Workspace::open(dir, s.view.clone(), s.columns) {
             Ok(mut ws) => {
                 if restore_selection && s.last_dataset.as_deref() == Some(dir) {
                     ws.select(s.selected);
@@ -422,7 +422,6 @@ impl FastLabelApp {
         if let Some(ws) = &self.ws {
             self.session.selected = ws.selected;
             self.session.view = ws.opts.clone();
-            self.session.thresholds = ws.thresholds;
             self.session.columns = ws.columns;
         }
         if let Some(path) = &self.session_path
@@ -875,20 +874,8 @@ impl FastLabelApp {
             ui.add_enabled_ui(has_preds, |ui| {
                 ui.horizontal(|ui| {
                     ui.toggle_value(&mut opts.fp_only, "FP only");
-                    ui.toggle_value(&mut opts.fn_only, "FN only");
-                    let mut t = ws.thresholds;
-                    ui.menu_button("Thresholds", |ui| {
-                        ui.add(iou_slider(&mut t.match_iou).text("Match IoU (TP)"));
-                        ui.add(iou_slider(&mut t.fp_iou).text("FP filter: best IoU below"));
-                        ui.add(iou_slider(&mut t.fn_iou).text("FN filter: best IoU below"));
-                        if ui.button("Reset defaults").clicked() {
-                            t = Default::default();
-                        }
-                    });
-                    if t != ws.thresholds {
-                        ws.thresholds = t;
-                        ws.rebuild();
-                    }
+                    ui.toggle_value(&mut opts.fn_only, "FN only")
+                        .on_hover_text("FP: prediction overlapping no GT box. FN: GT box overlapping no prediction.");
                 })
             });
             if opts.sort == SortKey::Uniformity
@@ -946,7 +933,14 @@ impl FastLabelApp {
                     ui.separator();
                     let k = e.counts;
                     ui.label(
-                        RichText::new(format!("TP {}  FP {}  FN {}", k.tp, k.fp, k.fn_)).weak(),
+                        RichText::new(format!("paired {}  FP {}  FN {}  extra {}", k.matched, k.fp, k.fn_, k.extra))
+                            .weak(),
+                    )
+                    .on_hover_text(
+                        "paired: GT box with its best-overlapping prediction (IoU shown on the crop)\n\
+                         FP: prediction overlapping no GT box\n\
+                         FN: GT box overlapping no prediction\n\
+                         extra: unpaired box overlapping an already paired one (duplicate)",
                     );
                 }
                 if self.thumbs_busy() > 0 {
@@ -1109,10 +1103,6 @@ impl eframe::App for FastLabelApp {
         self.inference.shutdown();
         self.save_session();
     }
-}
-
-fn iou_slider(v: &mut f64) -> egui::Slider<'_> {
-    egui::Slider::new(v, 0.05..=0.95).step_by(0.05)
 }
 
 /// J / K in the editor: next / previous box of the frame (GT, then predictions).

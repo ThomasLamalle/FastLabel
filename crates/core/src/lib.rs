@@ -22,6 +22,6 @@ pub use dataset::{Dataset, Split};
 pub use edits::{AnnMark, EditLog, Op, PendingState, PredMark};
 pub use error::{Error, Result};
 pub use geom::BBox;
-pub use matching::{Evaluation, GtStatus, Thresholds};
+pub use matching::{Evaluation, GtStatus, PredStatus};
 pub use predictions::{PredRef, Predictions};
 pub use project::Project;

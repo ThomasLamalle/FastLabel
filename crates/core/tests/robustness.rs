@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use fastlabel_core::coco::{CocoAnnotation, CocoCategory, CocoFile, CocoImage};
 use fastlabel_core::commit::apply;
-use fastlabel_core::matching::{Thresholds, evaluate};
+use fastlabel_core::matching::evaluate;
 use fastlabel_core::predictions::{PredBox, PredImage, PredictionFile};
 use fastlabel_core::review::ReviewState;
 use fastlabel_core::{
@@ -102,7 +102,7 @@ proptest! {
             }
         }
         let predictions = Predictions::from_file(&file, &ds);
-        let ev = evaluate(&ds, &predictions, Thresholds::default());
+        let ev = evaluate(&ds, &predictions);
         prop_assert_eq!(ev.gt.len(), ds.annotations().len());
 
         let mut log = EditLog::new(ds.coco.next_annotation_id());

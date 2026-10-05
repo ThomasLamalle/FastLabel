@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use fastlabel_core::fsutil;
-use fastlabel_core::matching::Thresholds;
 use serde::{Deserialize, Serialize};
 
 use crate::crops::ViewOptions;
@@ -18,7 +17,6 @@ pub struct Session {
     pub margin_x: f64,
     pub margin_y: f64,
     pub view: ViewOptions,
-    pub thresholds: Thresholds,
     pub model_path: Option<PathBuf>,
     pub confidence: f64,
     /// GPU memory budget for crop thumbnails.
@@ -34,7 +32,6 @@ impl Default for Session {
             margin_x: 50.0,
             margin_y: 50.0,
             view: ViewOptions::default(),
-            thresholds: Thresholds::default(),
             model_path: None,
             confidence: 0.1,
             texture_budget_mb: 256,

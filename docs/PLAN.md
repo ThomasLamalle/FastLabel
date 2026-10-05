@@ -138,7 +138,7 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 |---|---|
 | ← → ↑ ↓ / h l k j | Move selection |
 | PgUp / PgDn, Home / End | Scroll by screen / to ends |
-| D / G / F / R | Delete-or-reject / accept-or-confirm / frame delete / replace (toggles, advance to the next undecided crop; F clears and blocks D/G/R on its frame) |
+| D / G / F / R | Delete-or-reject / accept-or-confirm / frame delete / replace (toggles, advance to the next undecided crop; F clears D/G/R on its frame; D/G/R unmark F) |
 | Shift + D / G / F | Same, from the selection to the end of the row, then first crop of the next row |
 | Right click | D on the clicked crop (no advance) |
 | Enter / E / double click | Open the frame editor popup |
@@ -177,3 +177,8 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 | M6 | done | Tab frame mode (h/l, Ctrl annotated-only), editor shared with the Enter/double-click popup: draw, select, move, 8-handle resize, zoom around cursor, pan (middle / Space drag), j/k box cycling, D/G on boxes and predictions, 1–9 categories, tags, F, run model on frame. Hold-Space peek over the mosaic. Edits are pending ops (visible immediately in frame view, applied on save). UI test drives Tab, mouse draw, D, l, Enter, Esc. |
 | M7 | done | Color uniformity (gray std dev in the box) for GT + prediction boxes, computed in the background on all cores (v1_exp0: 23,580 boxes in 11.7 s), cached incrementally in `.fastlabel/metrics.json`, sortable asc/desc, shown in tooltips; already surfaces GT boxes drawn on a sign. Export zip button: saves pending edits, then annotation file + images (stored) with progress and cancel. |
 | M8 | done | SIGKILL-during-save test (8 random kills: every version parses, project reopens). Property tests: random bytes into every loader and the JPEG decoder, random datasets + ops through evaluate/apply (result always valid, new boxes inside the image). 100k-image UI stress (symlinked 1080p JPEGs, 200k boxes, 100k predictions): open + first frame 0.56 s, worst frame while jumping 15 ms, 2,000 marks + undos 3.4 s, re-evaluate 108 ms, +297 MB RSS. Empty-dataset key sweep. README. |
+
+### Changes after first use (2026-10-05)
+
+- Matching has no thresholds anymore: pairs need any overlap; FP / FN mean zero overlap; duplicates are "extra".
+- D/G/R on a frame marked F apply and unmark the frame.
