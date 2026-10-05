@@ -86,6 +86,7 @@ Others:
 Similar to sorting, toggle buttons allow to:
 - display only FP: predictions overlapping no GT box (IoU 0 with all of them)
 - display only FN: GT boxes overlapping no prediction
+- display only extras: unpaired boxes overlapping an already paired box (typically duplicate predictions)
 - hide reviewed crops
 - filter by split
 

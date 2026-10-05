@@ -876,6 +876,9 @@ impl FastLabelApp {
                     ui.toggle_value(&mut opts.fp_only, "FP only");
                     ui.toggle_value(&mut opts.fn_only, "FN only")
                         .on_hover_text("FP: prediction overlapping no GT box. FN: GT box overlapping no prediction.");
+                    ui.toggle_value(&mut opts.extra_only, "Extra only").on_hover_text(
+                        "Unpaired boxes overlapping a box already paired with a better match (duplicates)",
+                    );
                 })
             });
             if opts.sort == SortKey::Uniformity
