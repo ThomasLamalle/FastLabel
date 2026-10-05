@@ -20,16 +20,18 @@ pub enum SortKey {
     Iou,
     Confidence,
     Uniformity,
+    ImageDate,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 6] = [
+    pub const ALL: [SortKey; 7] = [
         SortKey::Id,
         SortKey::Width,
         SortKey::Height,
         SortKey::Iou,
         SortKey::Confidence,
         SortKey::Uniformity,
+        SortKey::ImageDate,
     ];
 
     pub fn label(self) -> &'static str {
@@ -40,6 +42,7 @@ impl SortKey {
             SortKey::Iou => "IoU with prediction",
             SortKey::Confidence => "Prediction confidence",
             SortKey::Uniformity => "Color uniformity",
+            SortKey::ImageDate => "Image date (file)",
         }
     }
 
@@ -95,6 +98,8 @@ pub struct Crop {
     pub filter_candidate: bool,
     /// Grayscale standard deviation inside the box, once computed.
     pub uniformity: Option<f32>,
+    /// Image file date (creation, else modification), seconds since epoch.
+    pub date: Option<f64>,
 }
 
 impl Crop {
@@ -136,6 +141,7 @@ impl Crop {
             SortKey::Iou => self.iou,
             SortKey::Confidence => self.pred.map(|p| p.score),
             SortKey::Uniformity => self.uniformity.map(f64::from),
+            SortKey::ImageDate => self.date,
         }
     }
 }
@@ -148,6 +154,7 @@ pub fn build(
     eval: Option<&Evaluation>,
     review: &ReviewState,
     uniformity: &Uniformity,
+    dates: Option<&[Option<f64>]>,
     opts: &ViewOptions,
 ) -> Vec<Crop> {
     let mut crops = Vec::with_capacity(ds.annotations().len());
@@ -178,6 +185,7 @@ pub fn build(
                 iou,
                 filter_candidate: eval.is_some_and(|e| e.is_fn_candidate(ann_idx)),
                 uniformity: uniformity.get(metrics::key(&img.file_name, &ann.bbox)),
+                date: dates.and_then(|d| d[image_idx]),
             });
         }
         if let (Some(image_preds), Some(e)) = (image_preds, eval) {
@@ -196,6 +204,7 @@ pub fn build(
                     iou: Some(0.0),
                     filter_candidate: e.is_fp_candidate(image_idx, pi),
                     uniformity: uniformity.get(metrics::key(&img.file_name, &p.bbox)),
+                    date: dates.and_then(|d| d[image_idx]),
                 });
             }
         }
@@ -313,6 +322,7 @@ pub(crate) mod tests {
             Some(&ev),
             &ReviewState::default(),
             &Uniformity::default(),
+            None,
             &ViewOptions::default(),
         );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3", "P150"]);
@@ -334,6 +344,7 @@ pub(crate) mod tests {
             None,
             &ReviewState::default(),
             &Uniformity::default(),
+            None,
             &ViewOptions::default(),
         );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3"]);
@@ -344,7 +355,7 @@ pub(crate) mod tests {
     fn filters() {
         let (ds, preds, ev) = fixture();
         let run = |opts: ViewOptions, review: &ReviewState| {
-            ids(&build(&ds, Some(&preds), Some(&ev), review, &Uniformity::default(), &opts))
+            ids(&build(&ds, Some(&preds), Some(&ev), review, &Uniformity::default(), None, &opts))
         };
         let none = ReviewState::default();
         assert_eq!(run(ViewOptions { fp_only: true, ..Default::default() }, &none), vec!["P150"]);
@@ -377,6 +388,7 @@ pub(crate) mod tests {
                 Some(&ev),
                 &ReviewState::default(),
                 &Uniformity::default(),
+                None,
                 &ViewOptions { sort, descending, ..Default::default() },
             ))
         };

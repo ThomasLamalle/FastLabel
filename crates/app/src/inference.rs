@@ -13,6 +13,8 @@ use fastlabel_infer::{BatchItem, BatchResult, Detector, Progress, run_batch};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
     All,
+    /// Frames without predictions yet (merged into the existing ones).
+    Unpredicted,
     /// One image, by dataset image index.
     Frame(usize),
 }

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::coco::ImageId;
 use crate::edits::{EditLog, Op};
 use crate::error::{Error, Result};
 
@@ -20,6 +21,10 @@ const FORMAT: u32 = 1;
 struct Header {
     fastlabel_journal: u32,
     base: String,
+    /// Ids given to untracked images found in `images/` when the edits were
+    /// made, so they get the same ids on replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    added_images: Vec<(ImageId, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,12 +42,16 @@ pub struct Journal {
 
 impl Journal {
     /// Starts a fresh journal for edits on top of `base` (an annotation file name).
-    pub fn create(path: &Path, base: &str) -> Result<Self> {
+    pub fn create(path: &Path, base: &str, added_images: &[(ImageId, String)]) -> Result<Self> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
         }
         let mut file = File::create(path).map_err(|e| Error::io(path, e))?;
-        let header = Header { fastlabel_journal: FORMAT, base: base.to_string() };
+        let header = Header {
+            fastlabel_journal: FORMAT,
+            base: base.to_string(),
+            added_images: added_images.to_vec(),
+        };
         writeln!(file, "{}", serde_json::to_string(&header).expect("header serializes"))
             .map_err(|e| Error::io(path, e))?;
         Ok(Self { path: path.to_path_buf(), file })
@@ -71,6 +80,7 @@ impl Journal {
 #[derive(Debug, PartialEq)]
 pub struct Recorded {
     pub base: String,
+    pub added_images: Vec<(ImageId, String)>,
     pub entries: Vec<Entry>,
 }
 
@@ -97,7 +107,7 @@ pub fn read(path: &Path) -> Result<Option<Recorded>> {
             Err(_) => break,
         }
     }
-    Ok(Some(Recorded { base: header.base, entries }))
+    Ok(Some(Recorded { base: header.base, added_images: header.added_images, entries }))
 }
 
 pub fn replay(entries: &[Entry], log: &mut EditLog) {
@@ -123,7 +133,9 @@ mod tests {
     fn write_read_replay_with_truncated_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".fastlabel").join(JOURNAL_FILE);
-        let mut j = Journal::create(&path, "annotations.v003.json").unwrap();
+        let mut j =
+            Journal::create(&path, "annotations.v003.json", &[(9, "images/new.jpg".into())])
+                .unwrap();
         j.append(&Entry::Op { op: Op::AnnMark { ann: 1, mark: AnnMark::Delete } }).unwrap();
         j.append(&Entry::Op { op: Op::FrameDelete { image: 2 } }).unwrap();
         j.append(&Entry::Undo).unwrap();
@@ -137,6 +149,7 @@ mod tests {
 
         let rec = read(&path).unwrap().unwrap();
         assert_eq!(rec.base, "annotations.v003.json");
+        assert_eq!(rec.added_images, vec![(9, "images/new.jpg".to_string())]);
         assert_eq!(rec.entries.len(), 4);
         let mut log = EditLog::new(10);
         replay(&rec.entries, &mut log);

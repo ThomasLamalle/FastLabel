@@ -235,6 +235,7 @@ impl FastLabelApp {
         };
         let items = match scope {
             Scope::All => ws.inference_items(),
+            Scope::Unpredicted => ws.unpredicted_items(),
             Scope::Frame(idx) => vec![ws.frame_item(idx)],
         };
         if items.is_empty() {
@@ -386,6 +387,20 @@ impl FastLabelApp {
             let idle = !self.inference.is_running() && self.ws.is_some();
             if ui.add_enabled(idle, egui::Button::new("Run on all frames")).clicked() {
                 self.run_model(&ctx, Scope::All);
+                ui.close();
+            }
+            let missing = self.ws.as_ref().map_or(0, |ws| ws.unpredicted_items().len());
+            if ui
+                .add_enabled(
+                    idle && missing > 0,
+                    egui::Button::new(format!("Run on frames without predictions ({missing})")),
+                )
+                .on_hover_text(
+                    "e.g. images newly copied into images/; existing predictions are kept",
+                )
+                .clicked()
+            {
+                self.run_model(&ctx, Scope::Unpredicted);
                 ui.close();
             }
             let frame = self.ws.as_ref().and_then(|ws| ws.selected_crop()).map(|c| c.image_idx);
@@ -587,6 +602,11 @@ impl FastLabelApp {
                 if let Some(i) = ws.step_frame(dir, m.command) {
                     ws.go_to_frame(i);
                 }
+                Ok(())
+            }
+            Key::Home | Key::End if !popup => {
+                let last = ws.project.dataset.images().len() - 1;
+                ws.go_to_frame(if key == Key::Home { 0 } else { last });
                 Ok(())
             }
             Key::J | Key::K | Key::ArrowDown | Key::ArrowUp => {
@@ -836,6 +856,9 @@ impl FastLabelApp {
                     }
                 },
             );
+            if opts.sort == SortKey::ImageDate && ws.opts.sort != SortKey::ImageDate {
+                opts.descending = true; // newest first
+            }
             let dir = if opts.descending { "Descending" } else { "Ascending" };
             if ui.button(dir).clicked() {
                 opts.descending = !opts.descending;
@@ -934,7 +957,7 @@ impl FastLabelApp {
             if let Some((scope, done, total)) = self.inference.progress() {
                 ui.separator();
                 let label = match scope {
-                    Scope::All => format!("model {done}/{total}"),
+                    Scope::All | Scope::Unpredicted => format!("model {done}/{total}"),
                     Scope::Frame(_) => "model on frame…".into(),
                 };
                 let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };

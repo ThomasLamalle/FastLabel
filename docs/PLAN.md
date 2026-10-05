@@ -132,28 +132,28 @@ Each milestone ends with `cargo fmt --check && cargo clippy -D warnings && cargo
 
 ## Keyboard map
 
-Everywhere: `S` save new version · `Q` save and quit (closes the popup when open) · `U` / `Ctrl+Z` undo · `Ctrl+Shift+Z` / `Ctrl+Y` redo · `Tab` mosaic ⇄ frame mode · `Ctrl+O` open dataset.
+Everywhere: `S` save new version · `Q` save and quit (closes the popup when open) · `U` / `Ctrl+Z` undo · `Ctrl+Shift+Z` / `Ctrl+Y` redo · `Tab` / `M` mosaic ⇄ frame mode · `Ctrl+O` open dataset.
 
 | Mosaic | Action |
 |---|---|
 | ← → ↑ ↓ / h l k j | Move selection |
 | PgUp / PgDn, Home / End | Scroll by screen / to ends |
-| D / G / F / R | Delete-or-reject / accept-or-confirm / frame delete / replace (toggles, auto-advance) |
-| Shift + D / G / F | Same, for the whole row, then next row |
+| D / G / F / R | Delete-or-reject / accept-or-confirm / frame delete / replace (toggles, advance to the next undecided crop; F clears and blocks D/G/R on its frame) |
+| Shift + D / G / F | Same, from the selection to the end of the row, then first crop of the next row |
 | Right click | D on the clicked crop (no advance) |
-| Enter / double click | Open the frame editor popup |
+| Enter / E / double click | Open the frame editor popup |
 | Space (hold) | Peek at the full frame |
 
 | Frame mode and popup | Action |
 |---|---|
-| h / l, ← / → (Ctrl: annotated only) | Previous / next frame (frame mode only) |
+| h / l, ← / → (Ctrl: annotated only), Home / End | Previous / next / first / last frame (frame mode only) |
 | j / k, ↓ / ↑ | Next / previous box (GT, then predictions) |
 | D / G | Delete-or-reject / accept-or-confirm the selected box |
 | F | Toggle frame deletion (frame mode: then next frame) |
 | 1–9 | Category of the selected box and of new boxes |
 | Drag on empty area / box / handle | Draw / move / resize |
 | Wheel, middle drag or Space + drag | Zoom around cursor, pan |
-| Esc | Deselect (frame mode) / close (popup, also Enter) |
+| Esc | Deselect (frame mode) / close (popup, also Enter / E) |
 
 ## Risks
 

@@ -52,6 +52,8 @@ pub struct Workspace {
     /// Frame mode / editor state.
     pub frame: crate::frame::FrameState,
     pub uniformity: Uniformity,
+    /// Image file dates, read when sorting by date (indexed like images).
+    image_dates: Option<Vec<Option<f64>>>,
 }
 
 /// Outcome of a user action, for the status line.
@@ -76,6 +78,7 @@ impl Workspace {
             columns: columns.max(1),
             frame: Default::default(),
             uniformity,
+            image_dates: None,
         };
         ws.rebuild();
         Ok(ws)
@@ -102,12 +105,16 @@ impl Workspace {
         if self.opts.sort == crops::SortKey::Uniformity && self.uniformity.is_empty() {
             self.opts.sort = crops::SortKey::Id;
         }
+        if self.opts.sort == crops::SortKey::ImageDate && self.image_dates.is_none() {
+            self.image_dates = Some(file_dates(&p.dataset));
+        }
         self.crops = crops::build(
             &p.dataset,
             p.predictions.as_ref(),
             self.eval.as_ref(),
             &p.review,
             &self.uniformity,
+            self.image_dates.as_deref(),
             &self.opts,
         );
         self.selected = keep
@@ -350,6 +357,15 @@ impl Workspace {
             .collect()
     }
 
+    /// Frames the model has not been run on yet (e.g. newly added images).
+    pub fn unpredicted_items(&self) -> Vec<BatchItem> {
+        let preds = self.project.predictions.as_ref();
+        self.inference_items()
+            .into_iter()
+            .filter(|it| preds.is_none_or(|p| p.of(it.key).is_none()))
+            .collect()
+    }
+
     pub fn frame_item(&self, image_idx: usize) -> BatchItem {
         let ds = &self.project.dataset;
         BatchItem { key: image_idx, path: ds.image_path(&ds.images()[image_idx]) }
@@ -457,6 +473,7 @@ impl Workspace {
             let ds = &self.project.dataset;
             let n = ds.images().len();
             // Deleted frames shift image indices: stay on the same image.
+            self.image_dates = None;
             self.frame.image_idx = current
                 .and_then(|id| ds.image_idx(id))
                 .unwrap_or(self.frame.image_idx)
@@ -465,6 +482,19 @@ impl Workspace {
         }
         Ok(report)
     }
+}
+
+/// File date of each image: creation time when the filesystem records it
+/// (a copied file gets a new one), else modification time.
+fn file_dates(ds: &fastlabel_core::Dataset) -> Vec<Option<f64>> {
+    ds.images()
+        .iter()
+        .map(|img| {
+            let meta = std::fs::metadata(ds.image_path(img)).ok()?;
+            let t = meta.created().or_else(|_| meta.modified()).ok()?;
+            Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -684,5 +714,23 @@ mod tests {
         ws.rebuild();
         let left: Vec<_> = ws.crops.iter().map(|c| c.id).collect();
         assert_eq!(left, vec![CropId::Gt(2), CropId::Gt(3)]);
+    }
+
+    #[test]
+    fn date_sort_puts_newest_images_first_and_unpredicted_frames_are_listed() {
+        let (dir, mut ws) = open_fixture(2);
+        // Make the second image clearly newer.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let b = dir.path().join("images/val/b.jpg");
+        std::fs::remove_file(&b).unwrap();
+        std::fs::write(&b, b"y").unwrap();
+        ws.opts.sort = crops::SortKey::ImageDate;
+        ws.opts.descending = true;
+        ws.rebuild();
+        assert_eq!(ws.crops[0].id, CropId::Gt(3), "image b's crop first");
+        assert!(ws.crops.iter().all(|c| c.date.is_some()));
+
+        let items = ws.unpredicted_items();
+        assert_eq!(items.iter().map(|i| i.key).collect::<Vec<_>>(), vec![1]);
     }
 }

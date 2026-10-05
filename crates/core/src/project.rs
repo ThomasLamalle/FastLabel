@@ -1,10 +1,11 @@
 //! A dataset folder opened for review: annotations, pending edits (with crash
 //! journal), review state and predictions.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::coco::CocoFile;
+use crate::coco::{CocoFile, ImageId};
 use crate::commit::{self, Summary, TrashReport};
 use crate::dataset::Dataset;
 use crate::edits::{AnnMark, EditLog, Op};
@@ -24,6 +25,9 @@ pub struct Project {
     /// from YOLO labels or a plain image folder (not saved yet).
     pub source: Option<VersionFile>,
     pub log: EditLog,
+    /// Images found in `images/` but missing from the annotation file, added
+    /// on open (id, file name). The next save records them.
+    pub added_images: Vec<(ImageId, String)>,
     pub review: ReviewState,
     prediction_file: Option<PredictionFile>,
     pub predictions: Option<Predictions>,
@@ -59,10 +63,21 @@ impl Project {
         Self::from_coco(dir, coco, Some(version))
     }
 
-    fn from_coco(dir: &Path, coco: CocoFile, source: Option<VersionFile>) -> Result<Self> {
+    fn from_coco(dir: &Path, mut coco: CocoFile, source: Option<VersionFile>) -> Result<Self> {
         let source_path = source.as_ref().map_or_else(|| dir.to_path_buf(), |v| v.path.clone());
-        let (dataset, legacy) = Dataset::new(dir.to_path_buf(), coco, &source_path)?;
         let mut warnings = Vec::new();
+        // A YOLO / folder import already lists every image.
+        let added_images = match &source {
+            Some(v) => {
+                let hint = journal::read(&dir.join(STATE_DIR).join(JOURNAL_FILE))?
+                    .filter(|r| r.base == v.file_name())
+                    .map(|r| r.added_images)
+                    .unwrap_or_default();
+                add_untracked_images(dir, &mut coco, &hint, &mut warnings)
+            }
+            None => Vec::new(),
+        };
+        let (dataset, legacy) = Dataset::new(dir.to_path_buf(), coco, &source_path)?;
         let mut log = EditLog::new(dataset.coco.next_annotation_id());
         for ann in &legacy.deleted_annotations {
             log.push(Op::AnnMark { ann: *ann, mark: AnnMark::Delete });
@@ -91,6 +106,7 @@ impl Project {
             dataset,
             source,
             log,
+            added_images,
             review,
             prediction_file: None,
             predictions: None,
@@ -158,7 +174,8 @@ impl Project {
 
     fn journal(&mut self, entry: &Entry) -> Result<()> {
         if self.journal.is_none() {
-            self.journal = Some(Journal::create(&self.journal_path(), &self.base_name())?);
+            self.journal =
+                Some(Journal::create(&self.journal_path(), &self.base_name(), &self.added_images)?);
         }
         self.journal.as_mut().expect("journal created").append(entry)
     }
@@ -188,7 +205,7 @@ impl Project {
 
     /// True when saving would produce a new version.
     pub fn has_unsaved_changes(&self) -> bool {
-        self.log.is_dirty() || self.source.is_none()
+        self.log.is_dirty() || self.source.is_none() || !self.added_images.is_empty()
     }
 
     /// Writes the next `annotations.vNNN.json` with all pending edits applied,
@@ -222,6 +239,7 @@ impl Project {
         self.dataset = dataset;
         self.source = Some(version);
         self.review = applied.review;
+        self.added_images.clear();
         self.log = EditLog::new(self.dataset.coco.next_annotation_id());
         self.journal = None;
         let jp = self.journal_path();
@@ -249,6 +267,22 @@ impl Project {
         Ok(())
     }
 
+    /// Replaces the predictions of some images (by image index), keeping
+    /// the others, and writes `predictions.json`.
+    pub fn merge_predictions(
+        &mut self,
+        per_image: Vec<(usize, Vec<crate::predictions::PredRef>)>,
+        model: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        let mut all =
+            self.predictions.clone().unwrap_or_else(|| Predictions::empty(model, confidence));
+        for (idx, preds) in per_image {
+            all.set_image(idx, preds);
+        }
+        self.set_predictions(all)
+    }
+
     /// Replaces the predictions of one image and writes `predictions.json`.
     pub fn set_image_predictions(
         &mut self,
@@ -257,11 +291,87 @@ impl Project {
         model: &str,
         confidence: f64,
     ) -> Result<()> {
-        let mut all =
-            self.predictions.clone().unwrap_or_else(|| Predictions::empty(model, confidence));
-        all.set_image(image_idx, preds);
-        self.set_predictions(all)
+        self.merge_predictions(vec![(image_idx, preds)], model, confidence)
     }
+}
+
+/// Adds images present under `dir/images/` but missing from `coco`, with
+/// ids after the existing ones. Ids recorded in the journal (`hint`) are
+/// reused so replayed edits land on the same images.
+fn add_untracked_images(
+    dir: &Path,
+    coco: &mut CocoFile,
+    hint: &[(ImageId, String)],
+    warnings: &mut Vec<String>,
+) -> Vec<(ImageId, String)> {
+    let images_dir = dir.join("images");
+    if !images_dir.is_dir() {
+        return Vec::new();
+    }
+    let files = match yolo::list_images(&images_dir, dir) {
+        Ok(f) => f,
+        Err(e) => {
+            warnings.push(format!("cannot scan images/: {e}"));
+            return Vec::new();
+        }
+    };
+    let tracked: HashSet<&str> = coco.images.iter().map(|i| i.file_name.as_str()).collect();
+    let untracked: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|f| !tracked.contains(f.as_str()))
+        .collect();
+    if untracked.is_empty() {
+        return Vec::new();
+    }
+    let mut next_id = coco.images.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+    let mut used: HashSet<ImageId> = coco.images.iter().map(|i| i.id).collect();
+    let mut ordered: Vec<(Option<ImageId>, String)> = hint
+        .iter()
+        .filter(|(id, f)| untracked.contains(f) && !used.contains(id))
+        .map(|(id, f)| (Some(*id), f.clone()))
+        .collect();
+    for f in &untracked {
+        if !ordered.iter().any(|(_, g)| g == f) {
+            ordered.push((None, f.clone()));
+        }
+    }
+    let mut added = Vec::new();
+    let mut unreadable = 0;
+    for (hinted, file_name) in ordered {
+        let Ok(size) = imagesize::size(dir.join(&file_name)) else {
+            unreadable += 1;
+            continue;
+        };
+        let id = hinted.unwrap_or_else(|| {
+            while used.contains(&next_id) {
+                next_id += 1;
+            }
+            next_id
+        });
+        used.insert(id);
+        coco.images.push(crate::coco::CocoImage {
+            id,
+            file_name: file_name.clone(),
+            width: size.width as u32,
+            height: size.height as u32,
+            tags: Vec::new(),
+            extra: Default::default(),
+        });
+        added.push((id, file_name));
+    }
+    if !added.is_empty() {
+        warnings.push(format!(
+            "{} new images found in images/ and added (not annotated yet; saved with the next version)",
+            added.len()
+        ));
+    }
+    if unreadable > 0 {
+        warnings.push(format!(
+            "{unreadable} files in images/ are not readable images and were skipped"
+        ));
+    }
+    added
 }
 
 fn sanitize(name: &str) -> String {
@@ -382,5 +492,45 @@ mod tests {
         assert!(p.has_unsaved_changes());
         let report = p.save().unwrap().unwrap();
         assert_eq!(report.path, dir.join("annotations.v001.json"));
+    }
+
+    #[test]
+    fn untracked_images_are_added_and_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_dataset(dir); // images 1 and 2 (jpg stubs, tracked)
+        fs::write(dir.join("images/train/new_b.png"), crate::yolo::tests::png_header(64, 32))
+            .unwrap();
+        fs::write(dir.join("images/train/broken.png"), b"nope").unwrap();
+        let mut p = Project::open(dir).unwrap();
+        assert_eq!(p.added_images, vec![(3, "images/train/new_b.png".to_string())]);
+        let img = p.dataset.image(3).unwrap();
+        assert_eq!((img.width, img.height), (64, 32));
+        assert!(p.warnings.iter().any(|w| w.contains("1 new images")));
+        assert!(p.warnings.iter().any(|w| w.contains("not readable")));
+        assert!(p.has_unsaved_changes());
+
+        // Edit the new image, crash, add another file that sorts first:
+        // the replayed edit must still land on new_b.png.
+        let ann = p.log.alloc_ann_id();
+        p.record(Op::AddBox {
+            ann,
+            image: 3,
+            category: 1,
+            bbox: crate::geom::BBox::new(1.0, 1.0, 10.0, 10.0),
+        })
+        .unwrap();
+        drop(p);
+        fs::write(dir.join("images/train/new_a.png"), crate::yolo::tests::png_header(8, 8))
+            .unwrap();
+        let mut p = Project::open(dir).unwrap();
+        assert_eq!(p.dataset.image(3).unwrap().file_name, "images/train/new_b.png");
+        assert_eq!(p.dataset.image(4).unwrap().file_name, "images/train/new_a.png");
+        p.save().unwrap();
+        assert!(p.added_images.is_empty());
+        let p = Project::open(dir).unwrap();
+        assert!(p.added_images.is_empty(), "now tracked");
+        assert_eq!(p.dataset.images().len(), 4);
+        assert_eq!(p.dataset.annotations().iter().filter(|a| a.image_id == 3).count(), 1);
     }
 }

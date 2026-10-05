@@ -29,6 +29,7 @@ This file is the source of truth. The functional spec of the previous Python too
   - `cache/`: thumbnail cache.
   - `trash/`: deleted frames.
 - **Frame deletion moves images to `.fastlabel/trash/vNNN/<original path>`**, never a hard delete. Metadata is always written (atomically) before any image is moved.
+- **Adding images**: copy them anywhere under `images/` (e.g. `images/train/`). On open, images not referenced by the annotation file are added (no annotations yet) and recorded by the next save. Run the model on them with *Model → Run on frames without predictions*, then review their predictions in the mosaic, sorted by image date.
 - **Export**: one action produces a zip with the current annotation file + `images/` tree (same layout as today's `v19.zip`), ready to import into Ultralytics.
 
 
@@ -44,18 +45,18 @@ This file is the source of truth. The functional spec of the previous Python too
 
 ### Shortcuts
 
-All D/F/G marks are **toggles** (press again to undo the mark) and **auto-advance** the selection to the next crop.
+All D/F/G marks are **toggles** (press again to undo the mark) and **auto-advance** the selection to the next crop still waiting for a decision (no D/G/R mark, frame not marked F).
 
 - 'D' : on a GT crop, mark the annotation for deletion. On a prediction crop, reject the prediction (persisted, so it does not come back after the next model run). Display a red 'D' on the top right of the crop.
 - 'G' : on a prediction crop, accept the prediction into the dataset. On a GT crop, confirm it as good. Display a green 'G' on the top right corner of the crop.
-- 'F' : delete the frame associated with the crop. Display 'F' on all crops of this frame. Advances to the next crop belonging to a different frame.
+- 'F' : delete the frame associated with the crop. Display 'F' on all crops of this frame. Advances to the next undecided crop of a different frame. F is exclusive with D/G/R: marking a frame clears the D/G/R marks of its crops (same undo step), and D/G/R are refused on a frame marked F.
 - 'R' : on a TP crop, replace the GT box geometry with the prediction's box (tightens sloppy boxes). Display an orange 'R'.
-- Shift + D/F/G : toggle the shortcut for every crop of the current row, then move to the next row.
+- Shift + D/F/G : toggle the shortcut for each crop from the selected one to the end of the row (each frame once for F), then select the first crop of the next row.
 - D/F/G/R do not trigger instant deletion/acceptance, otherwise it would be laggy and constantly change the mosaic layout. The actual change is applied when saving.
 - 'U' / Ctrl+Z : undo the last action (Ctrl+Shift+Z / Ctrl+Y : redo). Undo history covers everything since the last save.
-- Enter : open the selected crop's full frame in the editor popup.
+- Enter or E : open the selected crop's full frame in the editor popup.
 - Hold Space : peek at the full frame of the selected crop, overlaid on the mosaic.
-- Tab : switch between mosaic mode and frame mode.
+- Tab or M : switch between mosaic mode and frame mode.
 - 'S' : save the annotations to a new version, applying all changes. Simple incremental versioning; each save generates a new annotation file.
 - 'Q' : save and quit the app.
 
@@ -78,6 +79,7 @@ Others:
 - by IoU with prediction
 - by prediction confidence
 - by color uniformity: grayscale standard deviation inside the bbox. Ascending surfaces suspiciously uniform crops (blank/occluded), descending surfaces very busy crops. Computed in the background and cached.
+- by image date: file creation time (a copied file gets a new one; falls back to modification time), newest first, to review recently added images.
 
 ### Filters
 
