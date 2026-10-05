@@ -339,6 +339,19 @@ impl FastLabelApp {
             ui.add_enabled_ui(has_preds, |ui| {
                 ui.toggle_value(&mut opts.fp_only, "FP only");
                 ui.toggle_value(&mut opts.fn_only, "FN only");
+                let mut t = ws.thresholds;
+                ui.menu_button("Thresholds", |ui| {
+                    ui.add(iou_slider(&mut t.match_iou).text("Match IoU (TP)"));
+                    ui.add(iou_slider(&mut t.fp_iou).text("FP filter: best IoU below"));
+                    ui.add(iou_slider(&mut t.fn_iou).text("FN filter: best IoU below"));
+                    if ui.button("Reset defaults").clicked() {
+                        t = Default::default();
+                    }
+                });
+                if t != ws.thresholds {
+                    ws.thresholds = t;
+                    ws.rebuild();
+                }
             });
             if opts != ws.opts {
                 ws.opts = opts;
@@ -465,4 +478,8 @@ impl eframe::App for FastLabelApp {
     fn on_exit(&mut self) {
         self.save_session();
     }
+}
+
+fn iou_slider(v: &mut f64) -> egui::Slider<'_> {
+    egui::Slider::new(v, 0.05..=0.95).step_by(0.05)
 }

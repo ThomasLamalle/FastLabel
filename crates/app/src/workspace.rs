@@ -384,4 +384,32 @@ mod tests {
         let new = ws.crops.iter().find(|c| c.ann_id() == Some(4)).unwrap();
         assert!(ws.marks_of(new).reviewed);
     }
+
+    #[test]
+    fn thresholds_change_classification() {
+        let (_d, mut ws) = open_fixture(2);
+        assert_eq!(ws.crops[0].status, crate::crops::CropStatus::Tp);
+        ws.thresholds.match_iou = 0.95; // TP had IoU 0.82
+        ws.rebuild();
+        assert_eq!(ws.crops[0].status, crate::crops::CropStatus::Fn);
+        // The once-matched prediction is now an extra FP crop.
+        assert_eq!(ws.crops.iter().filter(|c| c.is_pred()).count(), 2);
+    }
+
+    #[test]
+    fn replace_and_reject_persist_through_save_and_hide_reviewed() {
+        let (_d, mut ws) = open_fixture(2);
+        ws.mark_selected(Mark::Replace).unwrap(); // #1 takes the prediction box
+        ws.select(3);
+        ws.mark_selected(Mark::Delete).unwrap(); // reject P150
+        ws.save().unwrap().unwrap();
+        let replaced = ws.project.dataset.annotation(1).unwrap().bbox;
+        assert_eq!(replaced, fastlabel_core::BBox::new(1.0, 0.0, 10.0, 10.0));
+        assert_eq!(ws.crops[0].iou, Some(1.0));
+
+        ws.opts.hide_reviewed = true;
+        ws.rebuild();
+        let left: Vec<_> = ws.crops.iter().map(|c| c.id).collect();
+        assert_eq!(left, vec![CropId::Gt(2), CropId::Gt(3)]);
+    }
 }
