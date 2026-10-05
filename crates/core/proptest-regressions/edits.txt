@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 69d81d0afdacf100749d55dcea566fbb4e2d6c6f7c5a80eb54f694e6a462a14f # shrinks to ops = [PredMark { pred: PredRef { image_id: 1, category_id: 1, bbox: BBox { x: 3.0, y: 0.0, w: 10.0, h: 10.0 }, score: 0.5 }, mark: Accept }], extra = PredMark { pred: PredRef { image_id: 1, category_id: 1, bbox: BBox { x: 3.0, y: 0.0, w: 10.0, h: 10.0 }, score: 0.5 }, mark: Reject }
+cc 49d5a020a7f6e1360147583490eecb6fd71d6e867a1173ceeae8a67179217988 # shrinks to ops = [PredMark { pred: PredRef { image_id: 1, category_id: 1, bbox: BBox { x: 2.0, y: 0.0, w: 10.0, h: 10.0 }, score: 0.5 }, mark: Reject }], extra = PredMark { pred: PredRef { image_id: 1, category_id: 1, bbox: BBox { x: 2.0, y: 0.0, w: 10.0, h: 10.0 }, score: 0.5 }, mark: Reject }

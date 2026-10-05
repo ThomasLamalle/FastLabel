@@ -152,3 +152,10 @@ Each milestone ends with `cargo fmt --check && cargo clippy -D warnings && cargo
 | Cold thumbnail generation too slow on first open of 100k images | Visible-first priority queue + persistent cache; optional `fastlabel cache warm` CLI. |
 | 5 GB RAM machine (builds + app + browser) | Fixed LRU budget, no full-frame caching; `cargo` with limited `-j` if the linker runs out of memory. |
 | Wayland quirks with winit | Test on Hyprland early (M3); X11 fallback via env var. |
+
+## Status
+
+| Milestone | State | Notes |
+|---|---|---|
+| M0 | done | Workspace, aliases, model probed. |
+| M1 | done | 48 tests. All 24 real annotation files round-trip losslessly. v1_exp0: open 25 ms, evaluate 2 ms. Synthetic 100k images / 200k boxes / 300k preds: index 53 ms, evaluate 53 ms, apply 87 ms, save 108 ms, load 187 ms, peak RSS 230 MB. |
