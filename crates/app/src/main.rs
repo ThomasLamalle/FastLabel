@@ -5,8 +5,10 @@ mod crops;
 mod editor;
 mod frame;
 mod inference;
+mod metrics;
 mod mosaic;
 mod session;
+mod tasks;
 mod thumbs;
 #[cfg(test)]
 mod ui_tests;

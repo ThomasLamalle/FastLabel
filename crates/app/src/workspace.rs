@@ -10,6 +10,7 @@ use fastlabel_core::{PredRef, Predictions};
 use fastlabel_infer::{BatchItem, BatchResult};
 
 use crate::crops::{self, Crop, CropId, ViewOptions};
+use crate::metrics::{self, FrameBoxes, Uniformity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
@@ -50,6 +51,7 @@ pub struct Workspace {
     pub columns: usize,
     /// Frame mode / editor state.
     pub frame: crate::frame::FrameState,
+    pub uniformity: Uniformity,
 }
 
 /// Outcome of a user action, for the status line.
@@ -63,6 +65,7 @@ impl Workspace {
         columns: usize,
     ) -> anyhow::Result<Self> {
         let project = Project::open(dir)?;
+        let uniformity = Uniformity::load(&project.state_dir().join(metrics::METRICS_FILE));
         let mut ws = Self {
             project,
             eval: None,
@@ -72,6 +75,7 @@ impl Workspace {
             selected: 0,
             columns: columns.max(1),
             frame: Default::default(),
+            uniformity,
         };
         ws.rebuild();
         Ok(ws)
@@ -95,11 +99,15 @@ impl Workspace {
                 self.opts.sort = crops::SortKey::Id;
             }
         }
+        if self.opts.sort == crops::SortKey::Uniformity && self.uniformity.is_empty() {
+            self.opts.sort = crops::SortKey::Id;
+        }
         self.crops = crops::build(
             &p.dataset,
             p.predictions.as_ref(),
             self.eval.as_ref(),
             &p.review,
+            &self.uniformity,
             &self.opts,
         );
         self.selected = keep
@@ -342,6 +350,38 @@ impl Workspace {
             ));
         }
         Ok(msg)
+    }
+
+    /// Boxes (GT and unmatched predictions) without a uniformity value yet,
+    /// grouped by frame.
+    pub fn missing_uniformity(&self) -> Vec<FrameBoxes> {
+        let ds = &self.project.dataset;
+        let preds = self.project.predictions.as_ref();
+        ds.images()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, img)| {
+                let gt = ds.annotations_of(idx).map(|a| a.bbox);
+                let pr = preds.and_then(|p| p.of(idx)).unwrap_or(&[]).iter().map(|p| p.bbox);
+                let boxes: Vec<_> = gt
+                    .chain(pr)
+                    .map(|b| (metrics::key(&img.file_name, &b), b))
+                    .filter(|(k, _)| self.uniformity.get(*k).is_none())
+                    .collect();
+                (!boxes.is_empty()).then(|| FrameBoxes { path: ds.image_path(img), boxes })
+            })
+            .collect()
+    }
+
+    /// Stores computed values, persists them and re-sorts.
+    pub fn add_uniformity(
+        &mut self,
+        values: std::collections::HashMap<u64, f32>,
+    ) -> anyhow::Result<()> {
+        self.uniformity.extend(values);
+        self.uniformity.save(&self.project.state_dir().join(metrics::METRICS_FILE))?;
+        self.rebuild();
+        Ok(())
     }
 
     /// Saves a new version and rebuilds the view.

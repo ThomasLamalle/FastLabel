@@ -171,6 +171,9 @@ fn tooltip(ws: &Workspace, crop: &Crop, slot: Option<&Slot>) -> String {
     if let Some(p) = &crop.pred {
         lines.push(format!("confidence {:.2}", p.score));
     }
+    if let Some(u) = crop.uniformity {
+        lines.push(format!("color uniformity (gray std) {u:.1}"));
+    }
     if let Some(Slot::Failed(e)) = slot {
         lines.push(format!("cannot load image: {e}"));
     }

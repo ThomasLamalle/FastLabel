@@ -9,6 +9,8 @@ use fastlabel_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::{self, Uniformity};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortKey {
     #[default]
@@ -17,11 +19,18 @@ pub enum SortKey {
     Height,
     Iou,
     Confidence,
+    Uniformity,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 5] =
-        [SortKey::Id, SortKey::Width, SortKey::Height, SortKey::Iou, SortKey::Confidence];
+    pub const ALL: [SortKey; 6] = [
+        SortKey::Id,
+        SortKey::Width,
+        SortKey::Height,
+        SortKey::Iou,
+        SortKey::Confidence,
+        SortKey::Uniformity,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -30,6 +39,7 @@ impl SortKey {
             SortKey::Height => "Height",
             SortKey::Iou => "IoU with prediction",
             SortKey::Confidence => "Prediction confidence",
+            SortKey::Uniformity => "Color uniformity",
         }
     }
 
@@ -83,6 +93,8 @@ pub struct Crop {
     pub iou: Option<f64>,
     /// Shown by the FP-only / FN-only filters.
     pub filter_candidate: bool,
+    /// Grayscale standard deviation inside the box, once computed.
+    pub uniformity: Option<f32>,
 }
 
 impl Crop {
@@ -123,6 +135,7 @@ impl Crop {
             SortKey::Height => Some(self.primary().h),
             SortKey::Iou => self.iou,
             SortKey::Confidence => self.pred.map(|p| p.score),
+            SortKey::Uniformity => self.uniformity.map(f64::from),
         }
     }
 }
@@ -134,6 +147,7 @@ pub fn build(
     preds: Option<&Predictions>,
     eval: Option<&Evaluation>,
     review: &ReviewState,
+    uniformity: &Uniformity,
     opts: &ViewOptions,
 ) -> Vec<Crop> {
     let mut crops = Vec::with_capacity(ds.annotations().len());
@@ -163,6 +177,7 @@ pub fn build(
                 status,
                 iou,
                 filter_candidate: eval.is_some_and(|e| e.is_fn_candidate(ann_idx)),
+                uniformity: uniformity.get(metrics::key(&img.file_name, &ann.bbox)),
             });
         }
         if let (Some(image_preds), Some(e)) = (image_preds, eval) {
@@ -180,6 +195,7 @@ pub fn build(
                     status: CropStatus::Fp,
                     iou: Some(0.0),
                     filter_candidate: e.is_fp_candidate(image_idx, pi),
+                    uniformity: uniformity.get(metrics::key(&img.file_name, &p.bbox)),
                 });
             }
         }
@@ -291,8 +307,14 @@ pub(crate) mod tests {
     #[test]
     fn builds_gt_and_unmatched_pred_crops() {
         let (ds, preds, ev) = fixture();
-        let crops =
-            build(&ds, Some(&preds), Some(&ev), &ReviewState::default(), &ViewOptions::default());
+        let crops = build(
+            &ds,
+            Some(&preds),
+            Some(&ev),
+            &ReviewState::default(),
+            &Uniformity::default(),
+            &ViewOptions::default(),
+        );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3", "P150"]);
         assert_eq!(crops[0].status, CropStatus::Tp);
         assert_eq!(crops[0].pred.unwrap().score, 0.9);
@@ -306,7 +328,14 @@ pub(crate) mod tests {
     #[test]
     fn without_predictions_only_gt() {
         let (ds, ..) = fixture();
-        let crops = build(&ds, None, None, &ReviewState::default(), &ViewOptions::default());
+        let crops = build(
+            &ds,
+            None,
+            None,
+            &ReviewState::default(),
+            &Uniformity::default(),
+            &ViewOptions::default(),
+        );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3"]);
         assert!(crops.iter().all(|c| c.status == CropStatus::Unpredicted));
     }
@@ -315,7 +344,7 @@ pub(crate) mod tests {
     fn filters() {
         let (ds, preds, ev) = fixture();
         let run = |opts: ViewOptions, review: &ReviewState| {
-            ids(&build(&ds, Some(&preds), Some(&ev), review, &opts))
+            ids(&build(&ds, Some(&preds), Some(&ev), review, &Uniformity::default(), &opts))
         };
         let none = ReviewState::default();
         assert_eq!(run(ViewOptions { fp_only: true, ..Default::default() }, &none), vec!["P150"]);
@@ -347,6 +376,7 @@ pub(crate) mod tests {
                 Some(&preds),
                 Some(&ev),
                 &ReviewState::default(),
+                &Uniformity::default(),
                 &ViewOptions { sort, descending, ..Default::default() },
             ))
         };

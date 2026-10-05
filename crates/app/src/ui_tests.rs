@@ -270,3 +270,49 @@ fn frame_mode_draw_edit_navigate_popup_and_peek() {
     h.run_steps(2);
     assert!(!h.state().popup);
 }
+
+#[test]
+fn uniformity_sort_computes_in_background() {
+    use crate::crops::SortKey;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+    let ctx = h.ctx.clone();
+    assert!(h.state_mut().start_uniformity(&ctx));
+    for _ in 0..500 {
+        h.step();
+        if h.state().ws().opts.sort == SortKey::Uniformity {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let ws = h.state().ws();
+    assert_eq!(ws.opts.sort, SortKey::Uniformity);
+    assert!(ws.crops.iter().all(|c| c.uniformity.is_some()));
+    // The white boxes (first GT of every frame) are the most uniform.
+    assert!(ws.crops[..6].iter().all(|c| c.ann_id().is_some_and(|id| id % 2 == 1)));
+    assert!(tmp.path().join(".fastlabel/metrics.json").exists());
+    assert!(ws.missing_uniformity().is_empty());
+}
+
+/// Opt-in timing of the uniformity computation on a real dataset copy.
+#[test]
+#[ignore]
+fn real_uniformity_timing() {
+    let dataset =
+        PathBuf::from(std::env::var("FASTLABEL_SHOT_DATASET").expect("FASTLABEL_SHOT_DATASET"));
+    let mut h = harness(dataset, egui::vec2(1200.0, 800.0));
+    settle(&mut h);
+    let ctx = h.ctx.clone();
+    let t = std::time::Instant::now();
+    assert!(h.state_mut().start_uniformity(&ctx));
+    while h.state().ws().opts.sort != crate::crops::SortKey::Uniformity {
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(t.elapsed() < Duration::from_secs(300));
+    }
+    println!("uniformity for {} crops in {:?}", h.state().ws().crops.len(), t.elapsed());
+    settle(&mut h);
+    save_shot(&mut h, "real_uniformity.png");
+}

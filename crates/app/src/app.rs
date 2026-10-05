@@ -13,6 +13,7 @@ use crate::frame::Sel;
 use crate::inference::{Inference, Scope};
 use crate::mosaic::{self, Margins, MosaicEvent, MosaicState};
 use crate::session::Session;
+use crate::tasks::Task;
 use crate::thumbs::Thumbs;
 use crate::workspace::{Mark, Workspace};
 
@@ -47,6 +48,9 @@ pub struct FastLabelApp {
     /// Drop keyboard focus at the end of this frame (Tab handled by us).
     drop_focus: bool,
     pub(crate) inference: Inference,
+    /// Color-uniformity computation; sorts by it when done.
+    uniformity_task: Option<Task<std::collections::HashMap<u64, f32>>>,
+    export_task: Option<Task<Result<fastlabel_core::export::ExportReport, String>>>,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
     exit_ok: bool,
@@ -76,6 +80,8 @@ impl FastLabelApp {
             tags_buf: None,
             drop_focus: false,
             inference: Inference::default(),
+            uniformity_task: None,
+            export_task: None,
             status: None,
             exit_ok: false,
             #[cfg(test)]
@@ -253,6 +259,90 @@ impl FastLabelApp {
             }
             Err(e) => self.error(e),
         }
+    }
+
+    /// Starts computing missing uniformity values; returns false if none are missing.
+    pub(crate) fn start_uniformity(&mut self, ctx: &egui::Context) -> bool {
+        if self.uniformity_task.is_some() {
+            return true;
+        }
+        let Some(ws) = &self.ws else { return false };
+        let frames = ws.missing_uniformity();
+        if frames.is_empty() {
+            return false;
+        }
+        let threads =
+            std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1).max(1));
+        self.uniformity_task = Some(Task::spawn("color uniformity", ctx, move |p| {
+            crate::metrics::compute(frames, threads, p)
+        }));
+        true
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context) {
+        if self.export_task.is_some() || !self.save() {
+            return;
+        }
+        let Some(ws) = &self.ws else { return };
+        let p = &ws.project;
+        let Some(source) = &p.source else { return };
+        let name = source.file_name();
+        let dir_name =
+            p.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = name.trim_start_matches("annotations.").trim_end_matches(".json");
+        let Some(out) = rfd::FileDialog::new()
+            .set_directory(p.dir.parent().unwrap_or(&p.dir))
+            .set_file_name(format!("{dir_name}_{stem}.zip"))
+            .add_filter("zip", &["zip"])
+            .save_file()
+        else {
+            return;
+        };
+        let (root, coco) = (p.dir.clone(), p.dataset.coco.clone());
+        self.export_task = Some(Task::spawn("export", ctx, move |progress| {
+            use std::sync::atomic::Ordering;
+            fastlabel_core::export::export_zip(&root, &coco, &name, &out, |done, total| {
+                progress.done.store(done, Ordering::Relaxed);
+                progress.total.store(total, Ordering::Relaxed);
+                !progress.cancel.load(Ordering::Relaxed)
+            })
+            .map(|mut r| {
+                r.missing.truncate(5);
+                r
+            })
+            .map_err(|e| format!("{e} ({})", out.display()))
+        }));
+    }
+
+    fn poll_tasks(&mut self, ctx: &egui::Context) {
+        if let Some(values) = self.uniformity_task.as_mut().and_then(Task::poll) {
+            self.uniformity_task = None;
+            if let Some(ws) = &mut self.ws {
+                let n = values.len();
+                ws.opts.sort = SortKey::Uniformity;
+                let result = ws.add_uniformity(values);
+                ws.select(0);
+                match result {
+                    Ok(()) => self.info(format!("Color uniformity computed for {n} boxes")),
+                    Err(e) => self.error(format!("Cannot store color uniformity: {e:#}")),
+                }
+                self.mosaic.ensure_visible = true;
+            }
+        }
+        if let Some(result) = self.export_task.as_mut().and_then(Task::poll) {
+            self.export_task = None;
+            match result {
+                Ok(r) if r.cancelled => self.info("Export cancelled"),
+                Ok(r) if r.missing.is_empty() => self.info(format!("Exported {} images", r.images)),
+                Ok(r) => self.error(format!(
+                    "Exported {} images; missing: {}",
+                    r.images,
+                    r.missing.join(", ")
+                )),
+                Err(e) => self.error(format!("Export failed: {e}")),
+            }
+        }
+        let _ = ctx;
     }
 
     fn model_menu(&mut self, ui: &mut egui::Ui) {
@@ -652,6 +742,7 @@ impl FastLabelApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let mut want_uniformity = false;
         ui.horizontal_wrapped(|ui| {
             if ui.button("📂 Open…").on_hover_text("Open a dataset folder (Ctrl+O)").clicked() {
                 self.pick_and_open(&ctx);
@@ -659,6 +750,13 @@ impl FastLabelApp {
             let has_ws = self.ws.is_some();
             if ui.add_enabled(has_ws, egui::Button::new("💾 Save (S)")).clicked() {
                 self.save();
+            }
+            if ui
+                .add_enabled(has_ws && self.export_task.is_none(), egui::Button::new("Export zip…"))
+                .on_hover_text("Saves pending edits, then zips the annotation file and images")
+                .clicked()
+            {
+                self.start_export(&ctx);
             }
             self.model_menu(ui);
             let Some(ws) = &mut self.ws else { return };
@@ -745,6 +843,14 @@ impl FastLabelApp {
                     }
                 })
             });
+            if opts.sort == SortKey::Uniformity
+                && ws.opts.sort != SortKey::Uniformity
+                && !ws.missing_uniformity().is_empty()
+            {
+                // Sorted once the values are computed.
+                opts.sort = ws.opts.sort;
+                want_uniformity = true;
+            }
             if opts != ws.opts {
                 ws.opts = opts;
                 ws.rebuild();
@@ -752,6 +858,9 @@ impl FastLabelApp {
                 self.mosaic.ensure_visible = true;
             }
         });
+        if want_uniformity {
+            self.start_uniformity(&ctx);
+        }
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -809,6 +918,34 @@ impl FastLabelApp {
                     self.inference.cancel();
                 }
             }
+            let mut cancel = [false; 2];
+            for (i, task) in [
+                self.uniformity_task.as_ref().map(|t| (t.label, t.progress())),
+                self.export_task.as_ref().map(|t| (t.label, t.progress())),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Some((label, (done, total))) = task else { continue };
+                ui.separator();
+                let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("{label} {done}/{total}"))
+                        .desired_width(200.0),
+                );
+                cancel[i] = ui.button("Cancel").clicked();
+            }
+            if cancel[0]
+                && let Some(t) = &self.uniformity_task
+            {
+                t.cancel();
+            }
+            if cancel[1]
+                && let Some(t) = &self.export_task
+            {
+                t.cancel();
+            }
             if let Some(s) = &self.status {
                 ui.separator();
                 let color =
@@ -844,6 +981,7 @@ impl eframe::App for FastLabelApp {
             t.begin_frame(&ctx);
         }
         self.poll_inference();
+        self.poll_tasks(&ctx);
         self.handle_keys(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
