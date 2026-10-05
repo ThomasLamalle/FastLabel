@@ -17,6 +17,8 @@ pub enum SortKey {
     Id,
     Width,
     Height,
+    AspectRatio,
+    Area,
     Iou,
     Confidence,
     Uniformity,
@@ -24,10 +26,12 @@ pub enum SortKey {
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 7] = [
+    pub const ALL: [SortKey; 9] = [
         SortKey::Id,
         SortKey::Width,
         SortKey::Height,
+        SortKey::AspectRatio,
+        SortKey::Area,
         SortKey::Iou,
         SortKey::Confidence,
         SortKey::Uniformity,
@@ -39,6 +43,8 @@ impl SortKey {
             SortKey::Id => "Id",
             SortKey::Width => "Width",
             SortKey::Height => "Height",
+            SortKey::AspectRatio => "Aspect ratio (w / h)",
+            SortKey::Area => "Area",
             SortKey::Iou => "IoU with prediction",
             SortKey::Confidence => "Prediction confidence",
             SortKey::Uniformity => "Color uniformity",
@@ -141,6 +147,11 @@ impl Crop {
             SortKey::Id => self.ann_id().map(|a| a as f64),
             SortKey::Width => Some(self.primary().w),
             SortKey::Height => Some(self.primary().h),
+            SortKey::AspectRatio => {
+                let b = self.primary();
+                (b.h > 0.0).then(|| b.w / b.h)
+            }
+            SortKey::Area => Some(self.primary().area()),
             SortKey::Iou => self.iou,
             SortKey::Confidence => self.pred.map(|p| p.score),
             SortKey::Uniformity => self.uniformity.map(f64::from),
@@ -404,5 +415,8 @@ pub(crate) mod tests {
         assert_eq!(run(SortKey::Iou, true), vec!["#1", "#2", "P150", "#3"]);
         assert_eq!(run(SortKey::Confidence, false), vec!["P150", "#1", "#2", "#3"]);
         assert_eq!(run(SortKey::Id, true), vec!["#3", "#2", "#1", "P150"]);
+        // #1 10x10 (1.0, 100), #2 20x30 (0.67, 600), #3 40x5 (8.0, 200), P150 8x8 (1.0, 64)
+        assert_eq!(run(SortKey::AspectRatio, false), vec!["#2", "#1", "P150", "#3"]);
+        assert_eq!(run(SortKey::Area, true), vec!["#2", "#3", "#1", "P150"]);
     }
 }

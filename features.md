@@ -74,6 +74,8 @@ Always available:
 - by id
 - by height
 - by width
+- by aspect ratio (width / height)
+- by area
 
 Others:
 - by IoU with prediction
@@ -137,7 +139,7 @@ The last session is restored on launch: dataset, mode, scroll position, sort, fi
 # TODO: ideas for later (don't implement yet)
 
 - Predict once at a very low confidence, then filter predictions live with a confidence slider (no re-run).
-- More sorts: aspect ratio, area, blur (Laplacian variance), boxes touching the frame border.
+- More sorts: blur (Laplacian variance), boxes touching the frame border.
 - Duplicate GT filter: two GT boxes on the same frame with IoU > 0.7.
 - Headless CLI: `fastlabel predict | stats | export | diff vN vM`.
 - Version diff view: what changed between two annotation versions.
