@@ -211,3 +211,62 @@ fn model_on_frame() {
     let preds = h.state().ws().project.predictions.as_ref().unwrap();
     assert!(!preds.of(idx).unwrap().is_empty(), "the model found bibs on the frame");
 }
+
+#[test]
+fn frame_mode_draw_edit_navigate_popup_and_peek() {
+    use crate::app::Mode;
+    use crate::frame::Sel;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 800.0));
+    settle(&mut h);
+
+    // Space held in the mosaic shows the peek overlay (read-only).
+    h.key_down(Key::Space);
+    h.run_steps(2);
+    settle(&mut h);
+    save_shot(&mut h, "10_peek.png");
+    h.key_up(Key::Space);
+    h.run_steps(2);
+
+    // Tab → frame mode on the selected crop's frame, box selected.
+    h.key_press(Key::Tab);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Frame);
+    assert_eq!(h.state().ws().frame.sel, Some(Sel::Gt(1)));
+    settle(&mut h);
+
+    // Draw a new box by dragging on an empty area.
+    h.drag_at(egui::pos2(700.0, 200.0));
+    h.run_steps(2);
+    h.hover_at(egui::pos2(760.0, 250.0));
+    h.run_steps(2);
+    h.drop_at(egui::pos2(800.0, 300.0));
+    h.run_steps(3);
+    let ws = h.state().ws();
+    let added: Vec<_> = ws.frame_boxes(0).into_iter().filter(|b| b.added).collect();
+    assert_eq!(added.len(), 1, "a box was drawn");
+    assert_eq!(ws.frame.sel, Some(Sel::Gt(added[0].id)));
+    save_shot(&mut h, "11_frame_drawn.png");
+
+    // D marks the selection; J cycles; l goes to the next frame.
+    h.key_press(Key::D);
+    h.key_press(Key::L);
+    h.run_steps(2);
+    let ws = h.state().ws();
+    assert_eq!(ws.frame.image_idx, 1);
+    assert!(ws.project.log.state().ann_mark(added[0].id).is_some());
+
+    // Back to the mosaic, Enter opens the popup, Esc closes it.
+    h.key_press(Key::Tab);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Mosaic);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().popup);
+    settle(&mut h);
+    save_shot(&mut h, "12_popup.png");
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().popup);
+}

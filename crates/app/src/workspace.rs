@@ -48,6 +48,8 @@ pub struct Workspace {
     pub crops: Vec<Crop>,
     pub selected: usize,
     pub columns: usize,
+    /// Frame mode / editor state.
+    pub frame: crate::frame::FrameState,
 }
 
 /// Outcome of a user action, for the status line.
@@ -69,6 +71,7 @@ impl Workspace {
             crops: Vec::new(),
             selected: 0,
             columns: columns.max(1),
+            frame: Default::default(),
         };
         ws.rebuild();
         Ok(ws)
@@ -187,7 +190,7 @@ impl Workspace {
         }
     }
 
-    fn record(&mut self, op: Op) -> ActionResult {
+    pub(crate) fn record(&mut self, op: Op) -> ActionResult {
         self.project.record(op).map_err(|e| format!("action applied but not journaled: {e}"))
     }
 
@@ -343,8 +346,17 @@ impl Workspace {
 
     /// Saves a new version and rebuilds the view.
     pub fn save(&mut self) -> anyhow::Result<Option<SaveReport>> {
+        let ds = &self.project.dataset;
+        let current = ds.images().get(self.frame.image_idx).map(|i| i.id);
         let report = self.project.save()?;
         if report.is_some() {
+            let ds = &self.project.dataset;
+            let n = ds.images().len();
+            // Deleted frames shift image indices: stay on the same image.
+            self.frame.image_idx = current
+                .and_then(|id| ds.image_idx(id))
+                .unwrap_or(self.frame.image_idx)
+                .min(n.saturating_sub(1));
             self.rebuild();
         }
         Ok(report)

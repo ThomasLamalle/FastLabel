@@ -5,13 +5,25 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers, RichText, ViewportCommand};
 use fastlabel_core::Split;
+use fastlabel_media::Job;
 
 use crate::crops::SortKey;
+use crate::editor::{EditorAction, EditorView, FrameData};
+use crate::frame::Sel;
 use crate::inference::{Inference, Scope};
 use crate::mosaic::{self, Margins, MosaicEvent, MosaicState};
 use crate::session::Session;
 use crate::thumbs::Thumbs;
 use crate::workspace::{Mark, Workspace};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Mosaic,
+    Frame,
+}
+
+/// Full frames are loaded at most this large.
+const FRAME_MAX_SIDE: u32 = 4096;
 
 struct Status {
     text: String,
@@ -25,6 +37,15 @@ pub struct FastLabelApp {
     ws: Option<Workspace>,
     thumbs: Option<Thumbs>,
     mosaic: MosaicState,
+    pub(crate) mode: Mode,
+    /// Editor popup over the mosaic (Enter / double click).
+    pub(crate) popup: bool,
+    editor: EditorView,
+    peek: EditorView,
+    /// Tags text being edited: (image index, text).
+    tags_buf: Option<(usize, String)>,
+    /// Drop keyboard focus at the end of this frame (Tab handled by us).
+    drop_focus: bool,
     pub(crate) inference: Inference,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
@@ -48,6 +69,12 @@ impl FastLabelApp {
             ws: None,
             thumbs: None,
             mosaic: MosaicState::default(),
+            mode: Mode::Mosaic,
+            popup: false,
+            editor: EditorView::default(),
+            peek: EditorView::default(),
+            tags_buf: None,
+            drop_focus: false,
             inference: Inference::default(),
             status: None,
             exit_ok: false,
@@ -306,18 +333,88 @@ impl FastLabelApp {
             };
             self.handle_key(ctx, key, repeat, modifiers);
         }
+        // egui would also move focus with Tab; we use it to switch modes.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+            self.drop_focus = true;
+        }
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        let Some(ws) = &mut self.ws else { return };
+        match mode {
+            Mode::Frame => ws.focus_selected_crop(),
+            Mode::Mosaic => {
+                ws.select_crop_of_frame();
+                self.mosaic.ensure_visible = true;
+            }
+        }
+        self.mode = mode;
     }
 
     fn handle_key(&mut self, ctx: &egui::Context, key: Key, repeat: bool, m: Modifiers) {
-        let page = self.mosaic.rows_per_screen.max(1) as isize;
-        let Some(ws) = &mut self.ws else {
+        if self.ws.is_none() {
             if key == Key::O && m.command {
                 self.pick_and_open(ctx);
             }
             return;
+        }
+        let plain = !m.command && !m.alt;
+        // Shortcuts valid everywhere.
+        let result = match key {
+            Key::S if plain && !repeat => {
+                if self.save() {
+                    self.popup = false;
+                }
+                return;
+            }
+            Key::Q if plain && !repeat => {
+                if self.popup {
+                    self.popup = false;
+                } else {
+                    self.inference.shutdown();
+                    if self.save() {
+                        self.exit_ok = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+                return;
+            }
+            Key::O if m.command => {
+                self.pick_and_open(ctx);
+                return;
+            }
+            Key::Tab if plain && !self.popup => {
+                let next = if self.mode == Mode::Mosaic { Mode::Frame } else { Mode::Mosaic };
+                self.set_mode(next);
+                return;
+            }
+            Key::U if plain => self.ws.as_mut().map(Workspace::undo),
+            Key::Z if m.command && m.shift => self.ws.as_mut().map(Workspace::redo),
+            Key::Z if m.command => self.ws.as_mut().map(Workspace::undo),
+            Key::Y if m.command => self.ws.as_mut().map(Workspace::redo),
+            _ => None,
         };
+        if let Some(r) = result {
+            self.mosaic.ensure_visible = true;
+            if let Err(e) = r {
+                self.error(e);
+            }
+            return;
+        }
+        let r = if self.popup || self.mode == Mode::Frame {
+            self.frame_key(key, repeat, m)
+        } else {
+            self.mosaic_key(key, repeat, m)
+        };
+        if let Err(e) = r {
+            self.error(e);
+        }
+    }
+
+    fn mosaic_key(&mut self, key: Key, repeat: bool, m: Modifiers) -> Result<(), String> {
+        let page = self.mosaic.rows_per_screen.max(1) as isize;
+        let Some(ws) = &mut self.ws else { return Ok(()) };
         let mut result = Ok(());
-        let mut moved = true;
         match key {
             Key::ArrowLeft | Key::H if !m.command => ws.move_selection(-1, 0),
             Key::ArrowRight | Key::L if !m.command => ws.move_selection(1, 0),
@@ -341,33 +438,216 @@ impl FastLabelApp {
                     ws.mark_selected(mark)
                 };
             }
-            Key::U if !m.command => result = ws.undo(),
-            Key::Z if m.command && m.shift => result = ws.redo(),
-            Key::Z if m.command => result = ws.undo(),
-            Key::Y if m.command => result = ws.redo(),
-            _ => moved = false,
+            Key::Enter if !repeat && ws.selected_crop().is_some() => {
+                ws.focus_selected_crop();
+                self.popup = true;
+                return Ok(());
+            }
+            _ => return Ok(()),
         }
-        if moved {
-            self.mosaic.ensure_visible = true;
+        self.mosaic.ensure_visible = true;
+        result
+    }
+
+    fn frame_key(&mut self, key: Key, repeat: bool, m: Modifiers) -> Result<(), String> {
+        let popup = self.popup;
+        let Some(ws) = &mut self.ws else { return Ok(()) };
+        if ws.project.dataset.images().is_empty() {
+            return Ok(());
         }
-        if let Err(e) = result {
-            self.error(e);
+        const DIGITS: [Key; 9] = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ];
+        match key {
+            Key::ArrowLeft | Key::H | Key::ArrowRight | Key::L if !popup => {
+                let dir = if matches!(key, Key::ArrowLeft | Key::H) { -1 } else { 1 };
+                if let Some(i) = ws.step_frame(dir, m.command) {
+                    ws.go_to_frame(i);
+                }
+                Ok(())
+            }
+            Key::J | Key::K | Key::ArrowDown | Key::ArrowUp => {
+                cycle_selection(ws, if matches!(key, Key::K | Key::ArrowUp) { -1 } else { 1 });
+                Ok(())
+            }
+            Key::D if !repeat => ws.mark_sel(Mark::Delete),
+            Key::G if !repeat => ws.mark_sel(Mark::Good),
+            Key::F if !repeat => {
+                ws.toggle_frame_delete()?;
+                // Like the mosaic, F moves on (except in the popup).
+                if !popup
+                    && ws.is_frame_deleted(ws.frame.image_idx)
+                    && let Some(i) = ws.step_frame(1, false)
+                {
+                    ws.go_to_frame(i);
+                }
+                Ok(())
+            }
+            Key::Escape if popup => {
+                self.popup = false;
+                Ok(())
+            }
+            Key::Enter if popup && !repeat => {
+                self.popup = false;
+                Ok(())
+            }
+            Key::Escape => {
+                ws.frame.sel = None;
+                Ok(())
+            }
+            k => match DIGITS.iter().position(|d| *d == k) {
+                Some(n) if !repeat => ws.set_category_index(n),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Frame header (name, tags, frame deletion, model) and the editor.
+    fn frame_panel(&mut self, ui: &mut egui::Ui, popup: bool) {
+        let ctx = ui.ctx().clone();
+        let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
+        let n = ws.project.dataset.images().len();
+        if n == 0 {
+            ui.centered_and_justified(|ui| ui.label("No frames."));
             return;
         }
-        match key {
-            Key::S if !repeat && !m.command => {
-                self.save();
-            }
-            Key::Q if !repeat && !m.command => {
-                self.inference.shutdown();
-                if self.save() {
-                    self.exit_ok = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+        let idx = ws.frame.image_idx.min(n - 1);
+        ws.frame.image_idx = idx;
+        let img = ws.project.dataset.images()[idx].clone();
+        let job =
+            Job::Frame { path: ws.project.dataset.image_path(&img), max_side: FRAME_MAX_SIDE };
+        let texture = thumbs.texture(job.id());
+        thumbs.want_urgent(job);
+        if !popup {
+            for dir in [1, -1] {
+                if let Some(i) = ws.step_frame(dir, false) {
+                    let path = ws.project.dataset.image_path(&ws.project.dataset.images()[i]);
+                    thumbs.want(vec![Job::Frame { path, max_side: FRAME_MAX_SIDE }]);
                 }
             }
-            Key::O if m.command => self.pick_and_open(ctx),
-            _ => {}
         }
+
+        let mut run_here = false;
+        let mut error = None;
+        let deleted = ws.is_frame_deleted(idx);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} / {n}", idx + 1)).strong());
+            ui.label(&img.file_name);
+            if let Some(split) = ws.project.dataset.split_of(idx) {
+                ui.label(RichText::new(split.name()).weak());
+            }
+            ui.separator();
+            ui.label("Tags");
+            let buf = match &mut self.tags_buf {
+                Some((i, text)) if *i == idx => text,
+                other => {
+                    *other = Some((idx, ws.tags_of(idx).join(", ")));
+                    &mut other.as_mut().expect("just set").1
+                }
+            };
+            let resp = ui.add(
+                egui::TextEdit::singleline(buf).hint_text("blurry, occluded").desired_width(240.0),
+            );
+            if resp.lost_focus()
+                && let Err(e) = ws.set_tags_text(idx, buf)
+            {
+                error = Some(e);
+            }
+            ui.separator();
+            if ui.selectable_label(deleted, "F  delete frame").clicked()
+                && let Err(e) = ws.toggle_frame_delete()
+            {
+                error = Some(e);
+            }
+            if ui.button("Run model on this frame").clicked() {
+                run_here = true;
+            }
+            if popup {
+                ui.label(RichText::new("Esc / Enter / Q to close").weak());
+            }
+        });
+
+        let boxes = ws.frame_boxes(idx);
+        let preds = ws.frame_preds(idx);
+        let categories: Vec<_> =
+            ws.project.dataset.categories().iter().map(|c| (c.id, c.name.clone())).collect();
+        let data = FrameData {
+            image_idx: idx,
+            texture: texture.as_ref(),
+            img_w: f64::from(img.width),
+            img_h: f64::from(img.height),
+            boxes: &boxes,
+            preds: &preds,
+            sel: ws.frame.sel,
+            frame_deleted: deleted,
+            interactive: true,
+            categories: &categories,
+        };
+        for action in self.editor.show(ui, &data) {
+            let r = match action {
+                EditorAction::Select(sel) => {
+                    ws.frame.sel = sel;
+                    Ok(())
+                }
+                EditorAction::SetBox(id, b) => ws.set_box(id, b),
+                EditorAction::AddBox(b) => ws.add_box(b).map(|_| ()),
+            };
+            if let Err(e) = r {
+                error = Some(e);
+            }
+        }
+        if let Some(e) = error {
+            self.error(e);
+        }
+        if run_here {
+            self.run_model(&ctx, Scope::Frame(idx));
+        }
+    }
+
+    /// Hold Space in the mosaic: the selected crop's whole frame, read-only.
+    fn peek_overlay(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
+        let Some(crop) = ws.selected_crop().copied() else { return };
+        let img = ws.project.dataset.images()[crop.image_idx].clone();
+        let job =
+            Job::Frame { path: ws.project.dataset.image_path(&img), max_side: FRAME_MAX_SIDE };
+        let texture = thumbs.texture(job.id());
+        thumbs.want_urgent(job);
+        let boxes = ws.frame_boxes(crop.image_idx);
+        let preds = ws.frame_preds(crop.image_idx);
+        let sel = Some(match crop.id {
+            crate::crops::CropId::Gt(a) => Sel::Gt(a),
+            crate::crops::CropId::Pred(p) => Sel::Pred(p),
+        });
+        let data = FrameData {
+            image_idx: crop.image_idx,
+            texture: texture.as_ref(),
+            img_w: f64::from(img.width),
+            img_h: f64::from(img.height),
+            boxes: &boxes,
+            preds: &preds,
+            sel,
+            frame_deleted: ws.is_frame_deleted(crop.image_idx),
+            interactive: false,
+            categories: &[],
+        };
+        let peek = &mut self.peek;
+        egui::Area::new(egui::Id::new("peek"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(area.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(area.size());
+                ui.set_max_size(area.size());
+                peek.show(ui, &data);
+            });
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -447,21 +727,23 @@ impl FastLabelApp {
                 });
             ui.toggle_value(&mut opts.hide_reviewed, "Hide reviewed");
             ui.add_enabled_ui(has_preds, |ui| {
-                ui.toggle_value(&mut opts.fp_only, "FP only");
-                ui.toggle_value(&mut opts.fn_only, "FN only");
-                let mut t = ws.thresholds;
-                ui.menu_button("Thresholds", |ui| {
-                    ui.add(iou_slider(&mut t.match_iou).text("Match IoU (TP)"));
-                    ui.add(iou_slider(&mut t.fp_iou).text("FP filter: best IoU below"));
-                    ui.add(iou_slider(&mut t.fn_iou).text("FN filter: best IoU below"));
-                    if ui.button("Reset defaults").clicked() {
-                        t = Default::default();
+                ui.horizontal(|ui| {
+                    ui.toggle_value(&mut opts.fp_only, "FP only");
+                    ui.toggle_value(&mut opts.fn_only, "FN only");
+                    let mut t = ws.thresholds;
+                    ui.menu_button("Thresholds", |ui| {
+                        ui.add(iou_slider(&mut t.match_iou).text("Match IoU (TP)"));
+                        ui.add(iou_slider(&mut t.fp_iou).text("FP filter: best IoU below"));
+                        ui.add(iou_slider(&mut t.fn_iou).text("FN filter: best IoU below"));
+                        if ui.button("Reset defaults").clicked() {
+                            t = Default::default();
+                        }
+                    });
+                    if t != ws.thresholds {
+                        ws.thresholds = t;
+                        ws.rebuild();
                     }
-                });
-                if t != ws.thresholds {
-                    ws.thresholds = t;
-                    ws.rebuild();
-                }
+                })
             });
             if opts != ws.opts {
                 ws.opts = opts;
@@ -573,19 +855,31 @@ impl eframe::App for FastLabelApp {
             }
         });
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
+        let mut central = egui::Rect::NOTHING;
         egui::CentralPanel::default().show(ui, |ui| {
-            let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else {
+            central = ui.max_rect();
+            if self.ws.is_none() {
                 ui.centered_and_justified(|ui| {
                     if ui.button("Open a dataset folder (Ctrl+O)").clicked() {
                         self.pick_and_open(&ctx);
                     }
                 });
                 return;
-            };
+            }
+            if self.mode == Mode::Frame {
+                self.frame_panel(ui, false);
+                return;
+            }
+            let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
             let margins = Margins { x: self.session.margin_x, y: self.session.margin_y };
             for ev in mosaic::show(ui, ws, thumbs, &mut self.mosaic, &margins) {
                 match ev {
-                    MosaicEvent::Select(i) | MosaicEvent::Open(i) => ws.select(i),
+                    MosaicEvent::Select(i) => ws.select(i),
+                    MosaicEvent::Open(i) => {
+                        ws.select(i);
+                        ws.focus_selected_crop();
+                        self.popup = true;
+                    }
                     MosaicEvent::QuickDelete(i) => {
                         ws.select(i);
                         let keep = ws.selected;
@@ -597,6 +891,32 @@ impl eframe::App for FastLabelApp {
                 }
             }
         });
+
+        if self.popup && self.ws.is_some() {
+            let size = ctx.content_rect().size() * 0.92;
+            let modal = egui::Modal::new(egui::Id::new("frame-editor")).show(&ctx, |ui| {
+                ui.set_min_size(size);
+                ui.set_max_size(size);
+                self.frame_panel(ui, true);
+            });
+            if modal.should_close() {
+                self.popup = false;
+            }
+        } else if self.mode == Mode::Mosaic
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.key_down(Key::Space))
+        {
+            self.peek_overlay(&ctx, central);
+        }
+
+        if let Some(t) = &mut self.thumbs {
+            t.flush();
+        }
+        if std::mem::take(&mut self.drop_focus)
+            && let Some(id) = ctx.memory(|m| m.focused())
+        {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
     }
 
     fn on_exit(&mut self) {
@@ -607,4 +927,25 @@ impl eframe::App for FastLabelApp {
 
 fn iou_slider(v: &mut f64) -> egui::Slider<'_> {
     egui::Slider::new(v, 0.05..=0.95).step_by(0.05)
+}
+
+/// J / K in the editor: next / previous box of the frame (GT, then predictions).
+fn cycle_selection(ws: &mut Workspace, dir: isize) {
+    let idx = ws.frame.image_idx;
+    let items: Vec<Sel> = ws
+        .frame_boxes(idx)
+        .iter()
+        .map(|b| Sel::Gt(b.id))
+        .chain(ws.frame_preds(idx).iter().map(|(p, _)| Sel::Pred(*p)))
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    let n = items.len() as isize;
+    let next = match ws.frame.sel.and_then(|s| items.iter().position(|x| *x == s)) {
+        Some(i) => (i as isize + dir).rem_euclid(n),
+        None if dir > 0 => 0,
+        None => n - 1,
+    };
+    ws.frame.sel = Some(items[next as usize]);
 }

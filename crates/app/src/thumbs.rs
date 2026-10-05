@@ -26,6 +26,8 @@ pub struct Thumbs {
     budget: usize,
     frame: u64,
     wanted: Vec<JobId>,
+    wants: Vec<Job>,
+    urgent: Vec<Job>,
 }
 
 impl Thumbs {
@@ -43,6 +45,8 @@ impl Thumbs {
             budget: budget_bytes,
             frame: 0,
             wanted: Vec::new(),
+            wants: Vec::new(),
+            urgent: Vec::new(),
         }
     }
 
@@ -79,12 +83,25 @@ impl Thumbs {
         Some(&e.slot)
     }
 
-    /// The jobs the view needs, most urgent first. Only the missing ones are
-    /// queued, and the loader is only told when the list changes.
+    /// Adds jobs the current frame needs, most urgent first.
     pub fn want(&mut self, jobs: Vec<Job>) {
+        self.wants.extend(jobs);
+    }
+
+    /// A job needed before everything else (the frame being edited).
+    pub fn want_urgent(&mut self, job: Job) {
+        self.urgent.push(job);
+    }
+
+    /// Sends this frame's wanted jobs to the loader; call once per frame
+    /// after drawing. Only missing images are queued, and the loader is only
+    /// told when the list changes.
+    pub fn flush(&mut self) {
+        let jobs =
+            std::mem::take(&mut self.urgent).into_iter().chain(std::mem::take(&mut self.wants));
+        let mut seen = std::collections::HashSet::new();
         let missing: Vec<(Job, u64)> = jobs
-            .into_iter()
-            .filter(|j| !self.entries.contains_key(&j.id()))
+            .filter(|j| !self.entries.contains_key(&j.id()) && seen.insert(j.id()))
             .enumerate()
             .map(|(i, j)| (j, i as u64))
             .collect();
@@ -92,6 +109,14 @@ impl Thumbs {
         if ids != self.wanted {
             self.wanted = ids;
             self.loader.set_wanted(missing);
+        }
+    }
+
+    /// The texture of a loaded image, if ready.
+    pub fn texture(&mut self, id: JobId) -> Option<TextureHandle> {
+        match self.get(id)? {
+            Slot::Ready(t) => Some(t.clone()),
+            Slot::Failed(_) => None,
         }
     }
 

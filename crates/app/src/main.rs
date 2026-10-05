@@ -2,6 +2,8 @@
 
 mod app;
 mod crops;
+mod editor;
+mod frame;
 mod inference;
 mod mosaic;
 mod session;

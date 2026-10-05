@@ -130,19 +130,30 @@ Each milestone ends with `cargo fmt --check && cargo clippy -D warnings && cargo
 - Fuzz the COCO / YOLO / predictions loaders (`cargo fuzz`) and harden against malformed input.
 - Release profile (LTO, `codegen-units = 1`), install instructions.
 
-## Keyboard map (mosaic)
+## Keyboard map
 
-| Key | Action |
+Everywhere: `S` save new version · `Q` save and quit (closes the popup when open) · `U` / `Ctrl+Z` undo · `Ctrl+Shift+Z` / `Ctrl+Y` redo · `Tab` mosaic ⇄ frame mode · `Ctrl+O` open dataset.
+
+| Mosaic | Action |
 |---|---|
 | ← → ↑ ↓ / h l k j | Move selection |
 | PgUp / PgDn, Home / End | Scroll by screen / to ends |
 | D / G / F / R | Delete-or-reject / accept-or-confirm / frame delete / replace (toggles, auto-advance) |
 | Shift + D / G / F | Same, for the whole row, then next row |
-| U, Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y | Undo / redo |
-| Enter | Open frame editor popup |
-| Space (hold) | Peek full frame |
-| Tab | Switch mosaic / frame mode |
-| S / Q | Save new version / save and quit |
+| Right click | D on the clicked crop (no advance) |
+| Enter / double click | Open the frame editor popup |
+| Space (hold) | Peek at the full frame |
+
+| Frame mode and popup | Action |
+|---|---|
+| h / l, ← / → (Ctrl: annotated only) | Previous / next frame (frame mode only) |
+| j / k, ↓ / ↑ | Next / previous box (GT, then predictions) |
+| D / G | Delete-or-reject / accept-or-confirm the selected box |
+| F | Toggle frame deletion (frame mode: then next frame) |
+| 1–9 | Category of the selected box and of new boxes |
+| Drag on empty area / box / handle | Draw / move / resize |
+| Wheel, middle drag or Space + drag | Zoom around cursor, pan |
+| Esc | Deselect (frame mode) / close (popup, also Enter) |
 
 ## Risks
 
@@ -163,3 +174,4 @@ Each milestone ends with `cargo fmt --check && cargo clippy -D warnings && cargo
 | M3 | done | egui 0.36 mosaic: virtualized rows, hjkl/arrows/PgUp/PgDn/Home/End, D/G/F/R + Shift row toggles (no auto-repeat), right-click = D, undo/redo, S/Q, save on window close, session restore, sort + split + hide-reviewed + FP/FN filters. Headless UI tests with egui_kittest (offscreen wgpu): full keyboard flow on a synthetic dataset; opt-in screenshot test on a real copy. |
 | M4 | done | TP crops show GT + matched prediction, FP crops, IoU/confidence sorts, FP/FN filters, thresholds menu (match / FP / FN IoU), R replace, persistent rejects, reviewed state + hide-reviewed, model info tooltip. |
 | M5 | done | ort CPU detector: YOLO raw head + class-wise NMS (exp-10), YOLO end-to-end, DETR-style (RF-DETR, **not yet validated against a real export**). Square or Ultralytics-"rect" letterbox (dynamic-input models). Input tensor matches OpenCV/Ultralytics within 0.13/255 mean. vs the `.pt` with the same square letterbox: 146/147 boxes matched, mean IoU 0.983, max score diff 0.027 (exp-10.onnx has FP16 weights). Speed on Ryzen 5 5500U: 1.16 s/frame at 1280² (6 threads); PyTorch rect 1280×736: 0.42 s. Re-exporting FP32 + `dynamic=True` should close most of the gap. App: Model menu (path, confidence, run all / run on frame), background run with progress + cancel, save blocked during runs, cancelled full runs keep previous predictions, auto IoU-ascending sort after a full run. |
+| M6 | done | Tab frame mode (h/l, Ctrl annotated-only), editor shared with the Enter/double-click popup: draw, select, move, 8-handle resize, zoom around cursor, pan (middle / Space drag), j/k box cycling, D/G on boxes and predictions, 1–9 categories, tags, F, run model on frame. Hold-Space peek over the mosaic. Edits are pending ops (visible immediately in frame view, applied on save). UI test drives Tab, mouse draw, D, l, Enter, Esc. |
