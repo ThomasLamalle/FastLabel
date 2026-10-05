@@ -90,7 +90,6 @@ impl Workspace {
         if !self.has_predictions() {
             self.opts.fp_only = false;
             self.opts.fn_only = false;
-            self.opts.extra_only = false;
             if self.opts.sort.needs_predictions() {
                 self.opts.sort = crops::SortKey::Id;
             }

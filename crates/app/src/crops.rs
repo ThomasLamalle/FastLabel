@@ -58,8 +58,6 @@ pub struct ViewOptions {
     pub descending: bool,
     pub fp_only: bool,
     pub fn_only: bool,
-    /// Unpaired boxes overlapping an already paired box (duplicates).
-    pub extra_only: bool,
     pub hide_reviewed: bool,
     pub split: Option<Split>,
 }
@@ -226,10 +224,9 @@ pub fn build(
         if opts.hide_reviewed && reviewed {
             return false;
         }
-        // Several toggles on: their union.
-        if opts.fp_only || opts.fn_only || opts.extra_only {
-            let fp_fn = c.filter_candidate && if c.is_pred() { opts.fp_only } else { opts.fn_only };
-            return fp_fn || (opts.extra_only && c.status == CropStatus::Extra);
+        if opts.fp_only || opts.fn_only {
+            let wanted = if c.is_pred() { opts.fp_only } else { opts.fn_only };
+            return wanted && c.filter_candidate;
         }
         true
     });
@@ -407,35 +404,5 @@ pub(crate) mod tests {
         assert_eq!(run(SortKey::Iou, true), vec!["#1", "#2", "P150", "#3"]);
         assert_eq!(run(SortKey::Confidence, false), vec!["P150", "#1", "#2", "#3"]);
         assert_eq!(run(SortKey::Id, true), vec!["#3", "#2", "#1", "P150"]);
-    }
-
-    #[test]
-    fn extra_only_shows_duplicates() {
-        let gt = BBox::new(0.0, 0.0, 10.0, 10.0);
-        let ds = dataset(&["images/train/a.jpg"], &[(1, gt)]);
-        let mut preds = Predictions::empty("m", 0.1);
-        preds.set_image(
-            0,
-            vec![
-                pred(1, gt, 0.9),
-                pred(1, BBox::new(2.0, 0.0, 10.0, 10.0), 0.5),
-                pred(1, BBox::new(100.0, 50.0, 9.0, 9.0), 0.3),
-            ],
-        );
-        let ev = evaluate(&ds, &preds);
-        let opts = |extra_only, fp_only| ViewOptions { extra_only, fp_only, ..Default::default() };
-        let run = |o: ViewOptions| {
-            ids(&build(
-                &ds,
-                Some(&preds),
-                Some(&ev),
-                &ReviewState::default(),
-                &Uniformity::default(),
-                None,
-                &o,
-            ))
-        };
-        assert_eq!(run(opts(true, false)), vec!["P2"]);
-        assert_eq!(run(opts(true, true)), vec!["P2", "P100"]);
     }
 }
