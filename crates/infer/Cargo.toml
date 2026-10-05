@@ -1,0 +1,11 @@
+[package]
+name = "fastlabel-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ort = "2.0.0-rc.13"
+
+[lints]
+workspace = true

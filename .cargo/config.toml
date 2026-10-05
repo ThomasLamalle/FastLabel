@@ -1,0 +1,4 @@
+[alias]
+# cargo check-all: format check + clippy (warnings are errors) + tests
+check-all = "clippy --workspace --all-targets -- -D warnings"
+t = "test --workspace"
