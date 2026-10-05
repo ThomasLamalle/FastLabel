@@ -185,3 +185,29 @@ fn real_dataset_shot() {
     settle(&mut h);
     save_shot(&mut h, "real_02.png");
 }
+
+/// Opt-in: runs a real model on the selected crop's frame through the app.
+/// `FASTLABEL_SHOT_DATASET=<copy> FASTLABEL_MODEL=<model.onnx> cargo test -p fastlabel model_on_frame -- --ignored`
+#[test]
+#[ignore]
+fn model_on_frame() {
+    let dataset =
+        PathBuf::from(std::env::var("FASTLABEL_SHOT_DATASET").expect("FASTLABEL_SHOT_DATASET"));
+    let model = PathBuf::from(std::env::var("FASTLABEL_MODEL").expect("FASTLABEL_MODEL"));
+    let mut h = harness(dataset, egui::vec2(1200.0, 800.0));
+    settle(&mut h);
+    let idx = h.state().ws().selected_crop().unwrap().image_idx;
+    h.state_mut().session_mut().model_path = Some(model);
+    let ctx = h.ctx.clone();
+    h.state_mut().run_model(&ctx, crate::inference::Scope::Frame(idx));
+    for _ in 0..600 {
+        h.step();
+        if !h.state().inference.is_running() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.run_steps(2);
+    let preds = h.state().ws().project.predictions.as_ref().unwrap();
+    assert!(!preds.of(idx).unwrap().is_empty(), "the model found bibs on the frame");
+}

@@ -2,6 +2,7 @@
 
 mod app;
 mod crops;
+mod inference;
 mod mosaic;
 mod session;
 mod thumbs;

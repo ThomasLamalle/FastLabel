@@ -6,6 +6,8 @@ use std::path::Path;
 use fastlabel_core::matching::{Thresholds, evaluate};
 use fastlabel_core::project::SaveReport;
 use fastlabel_core::{AnnMark, Evaluation, Op, PredMark, Project};
+use fastlabel_core::{PredRef, Predictions};
+use fastlabel_infer::{BatchItem, BatchResult};
 
 use crate::crops::{self, Crop, CropId, ViewOptions};
 
@@ -261,6 +263,84 @@ impl Workspace {
         }
     }
 
+    /// Frames to run the model on: all images except frames pending deletion.
+    pub fn inference_items(&self) -> Vec<BatchItem> {
+        let ds = &self.project.dataset;
+        let st = self.project.log.state();
+        ds.images()
+            .iter()
+            .enumerate()
+            .filter(|(_, img)| !st.is_frame_deleted(img.id))
+            .map(|(key, img)| BatchItem { key, path: ds.image_path(img) })
+            .collect()
+    }
+
+    pub fn frame_item(&self, image_idx: usize) -> BatchItem {
+        let ds = &self.project.dataset;
+        BatchItem { key: image_idx, path: ds.image_path(&ds.images()[image_idx]) }
+    }
+
+    /// Stores model output as the predictions (all frames, or one frame) and
+    /// rebuilds. A cancelled full run keeps the previous predictions.
+    pub fn apply_detections(
+        &mut self,
+        all: bool,
+        model: &str,
+        confidence: f64,
+        class_names: &[String],
+        result: BatchResult,
+    ) -> Result<String, String> {
+        if result.cancelled && all {
+            return Err("Model run cancelled; previous predictions kept".into());
+        }
+        let ds = &self.project.dataset;
+        let mapping: Vec<_> = class_names
+            .iter()
+            .map(|n| {
+                ds.category_by_name(n)
+                    .ok_or_else(|| format!("model class '{n}' has no matching dataset category"))
+            })
+            .collect::<Result<_, _>>()?;
+        let to_refs = |idx: usize,
+                       dets: &[fastlabel_infer::Detection]|
+         -> Result<Vec<PredRef>, String> {
+            let image_id = ds.images()[idx].id;
+            dets.iter()
+                .map(|d| {
+                    let category_id = *mapping
+                        .get(d.class)
+                        .ok_or_else(|| format!("unknown model class index {}", d.class))?;
+                    Ok(PredRef { image_id, category_id, bbox: d.bbox, score: f64::from(d.score) })
+                })
+                .collect()
+        };
+        let boxes: usize = result.detections.iter().map(|(_, d)| d.len()).sum();
+        if all {
+            let mut preds = Predictions::empty(model, confidence);
+            for (idx, dets) in &result.detections {
+                preds.set_image(*idx, to_refs(*idx, dets)?);
+            }
+            self.project.set_predictions(preds).map_err(|e| e.to_string())?;
+            self.opts.sort = crops::SortKey::Iou;
+            self.opts.descending = false;
+        } else if let Some((idx, dets)) = result.detections.first() {
+            let refs = to_refs(*idx, dets)?;
+            self.project
+                .set_image_predictions(*idx, refs, model, confidence)
+                .map_err(|e| e.to_string())?;
+        }
+        self.rebuild();
+        let mut msg = format!("{boxes} predictions on {} frames", result.detections.len());
+        if !result.failed.is_empty() {
+            msg.push_str(&format!(
+                ", {} frames failed ({})",
+                result.failed.len(),
+                result.failed[0].1
+            ));
+        }
+        Ok(msg)
+    }
+
     /// Saves a new version and rebuilds the view.
     pub fn save(&mut self) -> anyhow::Result<Option<SaveReport>> {
         let report = self.project.save()?;
@@ -383,6 +463,40 @@ mod tests {
         // The accepted prediction is now a reviewed TP annotation.
         let new = ws.crops.iter().find(|c| c.ann_id() == Some(4)).unwrap();
         assert!(ws.marks_of(new).reviewed);
+    }
+
+    #[test]
+    fn detections_become_predictions_with_category_mapping() {
+        use fastlabel_infer::Detection;
+        let (_d, mut ws) = open_fixture(2);
+        assert_eq!(ws.inference_items().len(), 2);
+        let det = |x| Detection {
+            class: 0,
+            bbox: fastlabel_core::BBox::new(x, 10.0, 20.0, 20.0),
+            score: 0.6,
+        };
+        let result = BatchResult { detections: vec![(1, vec![det(100.0)])], ..Default::default() };
+        let msg = ws.apply_detections(false, "m.onnx", 0.2, &["BIB".into()], result).unwrap();
+        assert!(msg.starts_with("1 predictions"));
+        let preds = ws.project.predictions.as_ref().unwrap();
+        assert_eq!(preds.of(1).unwrap().len(), 1, "frame 2 now predicted");
+        assert_eq!(preds.of(0).unwrap().len(), 2, "frame 1 untouched");
+
+        let bad = BatchResult { detections: vec![(0, vec![det(0.0)])], ..Default::default() };
+        assert!(ws.apply_detections(true, "m", 0.2, &["car".into()], bad).is_err());
+        let cancelled = BatchResult { cancelled: true, ..Default::default() };
+        assert!(ws.apply_detections(true, "m", 0.2, &["bib".into()], cancelled).is_err());
+        assert_eq!(ws.project.predictions.as_ref().unwrap().of(0).unwrap().len(), 2, "kept");
+
+        let full = BatchResult {
+            detections: vec![(0, vec![]), (1, vec![det(5.0)])],
+            ..Default::default()
+        };
+        ws.apply_detections(true, "m2", 0.3, &["bib".into()], full).unwrap();
+        let preds = ws.project.predictions.as_ref().unwrap();
+        assert_eq!(preds.model, "m2");
+        assert_eq!(preds.of(0).unwrap().len(), 0);
+        assert_eq!(ws.opts.sort, crops::SortKey::Iou);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use eframe::egui::{self, Color32, Key, Modifiers, RichText, ViewportCommand};
 use fastlabel_core::Split;
 
 use crate::crops::SortKey;
+use crate::inference::{Inference, Scope};
 use crate::mosaic::{self, Margins, MosaicEvent, MosaicState};
 use crate::session::Session;
 use crate::thumbs::Thumbs;
@@ -24,6 +25,7 @@ pub struct FastLabelApp {
     ws: Option<Workspace>,
     thumbs: Option<Thumbs>,
     mosaic: MosaicState,
+    pub(crate) inference: Inference,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
     exit_ok: bool,
@@ -46,6 +48,7 @@ impl FastLabelApp {
             ws: None,
             thumbs: None,
             mosaic: MosaicState::default(),
+            inference: Inference::default(),
             status: None,
             exit_ok: false,
             #[cfg(test)]
@@ -61,6 +64,11 @@ impl FastLabelApp {
     #[cfg(test)]
     pub fn ws(&self) -> &Workspace {
         self.ws.as_ref().expect("a dataset is open")
+    }
+
+    #[cfg(test)]
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
     }
 
     pub fn thumbs_busy(&self) -> usize {
@@ -109,6 +117,10 @@ impl FastLabelApp {
     }
 
     fn pick_and_open(&mut self, ctx: &egui::Context) {
+        if self.inference.is_running() {
+            self.error("Wait for the model run to finish (or cancel it) before switching datasets");
+            return;
+        }
         let start = self.session.last_dataset.clone().unwrap_or_default();
         if let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() {
             // Pending edits of the current dataset stay in its journal.
@@ -118,6 +130,10 @@ impl FastLabelApp {
 
     /// Saves a new version. Returns false when saving failed.
     fn save(&mut self) -> bool {
+        if self.inference.is_running() {
+            self.error("Wait for the model run to finish (or cancel it) before saving");
+            return false;
+        }
         let Some(ws) = &mut self.ws else { return true };
         match ws.save() {
             Ok(Some(report)) => {
@@ -171,6 +187,98 @@ impl FastLabelApp {
                 false
             }
         }
+    }
+
+    pub(crate) fn run_model(&mut self, ctx: &egui::Context, scope: Scope) {
+        let Some(ws) = &self.ws else { return };
+        let Some(model) = self.session.model_path.clone().filter(|p| p.is_file()) else {
+            self.error("Choose an ONNX model file first (Model menu)");
+            return;
+        };
+        let items = match scope {
+            Scope::All => ws.inference_items(),
+            Scope::Frame(idx) => vec![ws.frame_item(idx)],
+        };
+        if items.is_empty() {
+            self.error("No frames to run the model on");
+            return;
+        }
+        self.inference.start(ctx, &model, self.session.confidence, scope, items);
+    }
+
+    fn poll_inference(&mut self) {
+        let Some(outcome) = self.inference.poll() else { return };
+        let Some(ws) = &mut self.ws else { return };
+        let model = outcome.model.display().to_string();
+        let applied = outcome.result.and_then(|r| {
+            ws.apply_detections(
+                outcome.scope == Scope::All,
+                &model,
+                outcome.confidence,
+                &outcome.class_names,
+                r,
+            )
+        });
+        match applied {
+            Ok(msg) => {
+                self.mosaic.ensure_visible = true;
+                self.info(format!("Model run done: {msg}"));
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    fn model_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.menu_button("Model", |ui| {
+            ui.set_min_width(380.0);
+            let mut path = self
+                .session
+                .model_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut path)
+                            .hint_text("model.onnx")
+                            .desired_width(280.0),
+                    )
+                    .changed()
+                {
+                    self.session.model_path = (!path.is_empty()).then(|| PathBuf::from(&path));
+                }
+                if ui.button("Browse…").clicked()
+                    && let Some(p) =
+                        rfd::FileDialog::new().add_filter("ONNX model", &["onnx"]).pick_file()
+                {
+                    self.session.model_path = Some(p);
+                }
+            });
+            ui.add(
+                egui::Slider::new(&mut self.session.confidence, 0.01..=1.0)
+                    .step_by(0.01)
+                    .text("confidence"),
+            );
+            let idle = !self.inference.is_running() && self.ws.is_some();
+            if ui.add_enabled(idle, egui::Button::new("Run on all frames")).clicked() {
+                self.run_model(&ctx, Scope::All);
+                ui.close();
+            }
+            let frame = self.ws.as_ref().and_then(|ws| ws.selected_crop()).map(|c| c.image_idx);
+            if ui
+                .add_enabled(
+                    idle && frame.is_some(),
+                    egui::Button::new("Run on the selected crop's frame"),
+                )
+                .clicked()
+                && let Some(idx) = frame
+            {
+                self.run_model(&ctx, Scope::Frame(idx));
+                ui.close();
+            }
+        });
     }
 
     fn save_session(&mut self) {
@@ -251,6 +359,7 @@ impl FastLabelApp {
                 self.save();
             }
             Key::Q if !repeat && !m.command => {
+                self.inference.shutdown();
                 if self.save() {
                     self.exit_ok = true;
                     ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -271,6 +380,7 @@ impl FastLabelApp {
             if ui.add_enabled(has_ws, egui::Button::new("💾 Save (S)")).clicked() {
                 self.save();
             }
+            self.model_menu(ui);
             let Some(ws) = &mut self.ws else { return };
             if ui
                 .add_enabled(ws.project.log.can_undo(), egui::Button::new("Undo"))
@@ -405,6 +515,18 @@ impl FastLabelApp {
                     ui.spinner();
                 }
             }
+            if let Some((scope, done, total)) = self.inference.progress() {
+                ui.separator();
+                let label = match scope {
+                    Scope::All => format!("model {done}/{total}"),
+                    Scope::Frame(_) => "model on frame…".into(),
+                };
+                let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                ui.add(egui::ProgressBar::new(frac).text(label).desired_width(180.0));
+                if ui.button("Cancel").clicked() {
+                    self.inference.cancel();
+                }
+            }
             if let Some(s) = &self.status {
                 ui.separator();
                 let color =
@@ -419,6 +541,7 @@ impl eframe::App for FastLabelApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_ok {
+            self.inference.shutdown();
             if self.save() {
                 self.exit_ok = true;
             } else {
@@ -438,6 +561,7 @@ impl eframe::App for FastLabelApp {
         if let Some(t) = &mut self.thumbs {
             t.begin_frame(&ctx);
         }
+        self.poll_inference();
         self.handle_keys(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -476,6 +600,7 @@ impl eframe::App for FastLabelApp {
     }
 
     fn on_exit(&mut self) {
+        self.inference.shutdown();
         self.save_session();
     }
 }
