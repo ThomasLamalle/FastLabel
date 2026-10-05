@@ -387,9 +387,7 @@ impl FastLabelApp {
                         RichText::new(format!("TP {}  FP {}  FN {}", k.tp, k.fp, k.fn_)).weak(),
                     );
                 }
-                if let Some(t) = &self.thumbs
-                    && t.busy() > 0
-                {
+                if self.thumbs_busy() > 0 {
                     ui.separator();
                     ui.spinner();
                 }

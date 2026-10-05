@@ -116,6 +116,7 @@ pub fn show(
                 let crop = &ws.crops[idx];
                 let job = crop_job(ws, crop, margins, max_side);
                 let slot = job.as_ref().and_then(|(j, _)| thumbs.get(j.id()));
+                resp.on_hover_text(tooltip(ws, crop, slot));
                 paint_cell(
                     ui.painter(),
                     cell,
@@ -151,6 +152,29 @@ pub fn show(
         .map(|(j, _)| j);
     thumbs.want(jobs.collect());
     events
+}
+
+fn tooltip(ws: &Workspace, crop: &Crop, slot: Option<&Slot>) -> String {
+    let img = &ws.project.dataset.images()[crop.image_idx];
+    let b = crop.primary();
+    let mut lines = vec![img.file_name.clone(), format!("{:.0} × {:.0} px", b.w, b.h)];
+    let status = match crop.status {
+        CropStatus::Tp => "TP",
+        CropStatus::Fn => "FN",
+        CropStatus::Fp => "FP (prediction only)",
+        CropStatus::Unpredicted => "not predicted",
+    };
+    match crop.iou {
+        Some(iou) => lines.push(format!("{status}, IoU {iou:.2}")),
+        None => lines.push(status.into()),
+    }
+    if let Some(p) = &crop.pred {
+        lines.push(format!("confidence {:.2}", p.score));
+    }
+    if let Some(Slot::Failed(e)) = slot {
+        lines.push(format!("cannot load image: {e}"));
+    }
+    lines.join("\n")
 }
 
 fn split_name(ws: &Workspace, crop: &Crop) -> &'static str {
