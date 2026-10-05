@@ -40,7 +40,7 @@ Nothing changes on disk until you save (`S`). Every action is journaled, so a cr
 | Tab or M | frame mode (draw, move, resize, 1–9 class, tags) |
 | S / Q | save new version / save and quit |
 
-*Cleaning → Overlapping GT boxes* reviews double annotations one group at a time: 1–9 keeps that box and deletes the others, A keeps all, Right/Left moves between groups, Esc goes back.
+*Cleaning → Overlapping GT boxes* reviews double annotations one group at a time: 1–9 keeps that box and deletes the others, A keeps all, D deletes all, Right/Left moves between groups, Esc goes back.
 
 ## Models
 

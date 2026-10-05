@@ -115,7 +115,9 @@ Double annotations: GT boxes of the same category that overlap each other (IoU >
 
 - 1–9: keep that box (confirmed), queue the others of the group for deletion, go to the next group. Groups with 10 or more boxes: type the number, then Enter.
 - A: keep all boxes (e.g. after fixing them by hand), next group.
-- Boxes stay editable (move, resize, draw, D / G) before deciding.
+- D: delete all boxes of the group, next group.
+- Progress (group n / total) is shown in the bottom status line.
+- Boxes stay editable (move, resize, draw) before deciding.
 - F: delete the frame, next group. Right / Left: next / previous group. Esc (or M / Tab / Q): back to the mosaic.
 - Decisions are pending edits like any other (undo with U, applied on save). After a save the remaining groups are rescanned; resolved groups (deleted boxes, all boxes kept or reviewed) do not come back.
 

@@ -133,6 +133,11 @@ impl Workspace {
         self.resolve_group(group, |id| if id == keep { AnnMark::Confirm } else { AnnMark::Delete })
     }
 
+    /// Queues every box of the group for deletion.
+    pub fn delete_all(&mut self, group: &OverlapGroup) -> ActionResult {
+        self.resolve_group(group, |_| AnnMark::Delete)
+    }
+
     /// Keeps every box of the group (e.g. after fixing them by hand).
     pub fn keep_all(&mut self, group: &OverlapGroup) -> ActionResult {
         self.resolve_group(group, |_| AnnMark::Confirm)
@@ -226,6 +231,12 @@ mod tests {
         assert!(!ws.is_frame_deleted(1), "deciding keeps the frame");
         assert!(ws.frame_boxes(1).iter().all(|b| b.mark == Some(Mark::Good)));
         assert_eq!(ws.overlap_groups().len(), 1, "boxes no longer overlap");
+        // D on a group deletes all its boxes.
+        let mut ws2 = ws;
+        ws2.delete_all(&groups[0]).unwrap();
+        assert!(ws2.frame_boxes(0)[..3].iter().all(|b| b.mark == Some(Mark::Delete)));
+        ws2.undo().unwrap();
+        let mut ws = ws2;
         // Kept groups do not come back.
         ws.keep_all(&groups[0]).unwrap();
         assert!(ws.overlap_groups().is_empty());

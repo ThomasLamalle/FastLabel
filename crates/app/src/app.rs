@@ -769,6 +769,7 @@ impl FastLabelApp {
                 ws.keep_only(&group, group.boxes[d - 1])
             }
             (None, Key::A) if !repeat => ws.keep_all(&group),
+            (None, Key::D) if !repeat => ws.delete_all(&group),
             (None, Key::F) if !repeat => ws.toggle_frame_delete(),
             (None, Key::ArrowRight | Key::L | Key::N) => Ok(()),
             (None, Key::ArrowLeft | Key::H | Key::P) => {
@@ -797,10 +798,6 @@ impl FastLabelApp {
         };
         let digits = cs.digits.clone();
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("Overlapping GT boxes  {} / {total}", cs.index + 1)).strong(),
-            );
-            ui.separator();
             let keys = if group.boxes.len() <= 9 {
                 format!("1-{}: keep that box, delete the others", group.boxes.len())
             } else {
@@ -808,7 +805,7 @@ impl FastLabelApp {
             };
             ui.label(
                 RichText::new(format!(
-                    "{keys} · A: keep all · F: delete frame · Right/Left: next/previous group · Esc: exit"
+                    "{keys} · A: keep all · D: delete all · F: delete frame · Right/Left: next/previous group · Esc: exit"
                 ))
                 .weak(),
             );
@@ -1107,8 +1104,21 @@ impl FastLabelApp {
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if self.mode == Mode::Clean
+                && let Some(cs) = &self.clean
+            {
+                let total = cs.groups.len();
+                ui.label(
+                    RichText::new(format!("Overlapping GT boxes {} / {total}", (cs.index + 1).min(total)))
+                        .strong()
+                        .color(Color32::from_rgb(255, 215, 0)),
+                );
+                ui.separator();
+            }
             if let Some(ws) = &self.ws {
                 let n = ws.crops.len();
+                let clean = self.mode == Mode::Clean;
+                if !clean {
                 ui.label(format!("{} / {n}", if n == 0 { 0 } else { ws.selected + 1 }));
                 if let Some(crop) = ws.selected_crop() {
                     let img = &ws.project.dataset.images()[crop.image_idx];
@@ -1116,6 +1126,7 @@ impl FastLabelApp {
                     ui.label(
                         RichText::new(format!("{}  {:.0}×{:.0}px", img.file_name, b.w, b.h)).weak(),
                     );
+                }
                 }
                 let c = ws.pending_counts();
                 let pending = [

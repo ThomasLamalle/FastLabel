@@ -159,9 +159,10 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 |---|---|
 | 1–9 (10+: digits then Enter) | Keep that box, delete the others of the group, next group |
 | A | Keep all, next group |
+| D | Delete all boxes of the group, next group |
 | F | Delete frame, next group |
 | Right / Left (l / h, n / p) | Next / previous group |
-| Mouse, D / G, j / k | Edit boxes as in the popup |
+| Mouse, G, j / k | Edit boxes as in the popup |
 | Esc, M, Tab, Q | Back to the mosaic |
 
 ## Risks

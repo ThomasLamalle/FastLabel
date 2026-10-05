@@ -632,6 +632,24 @@ fn overlapping_gt_cleaning_workflow() {
     );
     assert_eq!(h.state().clean.as_ref().unwrap().index, 1, "moved to the next group");
 
+    // Progress is shown in the bottom status line.
+    let _ = h.get_by_label("Overlapping GT boxes 2 / 3");
+
+    // Group 2: D deletes all its boxes; Left goes back, A keeps both instead.
+    let g1 = h.state().clean.as_ref().unwrap().groups[1].clone();
+    h.key_press(Key::D);
+    h.run_steps(2);
+    let ws = h.state().ws();
+    assert!(
+        ws.frame_boxes(g1.image_idx)
+            .iter()
+            .filter(|b| g1.boxes.contains(&b.id))
+            .all(|b| b.mark == Some(crate::workspace::Mark::Delete))
+    );
+    h.key_press(Key::ArrowLeft);
+    h.run_steps(2);
+    assert_eq!(h.state().clean.as_ref().unwrap().index, 1);
+
     // Group 2: keep both. Group 3 (11 boxes): type 1, 1, Enter.
     h.key_press(Key::A);
     h.run_steps(2);
