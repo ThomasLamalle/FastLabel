@@ -39,7 +39,7 @@ pub fn export_zip(
             .compression_method(CompressionMethod::Stored)
             .large_file(false);
         zip.start_file(annotation_name, deflate).map_err(zip_err)?;
-        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"  ");
         serde::Serialize::serialize(
             coco,
             &mut serde_json::Serializer::with_formatter(&mut zip, fmt),

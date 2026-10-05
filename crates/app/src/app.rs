@@ -45,9 +45,9 @@ pub struct FastLabelApp {
     peek: EditorView,
     /// Tags text being edited: (image index, text).
     tags_buf: Option<(usize, String)>,
-    /// Drop keyboard focus at the end of this frame (Tab handled by us).
-    drop_focus: bool,
     pub(crate) inference: Inference,
+    /// Drop keyboard focus at the end of this frame (after Tab).
+    drop_focus: bool,
     /// Color-uniformity computation; sorts by it when done.
     uniformity_task: Option<Task<std::collections::HashMap<u64, f32>>>,
     export_task: Option<Task<Result<fastlabel_core::export::ExportReport, String>>>,
@@ -78,8 +78,8 @@ impl FastLabelApp {
             editor: EditorView::default(),
             peek: EditorView::default(),
             tags_buf: None,
-            drop_focus: false,
             inference: Inference::default(),
+            drop_focus: false,
             uniformity_task: None,
             export_task: None,
             status: None,
@@ -418,20 +418,40 @@ impl FastLabelApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        let events = ctx.input(|i| i.events.clone());
+        for e in &events {
+            if matches!(e, egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Ime(_)) {
+                tracing::debug!(
+                    event = ?e,
+                    focused = ?ctx.memory(|m| m.focused()),
+                    text_edit = ctx.text_edit_focused(),
+                    "input"
+                );
+            }
+        }
+        // Only a text field being edited takes the keyboard. A focused
+        // button (e.g. after a mouse click) must not swallow shortcuts.
+        if ctx.text_edit_focused() {
             return;
         }
-        let events = ctx.input(|i| i.events.clone());
         for event in events {
             let egui::Event::Key { key, pressed: true, repeat, modifiers, .. } = event else {
                 continue;
             };
             self.handle_key(ctx, key, repeat, modifiers);
         }
-        // egui would also move focus with Tab; we use it to switch modes.
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
-            self.drop_focus = true;
-        }
+        // Keep egui from using these keys too: Enter / Space would "press" a
+        // focused button. Tab already moved egui's focus this frame (focus
+        // traversal), so that focus is dropped at the end of the frame.
+        ctx.input_mut(|i| {
+            for key in [Key::Tab, Key::Enter, Key::Space] {
+                for m in [Modifiers::NONE, Modifiers::SHIFT] {
+                    if i.consume_key(m, key) && key == Key::Tab {
+                        self.drop_focus = true;
+                    }
+                }
+            }
+        });
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -478,7 +498,7 @@ impl FastLabelApp {
                 self.pick_and_open(ctx);
                 return;
             }
-            Key::Tab if plain && !self.popup => {
+            Key::Tab | Key::M if plain && !m.shift && !self.popup => {
                 let next = if self.mode == Mode::Mosaic { Mode::Frame } else { Mode::Mosaic };
                 self.set_mode(next);
                 return;
@@ -533,7 +553,7 @@ impl FastLabelApp {
                     ws.mark_selected(mark)
                 };
             }
-            Key::Enter if !repeat && ws.selected_crop().is_some() => {
+            Key::Enter | Key::E if !repeat && !m.command && ws.selected_crop().is_some() => {
                 ws.focus_selected_crop();
                 self.popup = true;
                 return Ok(());
@@ -590,7 +610,7 @@ impl FastLabelApp {
                 self.popup = false;
                 Ok(())
             }
-            Key::Enter if popup && !repeat => {
+            Key::Enter | Key::E if popup && !repeat => {
                 self.popup = false;
                 Ok(())
             }
@@ -666,7 +686,7 @@ impl FastLabelApp {
                 run_here = true;
             }
             if popup {
-                ui.label(RichText::new("Esc / Enter / Q to close").weak());
+                ui.label(RichText::new("Esc / Enter / E / Q to close").weak());
             }
         });
 

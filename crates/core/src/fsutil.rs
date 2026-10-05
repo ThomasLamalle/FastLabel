@@ -32,10 +32,10 @@ pub fn write_atomic(
     result
 }
 
-/// Atomic JSON write with 4-space indentation.
+/// Atomic JSON write with 2-space indentation (as the previous tool wrote).
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, |w| {
-        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(b"  ");
         let mut ser = serde_json::Serializer::with_formatter(&mut *w, fmt);
         value.serialize(&mut ser).map_err(|e| Error::json(path, e))?;
         w.write_all(b"\n").map_err(|e| Error::io(path, e))

@@ -92,6 +92,9 @@ impl Workspace {
 
     /// D / G on the editor selection.
     pub fn mark_sel(&mut self, mark: Mark) -> ActionResult {
+        if self.frame.sel.is_some() && self.is_frame_deleted(self.frame.image_idx) {
+            return Err("This frame is marked for deletion (F); press F to unmark it first".into());
+        }
         let op = match (self.frame.sel, mark) {
             (Some(Sel::Gt(ann)), Mark::Delete) => Op::AnnMark { ann, mark: AnnMark::Delete },
             (Some(Sel::Gt(ann)), Mark::Good) => Op::AnnMark { ann, mark: AnnMark::Confirm },
@@ -157,7 +160,12 @@ impl Workspace {
 
     pub fn toggle_frame_delete(&mut self) -> ActionResult {
         let image = self.project.dataset.images()[self.frame.image_idx].id;
-        self.record(Op::FrameDelete { image })
+        let mut ops = self.frame_delete_ops(image);
+        if ops.len() == 1 {
+            self.record(ops.pop().expect("one op"))
+        } else {
+            self.record(Op::Group { ops })
+        }
     }
 
     pub fn is_frame_deleted(&self, image_idx: usize) -> bool {
@@ -294,5 +302,17 @@ mod tests {
         assert!(ws.is_frame_deleted(1));
         ws.select_crop_of_frame();
         assert_eq!(ws.selected_crop().unwrap().image_idx, 1);
+    }
+
+    #[test]
+    fn editor_respects_frame_deletion() {
+        let (_d, mut ws) = open();
+        ws.frame.sel = Some(Sel::Gt(1));
+        ws.mark_sel(Mark::Good).unwrap();
+        ws.toggle_frame_delete().unwrap();
+        assert_eq!(ws.frame_boxes(0)[0].mark, None, "F cleared the mark");
+        assert!(ws.mark_sel(Mark::Delete).is_err());
+        ws.toggle_frame_delete().unwrap();
+        ws.mark_sel(Mark::Delete).unwrap();
     }
 }

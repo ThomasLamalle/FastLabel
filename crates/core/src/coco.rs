@@ -78,7 +78,7 @@ impl CocoFile {
         serde_json::from_slice(&bytes).map_err(|e| Error::json(path, e))
     }
 
-    /// Atomically writes the file with 4-space indentation (same layout as
+    /// Atomically writes the file with 2-space indentation (same layout as
     /// the previous tool, so versions diff cleanly).
     pub fn save(&self, path: &Path) -> Result<()> {
         fsutil::write_json_atomic(path, self)

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Key, Modifiers};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use fastlabel_core::coco::{CocoAnnotation, CocoCategory, CocoFile, CocoImage};
 use fastlabel_core::{BBox, PredRef, Predictions};
 use fastlabel_media::decode::encode_jpeg;
@@ -476,4 +477,108 @@ fn empty_dataset_survives_every_key() {
     h.key_press(Key::S); // first save of an imported folder writes v001
     h.run_steps(2);
     assert!(tmp.path().join("annotations.v001.json").exists());
+}
+
+/// Regression: after clicking a crop (which gives it egui focus), Enter,
+/// Tab and Space must still reach our shortcuts.
+#[test]
+fn shortcuts_work_after_clicking_a_crop() {
+    use crate::app::Mode;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+    let click = |h: &mut Harness<'static, FastLabelApp>| {
+        h.hover_at(egui::pos2(400.0, 150.0));
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 150.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 150.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        });
+        h.run_steps(2);
+    };
+    click(&mut h);
+    assert_eq!(h.state().ws().selected, 1, "click selected the second crop");
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().popup, "Enter opens the popup after a click");
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().popup);
+
+    click(&mut h);
+    h.key_press(Key::Tab);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Frame, "Tab switches mode after a click");
+    h.key_press(Key::M);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Mosaic, "M switches mode too");
+
+    click(&mut h);
+    h.key_press(Key::D);
+    h.run_steps(2);
+    let ws = h.state().ws();
+    assert!(ws.marks_of(&ws.crops[1]).mark.is_some(), "D works after a click");
+}
+
+/// Regression: clicking a toolbar button must not steal the shortcuts.
+#[test]
+fn shortcuts_work_after_clicking_a_toolbar_button() {
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+    h.get_by_label("Hide reviewed").click();
+    h.run_steps(2);
+    h.get_by_label("Hide reviewed").click();
+    h.run_steps(2);
+    h.key_press(Key::D);
+    h.run_steps(2);
+    let ws = h.state().ws();
+    assert!(ws.marks_of(&ws.crops[0]).mark.is_some(), "D works after clicking a toolbar button");
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().popup, "Enter opens the popup after clicking a toolbar button");
+}
+
+/// Regression: a focused button (e.g. after a real mouse click) must not
+/// swallow Enter / Space / Tab, nor be "pressed" by them.
+#[test]
+fn focused_button_does_not_swallow_shortcuts() {
+    use crate::app::Mode;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+    let focus = |h: &mut Harness<'static, FastLabelApp>| {
+        h.get_by_label("Ascending").focus();
+        h.run_steps(1);
+        assert!(h.get_by_label("Ascending").is_focused(), "button focused");
+    };
+    focus(&mut h);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().popup, "Enter opens the popup");
+    assert!(!h.state().ws().opts.descending, "the focused button was not pressed");
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    focus(&mut h);
+    h.key_press(Key::Tab);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Frame);
+    h.key_press(Key::M);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Mosaic);
+    h.key_press(Key::E);
+    h.run_steps(2);
+    assert!(h.state().popup, "E opens the popup");
 }

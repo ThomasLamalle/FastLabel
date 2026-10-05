@@ -202,46 +202,110 @@ impl Workspace {
         self.project.record(op).map_err(|e| format!("action applied but not journaled: {e}"))
     }
 
-    /// Toggles `mark` on the selected crop and advances: to the next crop, or
-    /// for F to the next crop of another frame.
+    /// Ops toggling the deletion of a frame. Marking a frame for deletion
+    /// also clears the D / G / R marks of its boxes and predictions (they
+    /// would be meaningless), in the same undo step.
+    pub(crate) fn frame_delete_ops(&self, image_id: fastlabel_core::ImageId) -> Vec<Op> {
+        let mut ops = vec![Op::FrameDelete { image: image_id }];
+        let st = self.project.log.state();
+        if st.is_frame_deleted(image_id) {
+            return ops;
+        }
+        let ds = &self.project.dataset;
+        if let Some(idx) = ds.image_idx(image_id) {
+            let anns = ds.annotations_of(idx).map(|a| a.id);
+            let added = st.added.iter().filter(|(_, b)| b.image == image_id).map(|(id, _)| *id);
+            for ann in anns.chain(added) {
+                if let Some(mark) = st.ann_mark(ann) {
+                    ops.push(Op::AnnMark { ann, mark });
+                }
+            }
+        }
+        let mut preds: Vec<_> =
+            st.pred_marks.iter().filter(|(p, _)| p.image_id == image_id).collect();
+        preds.sort_by_key(|(p, _)| p.bbox.bits());
+        ops.extend(preds.into_iter().map(|(pred, mark)| Op::PredMark { pred: *pred, mark: *mark }));
+        ops
+    }
+
+    fn ops_for(&self, crop: &Crop, mark: Mark) -> Result<Vec<Op>, String> {
+        if mark == Mark::Frame {
+            return Ok(self.frame_delete_ops(crop.image_id));
+        }
+        if self.project.log.state().is_frame_deleted(crop.image_id) {
+            return Err(
+                "This frame is marked for deletion (F); press F on it to unmark it first".into()
+            );
+        }
+        Self::op_for(crop, mark)
+            .map(|op| vec![op])
+            .ok_or_else(|| "R needs a GT box with a matched prediction".into())
+    }
+
+    fn record_all(&mut self, mut ops: Vec<Op>) -> ActionResult {
+        match ops.len() {
+            0 => Ok(()),
+            1 => self.record(ops.pop().expect("one op")),
+            _ => self.record(Op::Group { ops }),
+        }
+    }
+
+    /// A crop still waiting for a decision: no mark, frame not deleted.
+    fn is_pending(&self, crop: &Crop) -> bool {
+        let m = self.marks_of(crop);
+        m.mark.is_none() && !m.frame_deleted
+    }
+
+    /// Next crop after `from` still waiting for a decision (for F, also on
+    /// another frame); stays on `from` when there is none.
+    fn next_pending(&self, from: usize, skip_image: Option<fastlabel_core::ImageId>) -> usize {
+        (from + 1..self.crops.len())
+            .find(|&i| {
+                let c = &self.crops[i];
+                skip_image != Some(c.image_id) && self.is_pending(c)
+            })
+            .unwrap_or(from)
+    }
+
+    /// Toggles `mark` on the selected crop, then advances to the next crop
+    /// still waiting for a decision.
     pub fn mark_selected(&mut self, mark: Mark) -> ActionResult {
         let Some(crop) = self.selected_crop().copied() else { return Ok(()) };
-        let Some(op) = Self::op_for(&crop, mark) else {
-            return Err("R needs a GT box with a matched prediction".into());
-        };
-        let result = self.record(op);
-        self.selected = if mark == Mark::Frame {
-            (self.selected + 1..self.crops.len())
-                .find(|&i| self.crops[i].image_id != crop.image_id)
-                .unwrap_or(self.selected)
-        } else {
-            (self.selected + 1).min(self.crops.len() - 1)
-        };
+        let ops = self.ops_for(&crop, mark)?;
+        let result = self.record_all(ops);
+        let skip = (mark == Mark::Frame).then_some(crop.image_id);
+        self.selected = self.next_pending(self.selected, skip);
         result
     }
 
-    /// Toggles `mark` on every crop of the selected row (each frame once for
-    /// F), as one undo step, then moves to the same column of the next row.
+    /// Toggles `mark` on each crop from the selection to the end of its row
+    /// (each frame once for F; crops of deleted frames are skipped for D / G),
+    /// as one undo step, then selects the first crop of the next row.
     pub fn mark_row(&mut self, mark: Mark) -> ActionResult {
         if self.crops.is_empty() {
             return Ok(());
         }
-        let start = self.selected / self.columns * self.columns;
-        let end = (start + self.columns).min(self.crops.len());
+        let row_end = (self.selected / self.columns + 1) * self.columns;
+        let end = row_end.min(self.crops.len());
         let mut ops = Vec::new();
         let mut frames = Vec::new();
-        for crop in &self.crops[start..end] {
+        for i in self.selected..end {
+            let crop = self.crops[i];
             if mark == Mark::Frame {
                 if frames.contains(&crop.image_id) {
                     continue;
                 }
                 frames.push(crop.image_id);
+            } else if self.project.log.state().is_frame_deleted(crop.image_id) {
+                continue;
             }
-            ops.extend(Self::op_for(crop, mark));
+            if let Ok(o) = self.ops_for(&crop, mark) {
+                ops.extend(o);
+            }
         }
-        let result = if ops.is_empty() { Ok(()) } else { self.record(Op::Group { ops }) };
+        let result = self.record_all(ops);
         if end < self.crops.len() {
-            self.selected = (self.selected + self.columns).min(self.crops.len() - 1);
+            self.selected = end;
         }
         result
     }
@@ -471,19 +535,62 @@ mod tests {
     }
 
     #[test]
-    fn row_actions_toggle_each_and_frames_once() {
-        let (_d, mut ws) = open_fixture(2);
-        ws.mark_selected(Mark::Delete).unwrap(); // #1 marked, selection on #2
-        ws.mark_row(Mark::Delete).unwrap(); // row 0: toggles #1 off, #2 on
+    fn row_actions_go_from_selection_to_row_end_then_next_row_start() {
+        let (_d, mut ws) = open_fixture(3); // rows: [#1 #2 #3] [P150]
+        ws.select(1);
+        ws.mark_row(Mark::Delete).unwrap(); // #2 and #3 only
         assert_eq!(ws.marks_of(&ws.crops[0]).mark, None);
         assert_eq!(ws.marks_of(&ws.crops[1]).mark, Some(Mark::Delete));
-        assert_eq!(ws.selected, 3, "same column, next row");
+        assert_eq!(ws.marks_of(&ws.crops[2]).mark, Some(Mark::Delete));
+        assert_eq!(ws.selected, 3, "first crop of the next row");
+        ws.select(1);
+        ws.mark_row(Mark::Delete).unwrap(); // toggles both off again
+        assert!(ws.crops.iter().all(|c| ws.marks_of(c).mark.is_none()));
         ws.undo().unwrap();
-        assert_eq!(ws.marks_of(&ws.crops[0]).mark, Some(Mark::Delete), "row undone in one step");
+        assert_eq!(ws.marks_of(&ws.crops[2]).mark, Some(Mark::Delete), "row undone in one step");
 
+        // F on a row toggles each frame once (#1 and #2 share a frame).
         ws.select(0);
-        ws.mark_row(Mark::Frame).unwrap(); // #1 and #2 share a frame → toggled once
+        ws.mark_row(Mark::Frame).unwrap();
+        assert!(ws.crops.iter().all(|c| ws.marks_of(c).frame_deleted));
+        assert_eq!(ws.selected, 3);
+    }
+
+    #[test]
+    fn auto_advance_skips_decided_crops() {
+        let (_d, mut ws) = open_fixture(2); // #1 #2 #3 P150; #1 #2 P150 share frame 1
+        ws.select(2);
+        ws.mark_selected(Mark::Good).unwrap(); // decide #3 first
+        ws.select(3);
+        ws.mark_selected(Mark::Frame).unwrap(); // frame 1: #1 #2 P150
+        ws.select(0);
+        assert_eq!(ws.next_pending(0, None), 0, "nothing left to decide: stay");
+        ws.undo().unwrap(); // frame 1 back
+        ws.select(0);
+        ws.mark_selected(Mark::Delete).unwrap();
+        assert_eq!(ws.selected, 1);
+        ws.mark_selected(Mark::Delete).unwrap();
+        assert_eq!(ws.selected, 3, "skips #3, already decided");
+    }
+
+    #[test]
+    fn frame_deletion_excludes_box_marks() {
+        let (_d, mut ws) = open_fixture(2);
+        ws.mark_selected(Mark::Good).unwrap(); // #1 confirmed
+        ws.select(3);
+        ws.mark_selected(Mark::Good).unwrap(); // P150 accepted
+        ws.select(0);
+        ws.mark_selected(Mark::Frame).unwrap();
         assert!(ws.marks_of(&ws.crops[0]).frame_deleted);
+        assert_eq!(ws.marks_of(&ws.crops[0]).mark, None, "F cleared the G mark");
+        assert_eq!(ws.marks_of(&ws.crops[3]).mark, None, "and the accepted prediction");
+        ws.select(1);
+        assert!(ws.mark_selected(Mark::Delete).is_err(), "D refused on a deleted frame");
+        assert!(ws.mark_selected(Mark::Good).is_err());
+        ws.undo().unwrap(); // one step restores the marks
+        assert_eq!(ws.marks_of(&ws.crops[0]).mark, Some(Mark::Good));
+        assert_eq!(ws.marks_of(&ws.crops[3]).mark, Some(Mark::Good));
+        assert!(!ws.marks_of(&ws.crops[0]).frame_deleted);
     }
 
     #[test]
