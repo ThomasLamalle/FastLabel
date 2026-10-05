@@ -1,6 +1,7 @@
 //! FastLabel: fast bounding-box review.
 
 mod app;
+mod clean;
 mod crops;
 mod editor;
 mod frame;

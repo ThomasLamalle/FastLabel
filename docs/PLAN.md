@@ -155,6 +155,15 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 | Wheel, middle drag or Space + drag | Zoom around cursor, pan |
 | Esc | Deselect (frame mode) / close (popup, also Enter / E) |
 
+| Cleaning: overlapping GT | Action |
+|---|---|
+| 1–9 (10+: digits then Enter) | Keep that box, delete the others of the group, next group |
+| A | Keep all, next group |
+| F | Delete frame, next group |
+| Right / Left (l / h, n / p) | Next / previous group |
+| Mouse, D / G, j / k | Edit boxes as in the popup |
+| Esc, M, Tab, Q | Back to the mosaic |
+
 ## Risks
 
 | Risk | Mitigation |
@@ -182,3 +191,4 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 
 - Matching has no thresholds anymore: pairs need any overlap; FP / FN mean zero overlap; duplicates are "extra".
 - D/G/R on a frame marked F apply and unmark the frame.
+- Cleaning menu, first workflow: overlapping GT boxes (390 groups on the v023 copy).

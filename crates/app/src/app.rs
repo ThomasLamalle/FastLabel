@@ -21,6 +21,16 @@ use crate::workspace::{Mark, Workspace};
 pub enum Mode {
     Mosaic,
     Frame,
+    /// Cleaning workflow: overlapping GT boxes, one group at a time.
+    Clean,
+}
+
+/// Progress through the overlapping-GT cleaning workflow.
+pub(crate) struct CleanState {
+    pub groups: Vec<crate::clean::OverlapGroup>,
+    pub index: usize,
+    /// Typed digits when a group has more than 9 boxes (Enter confirms).
+    pub digits: String,
 }
 
 /// Full frames are loaded at most this large.
@@ -41,6 +51,7 @@ pub struct FastLabelApp {
     pub(crate) mode: Mode,
     /// Editor popup over the mosaic (Enter / double click).
     pub(crate) popup: bool,
+    pub(crate) clean: Option<CleanState>,
     editor: EditorView,
     peek: EditorView,
     /// Tags text being edited: (image index, text).
@@ -75,6 +86,7 @@ impl FastLabelApp {
             mosaic: MosaicState::default(),
             mode: Mode::Mosaic,
             popup: false,
+            clean: None,
             editor: EditorView::default(),
             peek: EditorView::default(),
             tags_buf: None,
@@ -214,6 +226,14 @@ impl FastLabelApp {
                     ));
                 }
                 self.mosaic.ensure_visible = true;
+                if self.mode == Mode::Clean
+                    && let Some(ws) = &self.ws
+                {
+                    // Saved decisions are resolved: continue with what is left.
+                    let groups = ws.overlap_groups();
+                    self.clean = Some(CleanState { groups, index: 0, digits: String::new() });
+                    self.goto_group(0);
+                }
                 true
             }
             Ok(None) => {
@@ -476,6 +496,7 @@ impl FastLabelApp {
                 ws.select_crop_of_frame();
                 self.mosaic.ensure_visible = true;
             }
+            Mode::Clean => {}
         }
         self.mode = mode;
     }
@@ -499,6 +520,8 @@ impl FastLabelApp {
             Key::Q if plain && !repeat => {
                 if self.popup {
                     self.popup = false;
+                } else if self.mode == Mode::Clean {
+                    self.exit_clean();
                 } else {
                     self.inference.shutdown();
                     if self.save() {
@@ -510,6 +533,10 @@ impl FastLabelApp {
             }
             Key::O if m.command => {
                 self.pick_and_open(ctx);
+                return;
+            }
+            Key::Tab | Key::M if plain && !m.shift && !self.popup && self.mode == Mode::Clean => {
+                self.exit_clean();
                 return;
             }
             Key::Tab | Key::M if plain && !m.shift && !self.popup => {
@@ -530,7 +557,16 @@ impl FastLabelApp {
             }
             return;
         }
-        let r = if self.popup || self.mode == Mode::Frame {
+        if self.mode == Mode::Clean
+            && !self.popup
+            && let Some(r) = self.clean_key(key, repeat)
+        {
+            if let Err(e) = r {
+                self.error(e);
+            }
+            return;
+        }
+        let r = if self.popup || self.mode != Mode::Mosaic {
             self.frame_key(key, repeat, m)
         } else {
             self.mosaic_key(key, repeat, m)
@@ -579,7 +615,8 @@ impl FastLabelApp {
     }
 
     fn frame_key(&mut self, key: Key, repeat: bool, m: Modifiers) -> Result<(), String> {
-        let popup = self.popup;
+        // The cleaning view behaves like the popup: no frame navigation.
+        let popup = self.popup || self.mode == Mode::Clean;
         let Some(ws) = &mut self.ws else { return Ok(()) };
         if ws.project.dataset.images().is_empty() {
             return Ok(());
@@ -644,8 +681,164 @@ impl FastLabelApp {
         }
     }
 
+    /// Starts the overlapping-GT cleaning workflow.
+    pub(crate) fn start_overlap_cleaning(&mut self) {
+        let Some(ws) = &self.ws else { return };
+        let groups = ws.overlap_groups();
+        if groups.is_empty() {
+            self.info("No overlapping GT boxes left to review");
+            return;
+        }
+        let n = groups.len();
+        self.clean = Some(CleanState { groups, index: 0, digits: String::new() });
+        self.popup = false;
+        self.mode = Mode::Clean;
+        self.goto_group(0);
+        self.info(format!("{n} groups of overlapping GT boxes to review"));
+    }
+
+    fn exit_clean(&mut self) {
+        self.clean = None;
+        self.set_mode(Mode::Mosaic);
+    }
+
+    fn goto_group(&mut self, index: usize) {
+        let (Some(cs), Some(ws)) = (&mut self.clean, &mut self.ws) else { return };
+        cs.index = index.min(cs.groups.len());
+        cs.digits.clear();
+        if let Some(g) = cs.groups.get(cs.index) {
+            ws.go_to_frame(g.image_idx);
+            ws.frame.sel = None;
+            if let Some(extent) = ws.group_extent(g) {
+                self.editor.focus_on(extent);
+            }
+        }
+    }
+
+    /// Keys of the cleaning view; `None` when the key is not one of them
+    /// (box editing keys then apply as in the popup).
+    fn clean_key(&mut self, key: Key, repeat: bool) -> Option<Result<(), String>> {
+        let cs = self.clean.as_mut()?;
+        let index = cs.index;
+        if key == Key::Escape {
+            self.exit_clean();
+            return Some(Ok(()));
+        }
+        let group = cs.groups.get(index)?.clone();
+        let n = group.boxes.len();
+        let digit = [
+            Key::Num0,
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ]
+        .iter()
+        .position(|k| *k == key);
+        let keep = match (digit, key) {
+            (Some(d), _) if !repeat => {
+                if n <= 9 {
+                    Some(d)
+                } else {
+                    cs.digits.push(char::from(b'0' + d as u8));
+                    return Some(Ok(()));
+                }
+            }
+            (_, Key::Enter) if !cs.digits.is_empty() => {
+                let d = cs.digits.parse().unwrap_or(0);
+                cs.digits.clear();
+                Some(d)
+            }
+            (_, Key::Backspace) => {
+                cs.digits.pop();
+                return Some(Ok(()));
+            }
+            _ => None,
+        };
+        let ws = self.ws.as_mut()?;
+        let result = match (keep, key) {
+            (Some(d), _) => {
+                if d == 0 || d > n {
+                    return Some(Err(format!("No box {d} in this group (1-{n})")));
+                }
+                ws.keep_only(&group, group.boxes[d - 1])
+            }
+            (None, Key::A) if !repeat => ws.keep_all(&group),
+            (None, Key::F) if !repeat => ws.toggle_frame_delete(),
+            (None, Key::ArrowRight | Key::L | Key::N) => Ok(()),
+            (None, Key::ArrowLeft | Key::H | Key::P) => {
+                self.goto_group(index.saturating_sub(1));
+                return Some(Ok(()));
+            }
+            _ => return None,
+        };
+        if result.is_ok() {
+            self.goto_group(index + 1);
+        }
+        Some(result)
+    }
+
+    /// The cleaning view: progress, keys and the editor zoomed on the group.
+    fn clean_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(cs) = &self.clean else { return };
+        let total = cs.groups.len();
+        let Some(group) = cs.groups.get(cs.index).cloned() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.heading(format!("All {total} groups of overlapping GT boxes reviewed"));
+                ui.label("S saves the decisions · Esc goes back to the mosaic · Left reviews the last group again");
+            });
+            return;
+        };
+        let digits = cs.digits.clone();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Overlapping GT boxes  {} / {total}", cs.index + 1)).strong(),
+            );
+            ui.separator();
+            let keys = if group.boxes.len() <= 9 {
+                format!("1-{}: keep that box, delete the others", group.boxes.len())
+            } else {
+                "type the box number + Enter: keep it, delete the others".to_string()
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{keys} · A: keep all · F: delete frame · Right/Left: next/previous group · Esc: exit"
+                ))
+                .weak(),
+            );
+            if !digits.is_empty() {
+                ui.label(
+                    RichText::new(format!("keep #{digits}_")).color(Color32::from_rgb(255, 215, 0)),
+                );
+            }
+        });
+        if let (Some(ws), Some(thumbs)) = (&self.ws, &mut self.thumbs)
+            && let Some(next) = self.clean.as_ref().and_then(|c| c.groups.get(c.index + 1))
+        {
+            let img = &ws.project.dataset.images()[next.image_idx];
+            thumbs.want(vec![Job::Frame {
+                path: ws.project.dataset.image_path(img),
+                max_side: FRAME_MAX_SIDE,
+            }]);
+        }
+        let numbers =
+            group.boxes.iter().enumerate().map(|(i, id)| (*id, (i + 1).to_string())).collect();
+        self.frame_panel(ui, true, numbers);
+    }
+
     /// Frame header (name, tags, frame deletion, model) and the editor.
-    fn frame_panel(&mut self, ui: &mut egui::Ui, popup: bool) {
+    fn frame_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        popup: bool,
+        numbers: Vec<(fastlabel_core::AnnId, String)>,
+    ) {
         let ctx = ui.ctx().clone();
         let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
         let n = ws.project.dataset.images().len();
@@ -704,13 +897,13 @@ impl FastLabelApp {
             if ui.button("Run model on this frame").clicked() {
                 run_here = true;
             }
-            if popup {
+            if popup && numbers.is_empty() {
                 ui.label(RichText::new("Esc / Enter / E / Q to close").weak());
             }
         });
 
         let boxes = ws.frame_boxes(idx);
-        let preds = ws.frame_preds(idx);
+        let preds = if numbers.is_empty() { ws.frame_preds(idx) } else { Vec::new() };
         let categories: Vec<_> =
             ws.project.dataset.categories().iter().map(|c| (c.id, c.name.clone())).collect();
         let data = FrameData {
@@ -724,6 +917,7 @@ impl FastLabelApp {
             frame_deleted: deleted,
             interactive: true,
             categories: &categories,
+            numbers: &numbers,
         };
         for action in self.editor.show(ui, &data) {
             let r = match action {
@@ -772,6 +966,7 @@ impl FastLabelApp {
             frame_deleted: ws.is_frame_deleted(crop.image_idx),
             interactive: false,
             categories: &[],
+            numbers: &[],
         };
         let peek = &mut self.peek;
         egui::Area::new(egui::Id::new("peek"))
@@ -803,6 +998,18 @@ impl FastLabelApp {
                 self.start_export(&ctx);
             }
             self.model_menu(ui);
+            ui.add_enabled_ui(has_ws, |ui| {
+                ui.menu_button("Cleaning", |ui| {
+                    if ui
+                        .button("Overlapping GT boxes")
+                        .on_hover_text("Review GT boxes that overlap each other (double annotations): keep one with 1-9")
+                        .clicked()
+                    {
+                        self.start_overlap_cleaning();
+                        ui.close();
+                    }
+                });
+            });
             let Some(ws) = &mut self.ws else { return };
             if ui
                 .add_enabled(ws.project.log.can_undo(), egui::Button::new("Undo"))
@@ -1047,7 +1254,11 @@ impl eframe::App for FastLabelApp {
                 return;
             }
             if self.mode == Mode::Frame {
-                self.frame_panel(ui, false);
+                self.frame_panel(ui, false, Vec::new());
+                return;
+            }
+            if self.mode == Mode::Clean {
+                self.clean_panel(ui);
                 return;
             }
             let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
@@ -1077,7 +1288,7 @@ impl eframe::App for FastLabelApp {
             let modal = egui::Modal::new(egui::Id::new("frame-editor")).show(&ctx, |ui| {
                 ui.set_min_size(size);
                 ui.set_max_size(size);
-                self.frame_panel(ui, true);
+                self.frame_panel(ui, true, Vec::new());
             });
             if modal.should_close() {
                 self.popup = false;

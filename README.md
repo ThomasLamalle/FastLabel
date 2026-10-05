@@ -40,6 +40,8 @@ Nothing changes on disk until you save (`S`). Every action is journaled, so a cr
 | Tab or M | frame mode (draw, move, resize, 1–9 class, tags) |
 | S / Q | save new version / save and quit |
 
+*Cleaning → Overlapping GT boxes* reviews double annotations one group at a time: 1–9 keeps that box and deletes the others, A keeps all, Right/Left moves between groups, Esc goes back.
+
 ## Models
 
 Model menu → choose an `.onnx` file, confidence, then *Run on all frames* (background, with progress and cancel), *Run on frames without predictions* or *Run on the selected crop's frame*. Supported: Ultralytics YOLO exports (raw head with NMS, or end-to-end), DETR-style models (RF-DETR, experimental). Class names are matched to dataset categories by name.

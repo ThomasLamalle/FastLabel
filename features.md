@@ -105,6 +105,20 @@ No thresholds to tune. Each GT box is paired with its best-overlapping predictio
 - Frame-mode edits are pending actions like mosaic marks: they are visible immediately in frame view, applied to the dataset (and the mosaic layout) on save.
 
 
+## Cleaning workflows
+
+Toolbar menu *Cleaning*, each workflow is a dedicated review mode.
+
+### Overlapping GT boxes
+
+Double annotations: GT boxes of the same category that overlap each other (IoU > 0; on v1_exp0 almost all such pairs cover most of the smaller box). Groups are reviewed one at a time, zoomed onto the group, every box with its own color and number (left to right).
+
+- 1–9: keep that box (confirmed), queue the others of the group for deletion, go to the next group. Groups with 10 or more boxes: type the number, then Enter.
+- A: keep all boxes (e.g. after fixing them by hand), next group.
+- Boxes stay editable (move, resize, draw, D / G) before deciding.
+- F: delete the frame, next group. Right / Left: next / previous group. Esc (or M / Tab / Q): back to the mosaic.
+- Decisions are pending edits like any other (undo with U, applied on save). After a save the remaining groups are rescanned; resolved groups (deleted boxes, all boxes kept or reviewed) do not come back.
+
 ## Model inference
 
 - ONNX models run through ONNX Runtime, no Python at runtime. CPU only must be fast enough (no GPU on the dev machine); GPU execution providers are optional.

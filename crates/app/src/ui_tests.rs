@@ -581,3 +581,106 @@ fn focused_button_does_not_swallow_shortcuts() {
     h.run_steps(2);
     assert!(h.state().popup, "E opens the popup");
 }
+
+#[test]
+fn overlapping_gt_cleaning_workflow() {
+    use crate::app::Mode;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    // Add double annotations: a near-duplicate on frames 1 and 3, and a
+    // chain of 11 overlapping boxes on frame 5.
+    let path = tmp.path().join("annotations.v001.json");
+    let mut coco = CocoFile::load(&path).unwrap();
+    let mut next = coco.next_annotation_id();
+    let mut add = |coco: &mut CocoFile, image: i64, b: BBox| {
+        coco.annotations.push(CocoAnnotation::new(next, image, 1, b));
+        next += 1;
+    };
+    add(&mut coco, 1, BBox::new(45.0, 62.0, 80.0, 50.0));
+    add(&mut coco, 3, BBox::new(38.0, 58.0, 84.0, 54.0));
+    for i in 0..11 {
+        add(&mut coco, 5, BBox::new(130.0 + 5.0 * i as f64, 10.0, 30.0, 20.0));
+    }
+    coco.save(&path).unwrap();
+
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1200.0, 800.0));
+    settle(&mut h);
+    h.get_by_label("Cleaning").click();
+    h.run_steps(2);
+    h.get_by_label("Overlapping GT boxes").click();
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Clean);
+    assert_eq!(h.state().clean.as_ref().unwrap().groups.len(), 3);
+    settle(&mut h);
+    save_shot(&mut h, "20_clean_group.png");
+
+    // Group 1 (frame 1): keep box 2, the other is queued for deletion.
+    let g0 = h.state().clean.as_ref().unwrap().groups[0].clone();
+    h.key_press(Key::Num2);
+    h.run_steps(2);
+    let ws = h.state().ws();
+    let marks: Vec<_> = ws
+        .frame_boxes(g0.image_idx)
+        .iter()
+        .filter(|b| g0.boxes.contains(&b.id))
+        .map(|b| (b.id, b.mark))
+        .collect();
+    assert_eq!(marks.iter().filter(|(_, m)| *m == Some(crate::workspace::Mark::Delete)).count(), 1);
+    assert_eq!(
+        marks.iter().find(|(id, _)| *id == g0.boxes[1]).unwrap().1,
+        Some(crate::workspace::Mark::Good)
+    );
+    assert_eq!(h.state().clean.as_ref().unwrap().index, 1, "moved to the next group");
+
+    // Group 2: keep both. Group 3 (11 boxes): type 1, 1, Enter.
+    h.key_press(Key::A);
+    h.run_steps(2);
+    let g2 = h.state().clean.as_ref().unwrap().groups[2].clone();
+    assert_eq!(g2.boxes.len(), 11);
+    settle(&mut h);
+    save_shot(&mut h, "21_clean_eleven.png");
+    h.key_press(Key::Num1);
+    h.key_press(Key::Num1);
+    h.run_steps(1);
+    assert_eq!(h.state().clean.as_ref().unwrap().digits, "11");
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let ws = h.state().ws();
+    let kept: Vec<_> = ws
+        .frame_boxes(g2.image_idx)
+        .iter()
+        .filter(|b| g2.boxes.contains(&b.id) && b.mark == Some(crate::workspace::Mark::Good))
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(kept, vec![g2.boxes[10]]);
+    assert_eq!(h.state().clean.as_ref().unwrap().index, 3, "done screen");
+
+    // Save: decisions applied, nothing left to review; Esc back to the mosaic.
+    h.key_press(Key::S);
+    h.run_steps(2);
+    assert!(tmp.path().join("annotations.v002.json").exists());
+    assert!(h.state().clean.as_ref().unwrap().groups.is_empty());
+    assert_eq!(h.state().ws().project.dataset.annotations().len(), 12 + 13 - 1 - 10);
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Mosaic);
+}
+
+/// Opt-in: the overlapping-GT cleaning view on a real dataset copy.
+#[test]
+#[ignore]
+fn real_cleaning_shot() {
+    let dataset =
+        PathBuf::from(std::env::var("FASTLABEL_SHOT_DATASET").expect("FASTLABEL_SHOT_DATASET"));
+    let mut h = harness(dataset, egui::vec2(1500.0, 950.0));
+    settle(&mut h);
+    h.state_mut().start_overlap_cleaning();
+    h.run_steps(2);
+    println!("groups: {}", h.state().clean.as_ref().map_or(0, |c| c.groups.len()));
+    settle(&mut h);
+    save_shot(&mut h, "real_clean_1.png");
+    h.key_press(Key::ArrowRight);
+    h.run_steps(2);
+    settle(&mut h);
+    save_shot(&mut h, "real_clean_2.png");
+}

@@ -16,6 +16,19 @@ const SELECT_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
 const DRAW_COLOR: Color32 = Color32::from_rgb(80, 200, 255);
 const REPLACE_COLOR: Color32 = Color32::from_rgb(245, 150, 30);
 const HANDLE_GRAB: f32 = 7.0;
+/// Distinct colors for numbered boxes (no yellow: that is the selection).
+const NUMBER_COLORS: [Color32; 10] = [
+    Color32::from_rgb(0, 200, 255),
+    Color32::from_rgb(255, 80, 200),
+    Color32::from_rgb(255, 150, 0),
+    Color32::from_rgb(150, 255, 80),
+    Color32::from_rgb(170, 130, 255),
+    Color32::from_rgb(255, 90, 90),
+    Color32::from_rgb(0, 225, 170),
+    Color32::from_rgb(255, 175, 210),
+    Color32::from_rgb(120, 170, 255),
+    Color32::from_rgb(235, 235, 235),
+];
 const MAX_ZOOM: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +106,8 @@ pub struct EditorView {
     pan: Vec2,
     drag: Option<Drag>,
     image_idx: Option<usize>,
+    /// Region to zoom onto at the next `show`.
+    focus: Option<BBox>,
 }
 
 pub enum EditorAction {
@@ -113,6 +128,8 @@ pub struct FrameData<'a> {
     pub interactive: bool,
     /// Category names, shown on boxes when there is more than one.
     pub categories: &'a [(CategoryId, String)],
+    /// Big labels on some GT boxes (cleaning: the key that keeps the box).
+    pub numbers: &'a [(AnnId, String)],
 }
 
 struct Xform {
@@ -136,6 +153,25 @@ impl Xform {
 }
 
 impl EditorView {
+    /// Zooms onto `region` (image pixels, with some context) on next show.
+    pub fn focus_on(&mut self, region: BBox) {
+        self.focus = Some(region);
+    }
+
+    fn apply_focus(&mut self, rect: Rect, data: &FrameData<'_>) {
+        let Some(b) = self.focus.take() else { return };
+        // Context around the region: its own size again, at least 100 px.
+        let (mx, my) = (b.w.max(100.0), b.h.max(100.0));
+        let (w, h) = (b.w + 2.0 * mx, b.h + 2.0 * my);
+        let fit = (rect.width() / data.img_w as f32).min(rect.height() / data.img_h as f32);
+        let want = (rect.width() / w as f32).min(rect.height() / h as f32);
+        self.zoom = (want / fit).clamp(1.0, MAX_ZOOM);
+        let scale = fit * self.zoom;
+        let size = Vec2::new(data.img_w as f32, data.img_h as f32) * scale;
+        let center = Vec2::new((b.x + b.w / 2.0) as f32, (b.y + b.h / 2.0) as f32) * scale;
+        self.pan = size / 2.0 - center;
+    }
+
     pub fn reset_view(&mut self) {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
@@ -159,6 +195,7 @@ impl EditorView {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), sense);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0, Color32::from_gray(18));
+        self.apply_focus(rect, data);
 
         if data.interactive {
             self.handle_zoom_pan(ui, &resp, rect, data);
@@ -377,12 +414,20 @@ impl EditorView {
             };
             let r = xf.rect(&bbox);
             let selected = data.sel == Some(Sel::Gt(b.id));
-            let (color, suffix) = match b.mark {
+            let number = data.numbers.iter().position(|(id, _)| *id == b.id);
+            let (mut color, suffix) = match b.mark {
                 Some(Mark::Delete) => (PRED_COLOR, "  D"),
                 Some(Mark::Good) => (GT_COLOR, "  G"),
                 Some(Mark::Replace) => (REPLACE_COLOR, "  R"),
                 _ => (GT_COLOR, ""),
             };
+            if let Some(n) = number {
+                color = if b.mark == Some(Mark::Delete) {
+                    Color32::from_gray(120)
+                } else {
+                    NUMBER_COLORS[n % NUMBER_COLORS.len()]
+                };
+            }
             let stroke = Stroke::new(
                 if selected { 2.5 } else { 2.0 },
                 if selected { SELECT_COLOR } else { color },
@@ -392,13 +437,16 @@ impl EditorView {
             } else {
                 painter.rect_stroke(r, 0, stroke, StrokeKind::Outside);
             }
-            let text = format!(
-                "GT{}{}{}",
-                label_of(b.category),
-                if b.added { " new" } else { "" },
-                suffix
-            );
-            tag(painter, r.left_top() - Vec2::new(0.0, 1.0), Align2::LEFT_BOTTOM, &text, color);
+            // Numbered boxes carry their number badge instead.
+            if number.is_none() {
+                let text = format!(
+                    "GT{}{}{}",
+                    label_of(b.category),
+                    if b.added { " new" } else { "" },
+                    suffix
+                );
+                tag(painter, r.left_top() - Vec2::new(0.0, 1.0), Align2::LEFT_BOTTOM, &text, color);
+            }
             if selected && data.interactive {
                 for h in Handle::ALL {
                     let (ax, ay) = h.anchor();
@@ -410,6 +458,46 @@ impl EditorView {
                     );
                 }
             }
+        }
+        // Number badges in the box color, placed so they never overlap:
+        // first free spot among the corners, else stacked below.
+        let mut placed: Vec<Rect> = Vec::new();
+        for (n, (id, label)) in data.numbers.iter().enumerate() {
+            let Some(b) = data.boxes.iter().find(|b| b.id == *id) else { continue };
+            let bbox = match &self.drag {
+                Some(Drag::Move { id: d, cur, .. } | Drag::Resize { id: d, cur, .. })
+                    if d == id =>
+                {
+                    *cur
+                }
+                _ => b.bbox,
+            };
+            let r = xf.rect(&bbox);
+            let galley =
+                painter.layout_no_wrap(label.clone(), FontId::proportional(20.0), Color32::BLACK);
+            let size = galley.size() + Vec2::new(10.0, 2.0);
+            let candidates = [
+                Align2::LEFT_BOTTOM.anchor_size(r.right_top() + Vec2::new(2.0, 0.0), size),
+                Align2::RIGHT_BOTTOM.anchor_size(r.left_top() - Vec2::new(2.0, 0.0), size),
+                Align2::LEFT_TOP.anchor_size(r.right_bottom() + Vec2::new(2.0, 0.0), size),
+                Align2::RIGHT_TOP.anchor_size(r.left_bottom() - Vec2::new(2.0, 0.0), size),
+            ];
+            let free = |c: &Rect| placed.iter().all(|p| !p.expand(1.0).intersects(*c));
+            let badge = candidates.into_iter().find(free).unwrap_or_else(|| {
+                let mut c = candidates[0];
+                while !free(&c) {
+                    c = c.translate(Vec2::new(0.0, size.y + 2.0));
+                }
+                c
+            });
+            placed.push(badge);
+            let fill = if b.mark == Some(Mark::Delete) {
+                Color32::from_gray(110)
+            } else {
+                NUMBER_COLORS[n % NUMBER_COLORS.len()]
+            };
+            painter.rect_filled(badge, CornerRadius::same(4), fill);
+            painter.galley(badge.min + Vec2::new(5.0, 1.0), galley, Color32::BLACK);
         }
         if let Some(Drag::Draw { start, cur }) = &self.drag {
             painter.rect_stroke(
