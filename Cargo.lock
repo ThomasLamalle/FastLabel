@@ -1359,6 +1359,7 @@ dependencies = [
  "fast_image_resize",
  "fastlabel-core",
  "image",
+ "proptest",
  "tempfile",
  "thiserror 2.0.21",
  "zune-jpeg",

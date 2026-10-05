@@ -100,6 +100,11 @@ impl FastLabelApp {
     }
 
     #[cfg(test)]
+    pub fn ws_mut(&mut self) -> &mut Workspace {
+        self.ws.as_mut().expect("a dataset is open")
+    }
+
+    #[cfg(test)]
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
     }

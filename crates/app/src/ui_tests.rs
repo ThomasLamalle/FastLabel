@@ -316,3 +316,164 @@ fn real_uniformity_timing() {
     settle(&mut h);
     save_shot(&mut h, "real_uniformity.png");
 }
+
+fn rss_mb() -> f64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
+/// Opt-in scale test: 100k images (symlinks to 5 real 1080p JPEGs), 200k
+/// boxes, 100k predictions. `cargo test --release -p fastlabel stress_100k -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn stress_100k() {
+    const N: i64 = 100_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let src: Vec<PathBuf> = (0..5)
+        .map(|k| {
+            let img = image::RgbImage::from_fn(1920, 1080, |x, y| {
+                image::Rgb([(x / 8) as u8, (y / 5) as u8, (k * 50) as u8])
+            });
+            let p = dir.join(format!("src{k}.jpg"));
+            std::fs::write(&p, encode_jpeg(&img, 85).unwrap()).unwrap();
+            p
+        })
+        .collect();
+    std::fs::create_dir_all(dir.join("images/train")).unwrap();
+    let mut coco = CocoFile {
+        categories: vec![CocoCategory {
+            id: 1,
+            name: "bib".into(),
+            supercategory: String::new(),
+            extra: Map::new(),
+        }],
+        ..CocoFile::default()
+    };
+    let mut preds = Predictions::empty("stress", 0.1);
+    for id in 1..=N {
+        let file_name = format!("images/train/{id:06}.jpg");
+        std::os::unix::fs::symlink(&src[(id % 5) as usize], dir.join(&file_name)).unwrap();
+        coco.images.push(CocoImage {
+            id,
+            file_name,
+            width: 1920,
+            height: 1080,
+            tags: vec![],
+            extra: Map::new(),
+        });
+        let n = coco.annotations.len() as i64;
+        let a = BBox::new(100.0 + (id % 900) as f64, 300.0, 90.0, 50.0);
+        coco.annotations.push(CocoAnnotation::new(n + 1, id, 1, a));
+        coco.annotations.push(CocoAnnotation::new(
+            n + 2,
+            id,
+            1,
+            BBox::new(1200.0, 500.0, 70.0, 40.0),
+        ));
+        preds.set_image(
+            id as usize - 1,
+            vec![PredRef {
+                image_id: id,
+                category_id: 1,
+                bbox: BBox::new(a.x + 4.0, a.y, a.w, a.h),
+                score: 0.8,
+            }],
+        );
+    }
+    coco.save(&dir.join("annotations.v001.json")).unwrap();
+    let ds = fastlabel_core::Dataset::new(dir.to_path_buf(), coco, Path::new("t")).unwrap().0;
+    preds.to_file(&ds).save(&dir.join("predictions.json")).unwrap();
+    drop(ds);
+    let base = rss_mb();
+
+    let t = std::time::Instant::now();
+    let mut h = harness(dir.to_path_buf(), egui::vec2(1600.0, 1000.0));
+    h.step();
+    println!(
+        "open + first frame: {:?}, {} crops, RSS +{:.0} MB",
+        t.elapsed(),
+        h.state().ws().crops.len(),
+        rss_mb() - base
+    );
+    settle(&mut h);
+
+    // Scroll through the dataset by pages and jumps; time each frame.
+    let mut worst = Duration::ZERO;
+    let t = std::time::Instant::now();
+    for i in 0..200 {
+        h.key_press(if i % 50 == 49 { Key::End } else { Key::PageDown });
+        let f = std::time::Instant::now();
+        h.step();
+        worst = worst.max(f.elapsed());
+    }
+    println!("200 page jumps: {:?} total, worst UI frame {:?}", t.elapsed(), worst);
+    settle(&mut h);
+
+    // Mark a lot, then undo everything.
+    let t = std::time::Instant::now();
+    for _ in 0..2000 {
+        h.key_press(Key::D);
+    }
+    h.step();
+    for _ in 0..2000 {
+        h.key_press(Key::U);
+    }
+    h.step();
+    println!("2000 marks + 2000 undos: {:?}", t.elapsed());
+    assert!(!h.state().ws().project.log.is_dirty());
+
+    let t = std::time::Instant::now();
+    h.state_mut().ws_mut().thresholds.match_iou = 0.9;
+    h.state_mut().ws_mut().rebuild();
+    println!("re-evaluate + rebuild 200k crops: {:?}", t.elapsed());
+    println!("RSS after scrolling: +{:.0} MB", rss_mb() - base);
+    assert!(rss_mb() - base < 1500.0, "memory stays bounded");
+}
+
+#[test]
+fn empty_dataset_survives_every_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("images")).unwrap();
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(900.0, 600.0));
+    h.run_steps(2);
+    assert_eq!(h.state().ws().crops.len(), 0);
+    let keys = [
+        Key::J,
+        Key::K,
+        Key::H,
+        Key::L,
+        Key::D,
+        Key::G,
+        Key::F,
+        Key::R,
+        Key::U,
+        Key::Enter,
+        Key::End,
+        Key::PageDown,
+        Key::Num1,
+        Key::Escape,
+        Key::Tab,
+        Key::H,
+        Key::L,
+        Key::D,
+        Key::J,
+        Key::F,
+        Key::Tab,
+    ];
+    for k in keys {
+        h.key_press(k);
+        h.key_press_modifiers(Modifiers::SHIFT, k);
+        h.run_steps(1);
+    }
+    h.key_down(Key::Space);
+    h.run_steps(2);
+    h.key_up(Key::Space);
+    h.key_press(Key::S); // first save of an imported folder writes v001
+    h.run_steps(2);
+    assert!(tmp.path().join("annotations.v001.json").exists());
+}
