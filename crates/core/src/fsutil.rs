@@ -14,15 +14,9 @@ pub fn write_atomic(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
 ) -> Result<()> {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
+    let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
     let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
     let result = (|| {
         let file = File::create(&tmp).map_err(|e| Error::io(&tmp, e))?;
@@ -43,9 +37,7 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_atomic(path, |w| {
         let fmt = serde_json::ser::PrettyFormatter::with_indent(b"    ");
         let mut ser = serde_json::Serializer::with_formatter(&mut *w, fmt);
-        value
-            .serialize(&mut ser)
-            .map_err(|e| Error::json(path, e))?;
+        value.serialize(&mut ser).map_err(|e| Error::json(path, e))?;
         w.write_all(b"\n").map_err(|e| Error::io(path, e))
     })
 }

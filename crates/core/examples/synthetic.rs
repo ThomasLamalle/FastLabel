@@ -70,10 +70,7 @@ fn main() {
 
     let mut log = EditLog::new(ds.coco.next_annotation_id());
     for ann in (1..next).step_by(7) {
-        log.push(Op::AnnMark {
-            ann,
-            mark: AnnMark::Delete,
-        });
+        log.push(Op::AnnMark { ann, mark: AnnMark::Delete });
     }
     for image in (1..IMAGES).step_by(50) {
         log.push(Op::FrameDelete { image });
@@ -88,10 +85,7 @@ fn main() {
 
     let dir = tempfile::tempdir().unwrap();
     let t = Instant::now();
-    applied
-        .coco
-        .save(&dir.path().join("annotations.v001.json"))
-        .unwrap();
+    applied.coco.save(&dir.path().join("annotations.v001.json")).unwrap();
     println!("save         {:?}", t.elapsed());
     let t = Instant::now();
     CocoFile::load(&dir.path().join("annotations.v001.json")).unwrap();

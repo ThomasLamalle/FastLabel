@@ -18,11 +18,7 @@ pub struct Thresholds {
 
 impl Default for Thresholds {
     fn default() -> Self {
-        Self {
-            match_iou: 0.5,
-            fp_iou: 0.3,
-            fn_iou: 0.3,
-        }
+        Self { match_iou: 0.5, fp_iou: 0.3, fn_iou: 0.3 }
     }
 }
 
@@ -78,19 +74,13 @@ impl Evaluation {
     }
 
     pub fn is_fn_candidate(&self, ann_idx: usize) -> bool {
-        self.gt[ann_idx]
-            .best_iou
-            .is_some_and(|b| b < self.thresholds.fn_iou)
+        self.gt[ann_idx].best_iou.is_some_and(|b| b < self.thresholds.fn_iou)
     }
 }
 
 pub fn evaluate(ds: &Dataset, preds: &Predictions, thresholds: Thresholds) -> Evaluation {
-    let unpredicted = GtEval {
-        status: GtStatus::Unpredicted,
-        matched: None,
-        iou: None,
-        best_iou: None,
-    };
+    let unpredicted =
+        GtEval { status: GtStatus::Unpredicted, matched: None, iou: None, best_iou: None };
     let mut gt = vec![unpredicted; ds.annotations().len()];
     let mut per_image = Vec::with_capacity(ds.images().len());
     let mut counts = Counts::default();
@@ -106,21 +96,11 @@ pub fn evaluate(ds: &Dataset, preds: &Predictions, thresholds: Thresholds) -> Ev
             .annotations_of(image_idx)
             .map(|a| (ds.ann_idx(a.id).expect("indexed annotation"), a))
             .collect();
-        let mut pevals = vec![
-            PredEval {
-                matched: None,
-                iou: 0.0,
-                best_iou: 0.0
-            };
-            image_preds.len()
-        ];
+        let mut pevals =
+            vec![PredEval { matched: None, iou: 0.0, best_iou: 0.0 }; image_preds.len()];
         for &(ai, _) in &anns {
-            gt[ai] = GtEval {
-                status: GtStatus::Fn,
-                matched: None,
-                iou: Some(0.0),
-                best_iou: Some(0.0),
-            };
+            gt[ai] =
+                GtEval { status: GtStatus::Fn, matched: None, iou: Some(0.0), best_iou: Some(0.0) };
         }
 
         pairs.clear();
@@ -158,12 +138,7 @@ pub fn evaluate(ds: &Dataset, preds: &Predictions, thresholds: Thresholds) -> Ev
         counts.fp += pevals.iter().filter(|p| p.matched.is_none()).count();
         per_image.push(pevals);
     }
-    Evaluation {
-        thresholds,
-        gt,
-        preds: per_image,
-        counts,
-    }
+    Evaluation { thresholds, gt, preds: per_image, counts }
 }
 
 #[cfg(test)]
@@ -180,12 +155,7 @@ mod tests {
             let list = boxes
                 .iter()
                 .filter(|(i, _)| *i == idx)
-                .map(|&(_, bbox)| PredRef {
-                    image_id,
-                    category_id: 1,
-                    bbox,
-                    score: 0.9,
-                })
+                .map(|&(_, bbox)| PredRef { image_id, category_id: 1, bbox, score: 0.9 })
                 .collect();
             p.set_image(idx, list);
         }
@@ -199,10 +169,7 @@ mod tests {
         let ds = dataset(2, &[(1, a), (1, far), (2, a)]);
         let preds = preds_for(
             &ds,
-            &[
-                (0, BBox::new(1.0, 0.0, 10.0, 10.0)),
-                (0, BBox::new(80.0, 80.0, 5.0, 5.0)),
-            ],
+            &[(0, BBox::new(1.0, 0.0, 10.0, 10.0)), (0, BBox::new(80.0, 80.0, 5.0, 5.0))],
             &[0],
         );
         let ev = evaluate(&ds, &preds, Thresholds::default());
@@ -210,15 +177,7 @@ mod tests {
         assert!((ev.gt[0].iou.unwrap() - 90.0 / 110.0).abs() < 1e-9);
         assert_eq!(ev.gt[1].status, GtStatus::Fn);
         assert_eq!(ev.gt[2].status, GtStatus::Unpredicted);
-        assert_eq!(
-            ev.counts,
-            Counts {
-                tp: 1,
-                fp: 1,
-                fn_: 1,
-                unpredicted_images: 1
-            }
-        );
+        assert_eq!(ev.counts, Counts { tp: 1, fp: 1, fn_: 1, unpredicted_images: 1 });
         assert!(ev.is_fp_candidate(0, 1));
         assert!(!ev.is_fp_candidate(0, 0));
         assert!(ev.is_fn_candidate(1));
@@ -232,14 +191,8 @@ mod tests {
         let preds = preds_for(&ds, &[(0, BBox::new(2.0, 0.0, 10.0, 10.0)), (0, gt)], &[0]);
         let ev = evaluate(&ds, &preds, Thresholds::default());
         assert_eq!(ev.gt[0].matched, Some(1));
-        assert_eq!(
-            ev.preds[0][0].matched, None,
-            "duplicate stays FP even though it overlaps"
-        );
-        assert!(
-            !ev.is_fp_candidate(0, 0),
-            "but it is not an FP-filter candidate (best IoU ≥ 0.3)"
-        );
+        assert_eq!(ev.preds[0][0].matched, None, "duplicate stays FP even though it overlaps");
+        assert!(!ev.is_fp_candidate(0, 0), "but it is not an FP-filter candidate (best IoU ≥ 0.3)");
         assert_eq!(ev.counts.fp, 1);
     }
 

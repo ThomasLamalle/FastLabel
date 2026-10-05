@@ -159,3 +159,4 @@ Each milestone ends with `cargo fmt --check && cargo clippy -D warnings && cargo
 |---|---|---|
 | M0 | done | Workspace, aliases, model probed. |
 | M1 | done | 48 tests. All 24 real annotation files round-trip losslessly. v1_exp0: open 25 ms, evaluate 2 ms. Synthetic 100k images / 200k boxes / 300k preds: index 53 ms, evaluate 53 ms, apply 87 ms, save 108 ms, load 187 ms, peak RSS 230 MB. |
+| M2 | done | Pure-Rust decode (zune-jpeg, 7.8 ms per 1080p frame). v1_exp0 10,385 crops: cold 911 crops/s, warm (disk cache) 34k crops/s. Indexed priority queue, one decode per frame per batch. |

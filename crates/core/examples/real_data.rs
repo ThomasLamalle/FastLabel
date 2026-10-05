@@ -9,11 +9,7 @@ use fastlabel_core::matching::{Thresholds, evaluate};
 use fastlabel_core::{Project, versions};
 
 fn main() {
-    let dir = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .expect("usage: real_data <dataset dir>"),
-    );
+    let dir = PathBuf::from(std::env::args().nth(1).expect("usage: real_data <dataset dir>"));
 
     // Lossless round-trip of every version file (JSON value equality).
     for v in versions::discover(&dir).unwrap() {
@@ -22,11 +18,7 @@ fn main() {
         let coco = CocoFile::load(&v.path).unwrap();
         let back = serde_json::to_value(&coco).unwrap();
         let same = numeric(&back) == numeric(&original);
-        println!(
-            "round-trip {:<28} {}",
-            v.file_name(),
-            if same { "ok" } else { "DIFFERENT" }
-        );
+        println!("round-trip {:<28} {}", v.file_name(), if same { "ok" } else { "DIFFERENT" });
     }
 
     let t = Instant::now();
@@ -44,12 +36,7 @@ fn main() {
     if let Some(preds) = &project.predictions {
         let t = Instant::now();
         let ev = evaluate(&project.dataset, preds, Thresholds::default());
-        println!(
-            "evaluate {} predictions in {:?}: {:?}",
-            preds.len(),
-            t.elapsed(),
-            ev.counts
-        );
+        println!("evaluate {} predictions in {:?}: {:?}", preds.len(), t.elapsed(), ev.counts);
     }
 }
 

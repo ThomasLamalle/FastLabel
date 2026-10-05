@@ -38,10 +38,7 @@ pub fn read_class_names(yaml_path: &Path) -> Result<Vec<String>> {
             let mut pairs = Vec::new();
             for (k, v) in map {
                 let (Yaml::Integer(i), Some(name)) = (k, as_name(v)) else {
-                    return Err(Error::invalid(
-                        yaml_path,
-                        "names keys must be class indices",
-                    ));
+                    return Err(Error::invalid(yaml_path, "names keys must be class indices"));
                 };
                 pairs.push((*i, name));
             }
@@ -82,11 +79,7 @@ pub fn list_images(dir: &Path, base: &Path) -> Result<Vec<PathBuf>> {
 /// are clipped to the image. Without `data.yaml` a single `object` class is used.
 pub fn import(dir: &Path) -> Result<CocoFile> {
     let yaml = dir.join("data.yaml");
-    let mut names = if yaml.exists() {
-        read_class_names(&yaml)?
-    } else {
-        Vec::new()
-    };
+    let mut names = if yaml.exists() { read_class_names(&yaml)? } else { Vec::new() };
     if names.is_empty() {
         names.push("object".into());
     }
@@ -102,15 +95,8 @@ pub fn import(dir: &Path) -> Result<CocoFile> {
         .collect();
 
     let images_dir = dir.join("images");
-    let image_root = if images_dir.is_dir() {
-        images_dir
-    } else {
-        dir.to_path_buf()
-    };
-    let mut coco = CocoFile {
-        categories,
-        ..CocoFile::default()
-    };
+    let image_root = if images_dir.is_dir() { images_dir } else { dir.to_path_buf() };
+    let mut coco = CocoFile { categories, ..CocoFile::default() };
     for (i, rel) in list_images(&image_root, dir)?.into_iter().enumerate() {
         let path = dir.join(&rel);
         let size = imagesize::size(&path)
@@ -128,10 +114,7 @@ pub fn import(dir: &Path) -> Result<CocoFile> {
                 let bad = || {
                     Error::invalid(
                         &label_path,
-                        format!(
-                            "line {}: invalid YOLO detection label `{line}`",
-                            line_no + 1
-                        ),
+                        format!("line {}: invalid YOLO detection label `{line}`", line_no + 1),
                     )
                 };
                 let v: Vec<f64> = line
@@ -152,8 +135,7 @@ pub fn import(dir: &Path) -> Result<CocoFile> {
                 let b = BBox::new((cx - bw / 2.0) * fw, (cy - bh / 2.0) * fh, bw * fw, bh * fh);
                 if let Some(b) = b.clip(fw, fh) {
                     let ann_id = coco.annotations.len() as i64 + 1;
-                    coco.annotations
-                        .push(CocoAnnotation::new(ann_id, id, cls as i64 + 1, b));
+                    coco.annotations.push(CocoAnnotation::new(ann_id, id, cls as i64 + 1, b));
                 }
             }
         }
@@ -198,11 +180,7 @@ pub(crate) mod tests {
     fn imports_yolo_layout() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
-        fs::write(
-            d.join("data.yaml"),
-            "path: x\nnames:\n  0: bib\n  1: face\n",
-        )
-        .unwrap();
+        fs::write(d.join("data.yaml"), "path: x\nnames:\n  0: bib\n  1: face\n").unwrap();
         for split in ["train", "val"] {
             fs::create_dir_all(d.join("images").join(split)).unwrap();
             fs::create_dir_all(d.join("labels").join(split)).unwrap();
@@ -210,26 +188,17 @@ pub(crate) mod tests {
         fs::write(d.join("images/train/a.png"), png_header(200, 100)).unwrap();
         fs::write(d.join("images/val/b.png"), png_header(200, 100)).unwrap();
         fs::write(d.join("images/val/c.png"), png_header(200, 100)).unwrap();
-        fs::write(
-            d.join("labels/train/a.txt"),
-            "0 0.5 0.5 0.1 0.2\n1 0.99 0.5 0.1 0.2\n\n",
-        )
-        .unwrap();
+        fs::write(d.join("labels/train/a.txt"), "0 0.5 0.5 0.1 0.2\n1 0.99 0.5 0.1 0.2\n\n")
+            .unwrap();
         fs::write(d.join("labels/val/b.txt"), "").unwrap();
 
         let coco = import(d).unwrap();
         assert_eq!(
-            coco.categories
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>(),
+            coco.categories.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["bib", "face"]
         );
         assert_eq!(
-            coco.images
-                .iter()
-                .map(|i| i.file_name.as_str())
-                .collect::<Vec<_>>(),
+            coco.images.iter().map(|i| i.file_name.as_str()).collect::<Vec<_>>(),
             vec!["images/train/a.png", "images/val/b.png", "images/val/c.png"]
         );
         assert_eq!(coco.annotations.len(), 2);

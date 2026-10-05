@@ -99,20 +99,8 @@ impl PendingState {
                     self.deleted_frames.insert(*image);
                 }
             }
-            Op::AddBox {
-                ann,
-                image,
-                category,
-                bbox,
-            } => {
-                self.added.insert(
-                    *ann,
-                    NewBox {
-                        image: *image,
-                        category: *category,
-                        bbox: *bbox,
-                    },
-                );
+            Op::AddBox { ann, image, category, bbox } => {
+                self.added.insert(*ann, NewBox { image: *image, category: *category, bbox: *bbox });
             }
             Op::SetBox { ann, bbox } => match self.added.get_mut(ann) {
                 Some(b) => b.bbox = *bbox,
@@ -180,12 +168,7 @@ pub struct EditLog {
 impl EditLog {
     /// `next_ann_id` must exceed every annotation id of the base dataset.
     pub fn new(next_ann_id: AnnId) -> Self {
-        Self {
-            ops: Vec::new(),
-            cursor: 0,
-            state: PendingState::default(),
-            next_ann_id,
-        }
+        Self { ops: Vec::new(), cursor: 0, state: PendingState::default(), next_ann_id }
     }
 
     pub fn state(&self) -> &PendingState {
@@ -239,9 +222,7 @@ impl EditLog {
         // Toggles depend on history, so rebuild from scratch: ops since the
         // last save are few and applying them is cheap.
         let mut state = PendingState::default();
-        self.ops[..self.cursor]
-            .iter()
-            .for_each(|op| state.apply(op));
+        self.ops[..self.cursor].iter().for_each(|op| state.apply(op));
         self.state = state;
         self.ops.get(self.cursor)
     }
@@ -260,42 +241,22 @@ mod tests {
     use proptest::prelude::*;
 
     fn pred(x: f64) -> PredRef {
-        PredRef {
-            image_id: 1,
-            category_id: 1,
-            bbox: BBox::new(x, 0.0, 10.0, 10.0),
-            score: 0.5,
-        }
+        PredRef { image_id: 1, category_id: 1, bbox: BBox::new(x, 0.0, 10.0, 10.0), score: 0.5 }
     }
 
     #[test]
     fn marks_toggle_and_replace_each_other() {
         let mut log = EditLog::new(100);
-        log.push(Op::AnnMark {
-            ann: 1,
-            mark: AnnMark::Delete,
-        });
+        log.push(Op::AnnMark { ann: 1, mark: AnnMark::Delete });
         assert_eq!(log.state().ann_mark(1), Some(AnnMark::Delete));
-        log.push(Op::AnnMark {
-            ann: 1,
-            mark: AnnMark::Confirm,
-        });
+        log.push(Op::AnnMark { ann: 1, mark: AnnMark::Confirm });
         assert_eq!(log.state().ann_mark(1), Some(AnnMark::Confirm));
-        log.push(Op::AnnMark {
-            ann: 1,
-            mark: AnnMark::Confirm,
-        });
+        log.push(Op::AnnMark { ann: 1, mark: AnnMark::Confirm });
         assert_eq!(log.state().ann_mark(1), None);
         assert!(!log.is_dirty());
 
-        log.push(Op::AnnMark {
-            ann: 2,
-            mark: AnnMark::Replace(pred(0.0)),
-        });
-        log.push(Op::AnnMark {
-            ann: 2,
-            mark: AnnMark::Replace(pred(1.0)),
-        });
+        log.push(Op::AnnMark { ann: 2, mark: AnnMark::Replace(pred(0.0)) });
+        log.push(Op::AnnMark { ann: 2, mark: AnnMark::Replace(pred(1.0)) });
         assert_eq!(log.state().ann_mark(2), Some(AnnMark::Replace(pred(1.0))));
     }
 
@@ -303,17 +264,8 @@ mod tests {
     fn undo_redo_and_new_op_clears_redo() {
         let mut log = EditLog::new(100);
         log.push(Op::FrameDelete { image: 3 });
-        log.push(Op::PredMark {
-            pred: pred(0.0),
-            mark: PredMark::Accept,
-        });
-        assert_eq!(
-            log.undo(),
-            Some(&Op::PredMark {
-                pred: pred(0.0),
-                mark: PredMark::Accept
-            })
-        );
+        log.push(Op::PredMark { pred: pred(0.0), mark: PredMark::Accept });
+        assert_eq!(log.undo(), Some(&Op::PredMark { pred: pred(0.0), mark: PredMark::Accept }));
         assert_eq!(log.state().pred_mark(&pred(0.0)), None);
         assert!(log.state().is_frame_deleted(3));
         log.redo();
@@ -332,14 +284,8 @@ mod tests {
         let mut log = EditLog::new(100);
         log.push(Op::Group {
             ops: vec![
-                Op::AnnMark {
-                    ann: 1,
-                    mark: AnnMark::Delete,
-                },
-                Op::AnnMark {
-                    ann: 2,
-                    mark: AnnMark::Delete,
-                },
+                Op::AnnMark { ann: 1, mark: AnnMark::Delete },
+                Op::AnnMark { ann: 2, mark: AnnMark::Delete },
             ],
         });
         assert_eq!(log.state().ann_marks.len(), 2);
@@ -357,26 +303,13 @@ mod tests {
             category: 1,
             bbox: BBox::new(0.0, 0.0, 5.0, 5.0),
         });
-        log.push(Op::SetBox {
-            ann: id,
-            bbox: BBox::new(1.0, 1.0, 5.0, 5.0),
-        });
-        log.push(Op::SetCategory {
-            ann: id,
-            category: 2,
-        });
-        log.push(Op::SetBox {
-            ann: 7,
-            bbox: BBox::new(2.0, 2.0, 5.0, 5.0),
-        });
+        log.push(Op::SetBox { ann: id, bbox: BBox::new(1.0, 1.0, 5.0, 5.0) });
+        log.push(Op::SetCategory { ann: id, category: 2 });
+        log.push(Op::SetBox { ann: 7, bbox: BBox::new(2.0, 2.0, 5.0, 5.0) });
         let st = log.state();
         assert_eq!(
             st.added[&id],
-            NewBox {
-                image: 1,
-                category: 2,
-                bbox: BBox::new(1.0, 1.0, 5.0, 5.0)
-            }
+            NewBox { image: 1, category: 2, bbox: BBox::new(1.0, 1.0, 5.0, 5.0) }
         );
         assert_eq!(st.boxes[&7], BBox::new(2.0, 2.0, 5.0, 5.0));
         assert!(!st.boxes.contains_key(&id));
@@ -385,10 +318,7 @@ mod tests {
 
     #[test]
     fn ops_serialize_as_tagged_json() {
-        let op = Op::AnnMark {
-            ann: 1,
-            mark: AnnMark::Replace(pred(2.0)),
-        };
+        let op = Op::AnnMark { ann: 1, mark: AnnMark::Replace(pred(2.0)) };
         let json = serde_json::to_string(&op).unwrap();
         assert!(json.starts_with(r#"{"op":"ann_mark""#), "{json}");
         assert_eq!(serde_json::from_str::<Op>(&json).unwrap(), op);
@@ -406,11 +336,7 @@ mod tests {
             }),
             (0..5u8, any::<bool>()).prop_map(|(x, a)| Op::PredMark {
                 pred: pred(f64::from(x)),
-                mark: if a {
-                    PredMark::Accept
-                } else {
-                    PredMark::Reject
-                },
+                mark: if a { PredMark::Accept } else { PredMark::Reject },
             }),
             (0..5i64).prop_map(|image| Op::FrameDelete { image }),
         ]

@@ -105,11 +105,7 @@ pub struct Predictions {
 
 impl Predictions {
     pub fn empty(model: impl Into<String>, confidence: f64) -> Self {
-        Self {
-            model: model.into(),
-            confidence,
-            ..Self::default()
-        }
+        Self { model: model.into(), confidence, ..Self::default() }
     }
 
     /// Keeps only entries whose image id, file name and size match the
@@ -159,12 +155,7 @@ impl Predictions {
                 "{unknown_categories} predictions have an unknown category and were ignored"
             ));
         }
-        Self {
-            model: file.model.clone(),
-            confidence: file.confidence,
-            per_image,
-            warnings,
-        }
+        Self { model: file.model.clone(), confidence: file.confidence, per_image, warnings }
     }
 
     /// Predictions of the image at `image_idx`, `None` when not evaluated.
@@ -279,12 +270,6 @@ mod tests {
         };
         let b = PredRef { score: 0.7, ..a };
         assert_eq!(a, b);
-        assert_ne!(
-            a,
-            PredRef {
-                bbox: BBox::new(1.0, 2.0, 3.0, 4.5),
-                ..a
-            }
-        );
+        assert_ne!(a, PredRef { bbox: BBox::new(1.0, 2.0, 3.0, 4.5), ..a });
     }
 }

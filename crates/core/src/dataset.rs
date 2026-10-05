@@ -22,19 +22,15 @@ impl Split {
 
     /// Split from any path component named train / val / valid / test.
     pub fn from_path(file_name: &str) -> Option<Split> {
-        Path::new(file_name)
-            .components()
-            .rev()
-            .skip(1)
-            .find_map(|c| match c {
-                Component::Normal(s) => match s.to_str()?.to_ascii_lowercase().as_str() {
-                    "train" => Some(Split::Train),
-                    "val" | "valid" | "validation" => Some(Split::Val),
-                    "test" => Some(Split::Test),
-                    _ => None,
-                },
+        Path::new(file_name).components().rev().skip(1).find_map(|c| match c {
+            Component::Normal(s) => match s.to_str()?.to_ascii_lowercase().as_str() {
+                "train" => Some(Split::Train),
+                "val" | "valid" | "validation" => Some(Split::Val),
+                "test" => Some(Split::Test),
                 _ => None,
-            })
+            },
+            _ => None,
+        })
     }
 
     pub fn name(self) -> &'static str {
@@ -85,48 +81,25 @@ impl Dataset {
         let mut image_index = HashMap::with_capacity(coco.images.len());
         for (i, img) in coco.images.iter().enumerate() {
             if image_index.insert(img.id, i).is_some() {
-                return Err(Error::invalid(
-                    source,
-                    format!("duplicate image id {}", img.id),
-                ));
+                return Err(Error::invalid(source, format!("duplicate image id {}", img.id)));
             }
         }
         let mut ann_index = HashMap::with_capacity(coco.annotations.len());
         let mut anns_by_image = vec![Vec::new(); coco.images.len()];
         for (i, ann) in coco.annotations.iter().enumerate() {
             if ann_index.insert(ann.id, i).is_some() {
-                return Err(Error::invalid(
-                    source,
-                    format!("duplicate annotation id {}", ann.id),
-                ));
+                return Err(Error::invalid(source, format!("duplicate annotation id {}", ann.id)));
             }
             let Some(&img) = image_index.get(&ann.image_id) else {
                 return Err(Error::invalid(
                     source,
-                    format!(
-                        "annotation {} refers to missing image {}",
-                        ann.id, ann.image_id
-                    ),
+                    format!("annotation {} refers to missing image {}", ann.id, ann.image_id),
                 ));
             };
             anns_by_image[img].push(i);
         }
-        let splits = coco
-            .images
-            .iter()
-            .map(|i| Split::from_path(&i.file_name))
-            .collect();
-        Ok((
-            Self {
-                root,
-                coco,
-                image_index,
-                ann_index,
-                anns_by_image,
-                splits,
-            },
-            legacy,
-        ))
+        let splits = coco.images.iter().map(|i| Split::from_path(&i.file_name)).collect();
+        Ok((Self { root, coco, image_index, ann_index, anns_by_image, splits }, legacy))
     }
 
     pub fn images(&self) -> &[CocoImage] {
@@ -159,9 +132,7 @@ impl Dataset {
 
     /// Annotations of the image at `image_idx`.
     pub fn annotations_of(&self, image_idx: usize) -> impl Iterator<Item = &CocoAnnotation> {
-        self.anns_by_image[image_idx]
-            .iter()
-            .map(|&i| &self.coco.annotations[i])
+        self.anns_by_image[image_idx].iter().map(|&i| &self.coco.annotations[i])
     }
 
     pub fn split_of(&self, image_idx: usize) -> Option<Split> {
@@ -173,21 +144,13 @@ impl Dataset {
     }
 
     pub fn category_name(&self, id: CategoryId) -> Option<&str> {
-        self.coco
-            .categories
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.name.as_str())
+        self.coco.categories.iter().find(|c| c.id == id).map(|c| c.name.as_str())
     }
 
     /// Category id for a class name, ignoring case and surrounding spaces.
     pub fn category_by_name(&self, name: &str) -> Option<CategoryId> {
         let name = name.trim();
-        self.coco
-            .categories
-            .iter()
-            .find(|c| c.name.trim().eq_ignore_ascii_case(name))
-            .map(|c| c.id)
+        self.coco.categories.iter().find(|c| c.name.trim().eq_ignore_ascii_case(name)).map(|c| c.id)
     }
 }
 
@@ -223,9 +186,7 @@ pub(crate) mod test_util {
             }],
             extra: Map::new(),
         };
-        Dataset::new(PathBuf::from("/data"), coco, Path::new("test.json"))
-            .unwrap()
-            .0
+        Dataset::new(PathBuf::from("/data"), coco, Path::new("test.json")).unwrap().0
     }
 }
 
@@ -265,17 +226,9 @@ mod tests {
     fn rejects_dangling_annotation_and_extracts_legacy_marks() {
         let mut coco = test_util::dataset(1, &[(1, BBox::new(0.0, 0.0, 5.0, 5.0))]).coco;
         coco.images[0].extra.insert("to_delete".into(), true.into());
-        coco.annotations[0]
-            .extra
-            .insert("to_delete".into(), true.into());
+        coco.annotations[0].extra.insert("to_delete".into(), true.into());
         let (_, legacy) = Dataset::new(PathBuf::new(), coco.clone(), Path::new("x")).unwrap();
-        assert_eq!(
-            legacy,
-            LegacyMarks {
-                deleted_frames: vec![1],
-                deleted_annotations: vec![1]
-            }
-        );
+        assert_eq!(legacy, LegacyMarks { deleted_frames: vec![1], deleted_annotations: vec![1] });
 
         coco.annotations[0].image_id = 99;
         assert!(Dataset::new(PathBuf::new(), coco, Path::new("x")).is_err());

@@ -31,10 +31,7 @@ pub fn export_zip(
 ) -> Result<ExportReport> {
     let mut report = ExportReport::default();
     let total = coco.images.len();
-    let zip_err = |e| Error::Zip {
-        path: out.to_path_buf(),
-        source: e,
-    };
+    let zip_err = |e| Error::Zip { path: out.to_path_buf(), source: e };
     let result = fsutil::write_atomic(out, |w| {
         let mut zip = ZipWriter::new(&mut *w);
         let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -93,25 +90,17 @@ mod tests {
         fs::create_dir_all(dir.path().join("images/train")).unwrap();
         fs::write(dir.path().join("images/train/0001.jpg"), b"jpegdata").unwrap();
         let out = dir.path().join("out.zip");
-        let report = export_zip(dir.path(), &coco, "annotations.v004.json", &out, |_, _| {
-            true
-        })
-        .unwrap();
+        let report =
+            export_zip(dir.path(), &coco, "annotations.v004.json", &out, |_, _| true).unwrap();
         assert_eq!(report.images, 1);
         assert_eq!(report.missing, vec!["images/train/0002.jpg"]);
 
         let mut zip = zip::ZipArchive::new(File::open(&out).unwrap()).unwrap();
         let mut s = String::new();
-        zip.by_name("annotations.v004.json")
-            .unwrap()
-            .read_to_string(&mut s)
-            .unwrap();
+        zip.by_name("annotations.v004.json").unwrap().read_to_string(&mut s).unwrap();
         assert_eq!(serde_json::from_str::<CocoFile>(&s).unwrap(), coco);
         let mut img = Vec::new();
-        zip.by_name("images/train/0001.jpg")
-            .unwrap()
-            .read_to_end(&mut img)
-            .unwrap();
+        zip.by_name("images/train/0001.jpg").unwrap().read_to_end(&mut img).unwrap();
         assert_eq!(img, b"jpegdata");
     }
 
@@ -119,10 +108,8 @@ mod tests {
     fn cancel_leaves_no_file() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out.zip");
-        let report = export_zip(dir.path(), &dataset(2, &[]).coco, "a.json", &out, |_, _| {
-            false
-        })
-        .unwrap();
+        let report =
+            export_zip(dir.path(), &dataset(2, &[]).coco, "a.json", &out, |_, _| false).unwrap();
         assert!(report.cancelled);
         assert!(!out.exists());
     }

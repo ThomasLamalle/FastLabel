@@ -28,23 +28,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn io(path: impl AsRef<Path>, source: std::io::Error) -> Self {
-        Self::Io {
-            path: path.as_ref().to_path_buf(),
-            source,
-        }
+        Self::Io { path: path.as_ref().to_path_buf(), source }
     }
 
     pub fn json(path: impl AsRef<Path>, source: serde_json::Error) -> Self {
-        Self::Json {
-            path: path.as_ref().to_path_buf(),
-            source,
-        }
+        Self::Json { path: path.as_ref().to_path_buf(), source }
     }
 
     pub fn invalid(path: impl AsRef<Path>, message: impl Into<String>) -> Self {
-        Self::Invalid {
-            path: path.as_ref().to_path_buf(),
-            message: message.into(),
-        }
+        Self::Invalid { path: path.as_ref().to_path_buf(), message: message.into() }
     }
 }

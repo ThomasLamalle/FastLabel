@@ -60,17 +60,12 @@ impl Project {
     }
 
     fn from_coco(dir: &Path, coco: CocoFile, source: Option<VersionFile>) -> Result<Self> {
-        let source_path = source
-            .as_ref()
-            .map_or_else(|| dir.to_path_buf(), |v| v.path.clone());
+        let source_path = source.as_ref().map_or_else(|| dir.to_path_buf(), |v| v.path.clone());
         let (dataset, legacy) = Dataset::new(dir.to_path_buf(), coco, &source_path)?;
         let mut warnings = Vec::new();
         let mut log = EditLog::new(dataset.coco.next_annotation_id());
         for ann in &legacy.deleted_annotations {
-            log.push(Op::AnnMark {
-                ann: *ann,
-                mark: AnnMark::Delete,
-            });
+            log.push(Op::AnnMark { ann: *ann, mark: AnnMark::Delete });
         }
         for image in &legacy.deleted_frames {
             log.push(Op::FrameDelete { image: *image });
@@ -117,9 +112,7 @@ impl Project {
 
     /// Name of the base annotation file, used to tie the journal to it.
     pub fn base_name(&self) -> String {
-        self.source
-            .as_ref()
-            .map_or_else(|| "<imported>".into(), VersionFile::file_name)
+        self.source.as_ref().map_or_else(|| "<imported>".into(), VersionFile::file_name)
     }
 
     fn load_predictions(&mut self) {
@@ -148,9 +141,7 @@ impl Project {
             journal::replay(&recorded.entries, &mut self.log);
             self.journal = Some(Journal::open_append(&path)?);
             if n > 0 {
-                self.warnings.push(format!(
-                    "recovered {n} unsaved actions from the last session"
-                ));
+                self.warnings.push(format!("recovered {n} unsaved actions from the last session"));
             }
         } else {
             let stale =
@@ -169,10 +160,7 @@ impl Project {
         if self.journal.is_none() {
             self.journal = Some(Journal::create(&self.journal_path(), &self.base_name())?);
         }
-        self.journal
-            .as_mut()
-            .expect("journal created")
-            .append(entry)
+        self.journal.as_mut().expect("journal created").append(entry)
     }
 
     /// Records a user action. The edit is always applied in memory; an error
@@ -217,10 +205,8 @@ impl Project {
         let state_dir = self.state_dir();
         applied.review.save(&state_dir.join(REVIEW_FILE))?;
 
-        let version_stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let version_stem =
+            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let trash = commit::move_to_trash(
             &self.dir,
             &state_dir.join("trash").join(version_stem),
@@ -246,17 +232,12 @@ impl Project {
         if let Some(file) = &mut self.prediction_file {
             if !applied.trashed_files.is_empty() {
                 let ds = &self.dataset;
-                file.images
-                    .retain(|k, _| k.parse().ok().and_then(|id| ds.image(id)).is_some());
+                file.images.retain(|k, _| k.parse().ok().and_then(|id| ds.image(id)).is_some());
                 file.save(&self.dir.join(PREDICTIONS_FILE))?;
             }
             self.predictions = Some(Predictions::from_file(file, &self.dataset));
         }
-        Ok(Some(SaveReport {
-            path,
-            summary: applied.summary,
-            trash,
-        }))
+        Ok(Some(SaveReport { path, summary: applied.summary, trash }))
     }
 
     /// Replaces all predictions and writes `predictions.json`.
@@ -276,10 +257,8 @@ impl Project {
         model: &str,
         confidence: f64,
     ) -> Result<()> {
-        let mut all = self
-            .predictions
-            .clone()
-            .unwrap_or_else(|| Predictions::empty(model, confidence));
+        let mut all =
+            self.predictions.clone().unwrap_or_else(|| Predictions::empty(model, confidence));
         all.set_image(image_idx, preds);
         self.set_predictions(all)
     }
@@ -287,13 +266,7 @@ impl Project {
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
         .collect()
 }
 
@@ -309,15 +282,10 @@ mod tests {
     fn write_dataset(dir: &Path) {
         let mut coco = dataset(
             2,
-            &[
-                (1, BBox::new(0.0, 0.0, 10.0, 10.0)),
-                (2, BBox::new(5.0, 5.0, 10.0, 10.0)),
-            ],
+            &[(1, BBox::new(0.0, 0.0, 10.0, 10.0)), (2, BBox::new(5.0, 5.0, 10.0, 10.0))],
         )
         .coco;
-        coco.annotations[1]
-            .extra
-            .insert("to_delete".into(), true.into());
+        coco.annotations[1].extra.insert("to_delete".into(), true.into());
         coco.save(&dir.join("annotations.v001.json")).unwrap();
         fs::create_dir_all(dir.join("images/train")).unwrap();
         for i in 1..=2 {
@@ -332,17 +300,9 @@ mod tests {
         write_dataset(dir);
 
         let mut p = Project::open(dir).unwrap();
-        assert_eq!(
-            p.log.state().ann_mark(2),
-            Some(AnnMark::Delete),
-            "legacy mark loaded"
-        );
+        assert_eq!(p.log.state().ann_mark(2), Some(AnnMark::Delete), "legacy mark loaded");
         p.record(Op::FrameDelete { image: 1 }).unwrap();
-        p.record(Op::AnnMark {
-            ann: 2,
-            mark: AnnMark::Delete,
-        })
-        .unwrap(); // un-mark legacy
+        p.record(Op::AnnMark { ann: 2, mark: AnnMark::Delete }).unwrap(); // un-mark legacy
         p.undo().unwrap();
         drop(p); // "crash"
 
@@ -382,11 +342,7 @@ mod tests {
         p.record(Op::FrameDelete { image: 2 }).unwrap();
         drop(p);
         // Someone saved a newer version meanwhile.
-        fs::copy(
-            dir.join("annotations.v001.json"),
-            dir.join("annotations.v002.json"),
-        )
-        .unwrap();
+        fs::copy(dir.join("annotations.v001.json"), dir.join("annotations.v002.json")).unwrap();
         let p = Project::open(dir).unwrap();
         assert!(!p.log.state().is_frame_deleted(2));
         assert!(p.warnings.iter().any(|w| w.contains("set aside")));
@@ -404,13 +360,8 @@ mod tests {
             bbox: BBox::new(50.0, 50.0, 10.0, 10.0),
             score: 0.7,
         };
-        p.set_image_predictions(0, vec![pred], "m.onnx", 0.1)
-            .unwrap();
-        p.record(Op::PredMark {
-            pred,
-            mark: PredMark::Accept,
-        })
-        .unwrap();
+        p.set_image_predictions(0, vec![pred], "m.onnx", 0.1).unwrap();
+        p.record(Op::PredMark { pred, mark: PredMark::Accept }).unwrap();
         p.save().unwrap();
         assert!(p.dataset.annotations().iter().any(|a| a.bbox == pred.bbox));
 
@@ -425,11 +376,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::create_dir_all(dir.join("images")).unwrap();
-        fs::write(
-            dir.join("images/a.png"),
-            crate::yolo::tests::png_header(20, 10),
-        )
-        .unwrap();
+        fs::write(dir.join("images/a.png"), crate::yolo::tests::png_header(20, 10)).unwrap();
         let mut p = Project::open(dir).unwrap();
         assert!(p.source.is_none());
         assert!(p.has_unsaved_changes());

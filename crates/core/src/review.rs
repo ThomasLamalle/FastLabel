@@ -49,10 +49,7 @@ impl ReviewState {
     fn reindex(&mut self) {
         self.rejected_by_image.clear();
         for (i, r) in self.rejected.iter().enumerate() {
-            self.rejected_by_image
-                .entry(r.image_id)
-                .or_default()
-                .push(i);
+            self.rejected_by_image.entry(r.image_id).or_default().push(i);
         }
     }
 
@@ -62,13 +59,11 @@ impl ReviewState {
 
     /// True when a previously rejected prediction overlaps this one enough.
     pub fn is_rejected(&self, pred: &PredRef) -> bool {
-        self.rejected_by_image
-            .get(&pred.image_id)
-            .is_some_and(|idx| {
-                idx.iter().map(|&i| &self.rejected[i]).any(|r| {
-                    r.category_id == pred.category_id && r.bbox.iou(&pred.bbox) >= REJECT_MATCH_IOU
-                })
+        self.rejected_by_image.get(&pred.image_id).is_some_and(|idx| {
+            idx.iter().map(|&i| &self.rejected[i]).any(|r| {
+                r.category_id == pred.category_id && r.bbox.iou(&pred.bbox) >= REJECT_MATCH_IOU
             })
+        })
     }
 
     pub fn reject(&mut self, pred: &PredRef) {
@@ -78,10 +73,7 @@ impl ReviewState {
                 category_id: pred.category_id,
                 bbox: pred.bbox,
             });
-            self.rejected_by_image
-                .entry(pred.image_id)
-                .or_default()
-                .push(self.rejected.len() - 1);
+            self.rejected_by_image.entry(pred.image_id).or_default().push(self.rejected.len() - 1);
         }
     }
 
@@ -102,12 +94,7 @@ mod tests {
     use super::*;
 
     fn pred(x: f64) -> PredRef {
-        PredRef {
-            image_id: 1,
-            category_id: 1,
-            bbox: BBox::new(x, 0.0, 100.0, 100.0),
-            score: 0.3,
-        }
+        PredRef { image_id: 1, category_id: 1, bbox: BBox::new(x, 0.0, 100.0, 100.0), score: 0.3 }
     }
 
     #[test]
@@ -124,10 +111,7 @@ mod tests {
         assert_eq!(st.rejected.len(), 1);
         assert!(st.is_rejected(&pred(2.0)));
         assert!(!st.is_rejected(&pred(30.0)));
-        assert!(!st.is_rejected(&PredRef {
-            category_id: 2,
-            ..pred(0.0)
-        }));
+        assert!(!st.is_rejected(&PredRef { category_id: 2, ..pred(0.0) }));
         assert!(st.is_reviewed(5));
     }
 

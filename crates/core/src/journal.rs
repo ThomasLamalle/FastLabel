@@ -42,32 +42,16 @@ impl Journal {
             fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
         }
         let mut file = File::create(path).map_err(|e| Error::io(path, e))?;
-        let header = Header {
-            fastlabel_journal: FORMAT,
-            base: base.to_string(),
-        };
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&header).expect("header serializes")
-        )
-        .map_err(|e| Error::io(path, e))?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            file,
-        })
+        let header = Header { fastlabel_journal: FORMAT, base: base.to_string() };
+        writeln!(file, "{}", serde_json::to_string(&header).expect("header serializes"))
+            .map_err(|e| Error::io(path, e))?;
+        Ok(Self { path: path.to_path_buf(), file })
     }
 
     /// Continues an existing journal (after a replay).
     pub fn open_append(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|e| Error::io(path, e))?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            file,
-        })
+        let file = OpenOptions::new().append(true).open(path).map_err(|e| Error::io(path, e))?;
+        Ok(Self { path: path.to_path_buf(), file })
     }
 
     /// Appends one entry. Unbuffered write of a single line: the OS page
@@ -75,9 +59,7 @@ impl Journal {
     pub fn append(&mut self, entry: &Entry) -> Result<()> {
         let mut line = serde_json::to_vec(entry).expect("entry serializes");
         line.push(b'\n');
-        self.file
-            .write_all(&line)
-            .map_err(|e| Error::io(&self.path, e))
+        self.file.write_all(&line).map_err(|e| Error::io(&self.path, e))
     }
 
     pub fn path(&self) -> &Path {
@@ -115,10 +97,7 @@ pub fn read(path: &Path) -> Result<Option<Recorded>> {
             Err(_) => break,
         }
     }
-    Ok(Some(Recorded {
-        base: header.base,
-        entries,
-    }))
+    Ok(Some(Recorded { base: header.base, entries }))
 }
 
 pub fn replay(entries: &[Entry], log: &mut EditLog) {
@@ -145,29 +124,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".fastlabel").join(JOURNAL_FILE);
         let mut j = Journal::create(&path, "annotations.v003.json").unwrap();
-        j.append(&Entry::Op {
-            op: Op::AnnMark {
-                ann: 1,
-                mark: AnnMark::Delete,
-            },
-        })
-        .unwrap();
-        j.append(&Entry::Op {
-            op: Op::FrameDelete { image: 2 },
-        })
-        .unwrap();
+        j.append(&Entry::Op { op: Op::AnnMark { ann: 1, mark: AnnMark::Delete } }).unwrap();
+        j.append(&Entry::Op { op: Op::FrameDelete { image: 2 } }).unwrap();
         j.append(&Entry::Undo).unwrap();
         drop(j);
         let mut j = Journal::open_append(&path).unwrap();
-        j.append(&Entry::Op {
-            op: Op::FrameDelete { image: 5 },
-        })
-        .unwrap();
+        j.append(&Entry::Op { op: Op::FrameDelete { image: 5 } }).unwrap();
         drop(j);
         // Simulate a crash mid-line.
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(br#"{"kind":"op","op":{"op":"frame_del"#)
-            .unwrap();
+        f.write_all(br#"{"kind":"op","op":{"op":"frame_del"#).unwrap();
 
         let rec = read(&path).unwrap().unwrap();
         assert_eq!(rec.base, "annotations.v003.json");

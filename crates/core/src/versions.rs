@@ -26,10 +26,7 @@ pub struct VersionFile {
 
 impl VersionFile {
     pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
 }
 
@@ -38,9 +35,7 @@ pub fn parse_kind(file_name: &str) -> Option<VersionKind> {
         "annotations.json" => Some(VersionKind::Base),
         "annotations.draft.json" => Some(VersionKind::Draft),
         _ => {
-            let digits = file_name
-                .strip_prefix("annotations.v")?
-                .strip_suffix(".json")?;
+            let digits = file_name.strip_prefix("annotations.v")?.strip_suffix(".json")?;
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
@@ -67,11 +62,7 @@ pub fn discover(dir: &Path) -> Result<Vec<VersionFile>> {
             continue;
         }
         let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push(VersionFile {
-            path: entry.path(),
-            kind,
-            modified,
-        });
+        out.push(VersionFile { path: entry.path(), kind, modified });
     }
     out.sort_by_key(|v| v.kind);
     Ok(out)
@@ -80,10 +71,8 @@ pub fn discover(dir: &Path) -> Result<Vec<VersionFile>> {
 /// The file to open: the newest numbered snapshot, unless the legacy draft
 /// was modified strictly after it; `annotations.json` only as a last resort.
 pub fn latest(files: &[VersionFile]) -> Option<&VersionFile> {
-    let numbered = files
-        .iter()
-        .filter(|f| matches!(f.kind, VersionKind::Numbered(_)))
-        .max_by_key(|f| f.kind);
+    let numbered =
+        files.iter().filter(|f| matches!(f.kind, VersionKind::Numbered(_))).max_by_key(|f| f.kind);
     let draft = files.iter().find(|f| f.kind == VersionKind::Draft);
     let base = files.iter().find(|f| f.kind == VersionKind::Base);
     match (numbered, draft) {
@@ -126,18 +115,9 @@ mod tests {
 
     #[test]
     fn parses_file_names() {
-        assert_eq!(
-            parse_kind("annotations.v022.json"),
-            Some(VersionKind::Numbered(22))
-        );
-        assert_eq!(
-            parse_kind("annotations.v1234.json"),
-            Some(VersionKind::Numbered(1234))
-        );
-        assert_eq!(
-            parse_kind("annotations.draft.json"),
-            Some(VersionKind::Draft)
-        );
+        assert_eq!(parse_kind("annotations.v022.json"), Some(VersionKind::Numbered(22)));
+        assert_eq!(parse_kind("annotations.v1234.json"), Some(VersionKind::Numbered(1234)));
+        assert_eq!(parse_kind("annotations.draft.json"), Some(VersionKind::Draft));
         assert_eq!(parse_kind("annotations.json"), Some(VersionKind::Base));
         assert_eq!(parse_kind("annotations.v.json"), None);
         assert_eq!(parse_kind("annotations.vx1.json"), None);
@@ -155,10 +135,7 @@ mod tests {
         assert_eq!(latest(&files).unwrap().kind, VersionKind::Numbered(2));
         let files = vec![vf(VersionKind::Numbered(2), 10), vf(VersionKind::Draft, 11)];
         assert_eq!(latest(&files).unwrap().kind, VersionKind::Draft);
-        assert_eq!(
-            latest(&[vf(VersionKind::Base, 1)]).unwrap().kind,
-            VersionKind::Base
-        );
+        assert_eq!(latest(&[vf(VersionKind::Base, 1)]).unwrap().kind, VersionKind::Base);
         assert!(latest(&[]).is_none());
     }
 
@@ -169,13 +146,7 @@ mod tests {
         fs::write(dir.path().join("annotations.v003.json"), "{}").unwrap();
         let files = discover(dir.path()).unwrap();
         assert_eq!(files.len(), 2);
-        assert_eq!(
-            next_path(dir.path(), &files),
-            dir.path().join("annotations.v004.json")
-        );
-        assert_eq!(
-            next_path(dir.path(), &[]),
-            dir.path().join("annotations.v001.json")
-        );
+        assert_eq!(next_path(dir.path(), &files), dir.path().join("annotations.v004.json"));
+        assert_eq!(next_path(dir.path(), &[]), dir.path().join("annotations.v001.json"));
     }
 }

@@ -61,15 +61,7 @@ pub struct CocoCategory {
 
 impl CocoAnnotation {
     pub fn new(id: AnnId, image_id: ImageId, category_id: CategoryId, bbox: BBox) -> Self {
-        Self {
-            id,
-            image_id,
-            category_id,
-            bbox,
-            area: bbox.area(),
-            iscrowd: 0,
-            extra: Map::new(),
-        }
+        Self { id, image_id, category_id, bbox, area: bbox.area(), iscrowd: 0, extra: Map::new() }
     }
 }
 

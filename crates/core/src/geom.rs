@@ -64,11 +64,7 @@ impl BBox {
             return 0.0;
         }
         let union = self.area() + other.area() - inter;
-        if union <= 0.0 {
-            0.0
-        } else {
-            (inter / union).clamp(0.0, 1.0)
-        }
+        if union <= 0.0 { 0.0 } else { (inter / union).clamp(0.0, 1.0) }
     }
 
     pub fn is_finite(&self) -> bool {
@@ -91,12 +87,7 @@ impl BBox {
 
     /// Bit-exact identity, used to recognise the same prediction across sessions.
     pub fn bits(&self) -> [u64; 4] {
-        [
-            self.x.to_bits(),
-            self.y.to_bits(),
-            self.w.to_bits(),
-            self.h.to_bits(),
-        ]
+        [self.x.to_bits(), self.y.to_bits(), self.w.to_bits(), self.h.to_bits()]
     }
 }
 
@@ -127,33 +118,16 @@ mod tests {
 
     #[test]
     fn clip_keeps_inside_part_and_rejects_tiny_or_outside() {
-        let b = BBox::new(-5.0, -5.0, 20.0, 20.0)
-            .clip(100.0, 100.0)
-            .unwrap();
+        let b = BBox::new(-5.0, -5.0, 20.0, 20.0).clip(100.0, 100.0).unwrap();
         assert_eq!(b, BBox::new(0.0, 0.0, 15.0, 15.0));
-        assert!(
-            BBox::new(200.0, 0.0, 10.0, 10.0)
-                .clip(100.0, 100.0)
-                .is_none()
-        );
-        assert!(
-            BBox::new(10.0, 10.0, 0.5, 10.0)
-                .clip(100.0, 100.0)
-                .is_none()
-        );
-        assert!(
-            BBox::new(f64::NAN, 0.0, 1.0, 1.0)
-                .clip(100.0, 100.0)
-                .is_none()
-        );
+        assert!(BBox::new(200.0, 0.0, 10.0, 10.0).clip(100.0, 100.0).is_none());
+        assert!(BBox::new(10.0, 10.0, 0.5, 10.0).clip(100.0, 100.0).is_none());
+        assert!(BBox::new(f64::NAN, 0.0, 1.0, 1.0).clip(100.0, 100.0).is_none());
     }
 
     #[test]
     fn from_corners_normalises_reverse_drags() {
-        assert_eq!(
-            BBox::from_corners(10.0, 8.0, 2.0, 4.0),
-            BBox::new(2.0, 4.0, 8.0, 4.0)
-        );
+        assert_eq!(BBox::from_corners(10.0, 8.0, 2.0, 4.0), BBox::new(2.0, 4.0, 8.0, 4.0));
     }
 
     #[test]
@@ -165,12 +139,7 @@ mod tests {
     }
 
     fn arb_box() -> impl Strategy<Value = BBox> {
-        (
-            -100.0..100.0f64,
-            -100.0..100.0f64,
-            0.0..100.0f64,
-            0.0..100.0f64,
-        )
+        (-100.0..100.0f64, -100.0..100.0f64, 0.0..100.0f64, 0.0..100.0f64)
             .prop_map(|(x, y, w, h)| BBox::new(x, y, w, h))
     }
 

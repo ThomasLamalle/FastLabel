@@ -46,11 +46,8 @@ pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Appl
     let mut coco = ds.coco.clone();
     let mut review = review.clone();
     let mut summary = Summary::default();
-    let dims: HashMap<ImageId, (f64, f64)> = coco
-        .images
-        .iter()
-        .map(|i| (i.id, (f64::from(i.width), f64::from(i.height))))
-        .collect();
+    let dims: HashMap<ImageId, (f64, f64)> =
+        coco.images.iter().map(|i| (i.id, (f64::from(i.width), f64::from(i.height)))).collect();
     let clip = |image: ImageId, b: &BBox| dims.get(&image).and_then(|&(w, h)| b.clip(w, h));
 
     let mut deleted: HashSet<AnnId> = HashSet::new();
@@ -93,9 +90,8 @@ pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Appl
         }
     }
 
-    let mut next_id = coco
-        .next_annotation_id()
-        .max(pending.added.keys().max().map_or(0, |m| m + 1));
+    let mut next_id =
+        coco.next_annotation_id().max(pending.added.keys().max().map_or(0, |m| m + 1));
     for (&id, new) in &pending.added {
         if pending.ann_marks.get(&id) == Some(&AnnMark::Delete) {
             continue;
@@ -104,8 +100,7 @@ pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Appl
             summary.invalid_skipped += 1;
             continue;
         };
-        coco.annotations
-            .push(CocoAnnotation::new(id, new.image, new.category, b));
+        coco.annotations.push(CocoAnnotation::new(id, new.image, new.category, b));
         review.reviewed.insert(id);
         summary.added += 1;
     }
@@ -168,18 +163,12 @@ pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Appl
     summary.deleted_frames = frames.iter().filter(|id| dims.contains_key(id)).count();
     coco.images.retain(|i| !frames.contains(&i.id));
     let before = coco.annotations.len();
-    coco.annotations
-        .retain(|a| !frames.contains(&a.image_id) && !deleted.contains(&a.id));
+    coco.annotations.retain(|a| !frames.contains(&a.image_id) && !deleted.contains(&a.id));
     summary.deleted_annotations = before - coco.annotations.len();
 
     let kept: HashSet<AnnId> = coco.annotations.iter().map(|a| a.id).collect();
     review.retain(|a| kept.contains(&a), |i| !frames.contains(&i));
-    Applied {
-        coco,
-        review,
-        trashed_files,
-        summary,
-    }
+    Applied { coco, review, trashed_files, summary }
 }
 
 fn set_bbox(ann: &mut CocoAnnotation, b: BBox) {
@@ -204,26 +193,18 @@ pub fn move_to_trash(
     files: &[String],
     retained: &CocoFile,
 ) -> TrashReport {
-    let still_used: HashSet<&str> = retained
-        .images
-        .iter()
-        .map(|i| i.file_name.as_str())
-        .collect();
+    let still_used: HashSet<&str> = retained.images.iter().map(|i| i.file_name.as_str()).collect();
     let mut report = TrashReport::default();
     for name in files {
         let src = root.join(name);
         let rel = Path::new(name);
         let safe = rel.components().all(|c| matches!(c, Component::Normal(_)));
         if !safe {
-            report
-                .failed
-                .push((src, "path is outside the dataset folder".into()));
+            report.failed.push((src, "path is outside the dataset folder".into()));
             continue;
         }
         if still_used.contains(name.as_str()) {
-            report
-                .failed
-                .push((src, "image is still used by a retained frame".into()));
+            report.failed.push((src, "image is still used by a retained frame".into()));
             continue;
         }
         if !src.exists() {
@@ -262,42 +243,22 @@ mod tests {
     }
 
     fn pred(image_id: ImageId, bbox: BBox) -> PredRef {
-        PredRef {
-            image_id,
-            category_id: 1,
-            bbox,
-            score: 0.8,
-        }
+        PredRef { image_id, category_id: 1, bbox, score: 0.8 }
     }
 
     #[test]
     fn applies_marks_edits_and_frame_deletion() {
         let ds = dataset(3, &[(1, b(0.0)), (1, b(30.0)), (2, b(0.0)), (3, b(0.0))]);
         let mut log = EditLog::new(ds.coco.next_annotation_id());
-        log.push(Op::AnnMark {
-            ann: 1,
-            mark: AnnMark::Delete,
-        });
+        log.push(Op::AnnMark { ann: 1, mark: AnnMark::Delete });
         log.push(Op::AnnMark {
             ann: 2,
             mark: AnnMark::Replace(pred(1, BBox::new(31.0, 11.0, 18.0, 18.0))),
         });
-        log.push(Op::AnnMark {
-            ann: 3,
-            mark: AnnMark::Confirm,
-        });
-        log.push(Op::SetCategory {
-            ann: 3,
-            category: 2,
-        });
-        log.push(Op::PredMark {
-            pred: pred(2, b(60.0)),
-            mark: PredMark::Accept,
-        });
-        log.push(Op::PredMark {
-            pred: pred(2, b(40.0)),
-            mark: PredMark::Reject,
-        });
+        log.push(Op::AnnMark { ann: 3, mark: AnnMark::Confirm });
+        log.push(Op::SetCategory { ann: 3, category: 2 });
+        log.push(Op::PredMark { pred: pred(2, b(60.0)), mark: PredMark::Accept });
+        log.push(Op::PredMark { pred: pred(2, b(40.0)), mark: PredMark::Reject });
         let id = log.alloc_ann_id();
         log.push(Op::AddBox {
             ann: id,
@@ -306,10 +267,7 @@ mod tests {
             bbox: BBox::new(90.0, 90.0, 20.0, 20.0),
         });
         log.push(Op::FrameDelete { image: 3 });
-        log.push(Op::SetTags {
-            image: 2,
-            tags: vec!["blurry".into()],
-        });
+        log.push(Op::SetTags { image: 2, tags: vec!["blurry".into()] });
 
         let out = apply(&ds, log.state(), &ReviewState::default());
         let anns: Vec<_> = out
@@ -327,16 +285,10 @@ mod tests {
                 (6, 2, 1, b(60.0)),
             ]
         );
-        assert_eq!(
-            out.coco.images.iter().map(|i| i.id).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
+        assert_eq!(out.coco.images.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(out.coco.images[1].tags, vec!["blurry"]);
         assert_eq!(out.trashed_files, vec!["images/train/0003.jpg"]);
-        assert_eq!(
-            out.review.reviewed.iter().copied().collect::<Vec<_>>(),
-            vec![2, 3, 5, 6]
-        );
+        assert_eq!(out.review.reviewed.iter().copied().collect::<Vec<_>>(), vec![2, 3, 5, 6]);
         assert!(out.review.is_rejected(&pred(2, b(40.0))));
         assert_eq!(
             out.summary,
@@ -360,14 +312,8 @@ mod tests {
     fn accepting_an_identical_box_keeps_it_instead_of_duplicating() {
         let ds = dataset(1, &[(1, b(0.0))]);
         let mut log = EditLog::new(10);
-        log.push(Op::AnnMark {
-            ann: 1,
-            mark: AnnMark::Delete,
-        });
-        log.push(Op::PredMark {
-            pred: pred(1, b(0.0)),
-            mark: PredMark::Accept,
-        });
+        log.push(Op::AnnMark { ann: 1, mark: AnnMark::Delete });
+        log.push(Op::PredMark { pred: pred(1, b(0.0)), mark: PredMark::Accept });
         let out = apply(&ds, log.state(), &ReviewState::default());
         assert_eq!(out.coco.annotations.len(), 1);
         assert_eq!(out.coco.annotations[0].id, 1);

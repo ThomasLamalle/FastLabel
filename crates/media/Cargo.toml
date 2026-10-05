@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+crossbeam-channel = "0.5.17"
+fast_image_resize = "6.1.0"
+fastlabel-core = { version = "0.1.0", path = "../core" }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+thiserror = "2.0.21"
+zune-jpeg = "0.5.15"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
