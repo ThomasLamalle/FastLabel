@@ -7,8 +7,10 @@ use eframe::egui::{self, Color32, Key, Modifiers, RichText, ViewportCommand};
 use fastlabel_core::Split;
 use fastlabel_media::Job;
 
+use crate::cluster_view::{ClusterEvent, ClusterView, Setup};
 use crate::crops::SortKey;
 use crate::editor::{EditorAction, EditorView, FrameData};
+use crate::embeddings::{self, Embeddings, SavedLayout};
 use crate::frame::Sel;
 use crate::inference::{Inference, Scope};
 use crate::mosaic::{self, Margins, MosaicEvent, MosaicState};
@@ -23,6 +25,17 @@ pub enum Mode {
     Frame,
     /// Cleaning workflow: overlapping GT boxes, one group at a time.
     Clean,
+    /// Frames as a point cloud of image embeddings, to manage splits.
+    Cluster,
+}
+
+/// Finished embedding run: model id, (image key, vector), failures, cancelled.
+struct EmbedOutcome {
+    model: String,
+    vectors: Vec<(u64, Vec<f32>)>,
+    failed: Vec<String>,
+    cancelled: bool,
+    error: Option<String>,
 }
 
 /// Progress through the overlapping-GT cleaning workflow.
@@ -62,6 +75,12 @@ pub struct FastLabelApp {
     /// Color-uniformity computation; sorts by it when done.
     uniformity_task: Option<Task<std::collections::HashMap<u64, f32>>>,
     export_task: Option<Task<Result<fastlabel_core::export::ExportReport, String>>>,
+    pub(crate) cluster: ClusterView,
+    /// Loaded when cluster mode is first opened.
+    embeddings: Option<Embeddings>,
+    embed_task: Option<Task<EmbedOutcome>>,
+    layout_task: Option<Task<Option<SavedLayout>>>,
+    report_task: Option<Task<Result<PathBuf, String>>>,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
     exit_ok: bool,
@@ -78,6 +97,7 @@ impl FastLabelApp {
         dataset: Option<PathBuf>,
     ) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
+        let min_cluster_size = session.min_cluster_size;
         let mut app = Self {
             session,
             session_path,
@@ -94,11 +114,17 @@ impl FastLabelApp {
             drop_focus: false,
             uniformity_task: None,
             export_task: None,
+            cluster: ClusterView::default(),
+            embeddings: None,
+            embed_task: None,
+            layout_task: None,
+            report_task: None,
             status: None,
             exit_ok: false,
             #[cfg(test)]
             focus_probe: None,
         };
+        app.cluster.min_cluster_size = min_cluster_size;
         let restore = dataset.is_none();
         if let Some(dir) = dataset.or_else(|| app.session.last_dataset.clone()) {
             app.open(&cc.egui_ctx, &dir, restore);
@@ -119,6 +145,11 @@ impl FastLabelApp {
     #[cfg(test)]
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    #[cfg(test)]
+    pub fn cluster_busy(&self) -> bool {
+        self.embed_task.is_some() || self.layout_task.is_some()
     }
 
     pub fn thumbs_busy(&self) -> usize {
@@ -155,6 +186,14 @@ impl FastLabelApp {
                 );
                 self.session.last_dataset = Some(dir.to_path_buf());
                 self.ws = Some(ws);
+                self.cluster = ClusterView::default();
+                self.cluster.min_cluster_size = self.session.min_cluster_size;
+                self.embeddings = None;
+                self.embed_task = None;
+                self.layout_task = None;
+                if self.mode == Mode::Cluster {
+                    self.mode = Mode::Mosaic;
+                }
                 self.mosaic.ensure_visible = true;
                 if warnings.is_empty() {
                     self.info(summary)
@@ -167,8 +206,10 @@ impl FastLabelApp {
     }
 
     fn pick_and_open(&mut self, ctx: &egui::Context) {
-        if self.inference.is_running() {
-            self.error("Wait for the model run to finish (or cancel it) before switching datasets");
+        if self.inference.is_running() || self.embed_task.is_some() || self.layout_task.is_some() {
+            self.error(
+                "Wait for the background run to finish (or cancel it) before switching datasets",
+            );
             return;
         }
         let start = self.session.last_dataset.clone().unwrap_or_default();
@@ -202,6 +243,8 @@ impl FastLabelApp {
                     (s.confirmed, "confirmed"),
                     (s.added + s.edited, "edited"),
                     (s.deleted_frames, "frames moved to trash"),
+                    (s.moved_frames, "frames moved to another split"),
+                    (s.moves_skipped, "split moves skipped (no split folder or file exists)"),
                 ] {
                     if n > 0 {
                         parts.push(format!("{n} {what}"));
@@ -210,6 +253,7 @@ impl FastLabelApp {
                 if let Some(t) = &mut self.thumbs {
                     t.retry_failed();
                 }
+                self.cluster.dirty = true;
                 if report.trash.failed.is_empty() {
                     self.info(parts.join(" · "));
                 } else {
@@ -220,7 +264,7 @@ impl FastLabelApp {
                         .map(|(p, why)| format!("{} ({why})", p.display()))
                         .collect();
                     self.error(format!(
-                        "{} — could not move to trash: {}",
+                        "{} — could not move: {}",
                         parts.join(" · "),
                         files.join(", ")
                     ));
@@ -444,6 +488,7 @@ impl FastLabelApp {
             self.session.view = ws.opts.clone();
             self.session.columns = ws.columns;
         }
+        self.session.min_cluster_size = self.cluster.min_cluster_size;
         if let Some(path) = &self.session_path
             && let Err(e) = self.session.save(path)
         {
@@ -493,10 +538,14 @@ impl FastLabelApp {
         match mode {
             Mode::Frame => ws.focus_selected_crop(),
             Mode::Mosaic => {
+                if self.mode == Mode::Cluster {
+                    // Split moves change what the split filter shows.
+                    ws.rebuild();
+                }
                 ws.select_crop_of_frame();
                 self.mosaic.ensure_visible = true;
             }
-            Mode::Clean => {}
+            Mode::Clean | Mode::Cluster => {}
         }
         self.mode = mode;
     }
@@ -522,6 +571,8 @@ impl FastLabelApp {
                     self.popup = false;
                 } else if self.mode == Mode::Clean {
                     self.exit_clean();
+                } else if self.mode == Mode::Cluster {
+                    self.set_mode(Mode::Mosaic);
                 } else {
                     self.inference.shutdown();
                     if self.save() {
@@ -537,6 +588,16 @@ impl FastLabelApp {
             }
             Key::Tab | Key::M if plain && !m.shift && !self.popup && self.mode == Mode::Clean => {
                 self.exit_clean();
+                return;
+            }
+            Key::Tab | Key::M | Key::C
+                if plain && !m.shift && !self.popup && self.mode == Mode::Cluster =>
+            {
+                self.set_mode(Mode::Mosaic);
+                return;
+            }
+            Key::C if plain && !m.shift && !repeat && !self.popup && self.mode == Mode::Mosaic => {
+                self.start_cluster_mode(ctx);
                 return;
             }
             Key::Tab | Key::M if plain && !m.shift && !self.popup => {
@@ -563,6 +624,12 @@ impl FastLabelApp {
         {
             if let Err(e) = r {
                 self.error(e);
+            }
+            return;
+        }
+        if self.mode == Mode::Cluster && !self.popup {
+            if let Some(event) = self.cluster_key(key, repeat, m) {
+                self.cluster_event(ctx, event);
             }
             return;
         }
@@ -678,6 +745,349 @@ impl FastLabelApp {
                 Some(n) if !repeat => ws.set_category_index(n),
                 _ => Ok(()),
             },
+        }
+    }
+
+    /// Opens cluster mode, loading the cached embeddings and layout; the
+    /// layout is computed right away when every frame has an embedding.
+    pub(crate) fn start_cluster_mode(&mut self, ctx: &egui::Context) {
+        let Some(ws) = &self.ws else { return };
+        let state = ws.project.state_dir();
+        if self.embeddings.is_none() {
+            self.embeddings = Some(Embeddings::load(&state.join(embeddings::EMBEDDINGS_FILE)));
+        }
+        if self.cluster.layout.is_none()
+            && let Some(l) = SavedLayout::load(&state.join(embeddings::LAYOUT_FILE))
+        {
+            self.cluster.set_layout(l);
+        }
+        self.cluster.dirty = true;
+        self.popup = false;
+        self.mode = Mode::Cluster;
+        let has_vectors = self.embeddings.as_ref().is_some_and(|e| e.len() > 0);
+        if self.cluster.layout.is_none() && has_vectors && self.embedding_items().is_empty() {
+            self.start_layout(ctx);
+        }
+    }
+
+    /// Model id of the configured embedder, if the file exists.
+    fn embed_model(&self) -> Option<(PathBuf, String)> {
+        let path = self.session.embed_model_path.clone().filter(|p| p.is_file())?;
+        let id = embeddings::model_id(&path);
+        Some((path, id))
+    }
+
+    /// Frames without an embedding from the configured model: (image index, key).
+    fn embedding_items(&self) -> Vec<(usize, u64)> {
+        let (Some(ws), Some(emb)) = (&self.ws, &self.embeddings) else { return Vec::new() };
+        let other_model =
+            self.embed_model().is_some_and(|(_, id)| emb.len() > 0 && id != emb.model);
+        ws.project
+            .dataset
+            .images()
+            .iter()
+            .enumerate()
+            .map(|(i, img)| (i, embeddings::key(img.id, &img.file_name)))
+            .filter(|(_, k)| other_model || emb.get(*k).is_none())
+            .collect()
+    }
+
+    fn start_embeddings(&mut self, ctx: &egui::Context) {
+        let Some((model_path, model)) = self.embed_model() else {
+            self.error("Choose an ONNX embedding model first (e.g. from scripts/export_dinov2.py)");
+            return;
+        };
+        let Some(ws) = &self.ws else { return };
+        let ds = &ws.project.dataset;
+        let todo = self.embedding_items();
+        let keys: Vec<u64> = todo.iter().map(|(_, k)| *k).collect();
+        let items: Vec<fastlabel_infer::BatchItem> = todo
+            .iter()
+            .enumerate()
+            .map(|(n, (i, _))| fastlabel_infer::BatchItem {
+                key: n,
+                path: ds.image_path(&ds.images()[*i]),
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.embed_task = Some(Task::spawn("embeddings", ctx, move |progress| {
+            let mut out = EmbedOutcome {
+                model,
+                vectors: Vec::new(),
+                failed: Vec::new(),
+                cancelled: false,
+                error: None,
+            };
+            match fastlabel_infer::Embedder::load(&model_path, 0) {
+                Ok(mut emb) => {
+                    let r = fastlabel_infer::run_embed(&mut emb, items, progress);
+                    out.vectors = r.vectors.into_iter().map(|(n, v)| (keys[n], v)).collect();
+                    out.failed = r.failed.into_iter().map(|(_, e)| e).collect();
+                    out.cancelled = r.cancelled;
+                }
+                Err(e) => out.error = Some(format!("Cannot load {}: {e}", model_path.display())),
+            }
+            out
+        }));
+    }
+
+    /// Lays out every frame that has an embedding.
+    fn start_layout(&mut self, ctx: &egui::Context) {
+        let (Some(ws), Some(emb)) = (&self.ws, &self.embeddings) else { return };
+        let mut keys = Vec::new();
+        let mut vectors = Vec::new();
+        for img in ws.project.dataset.images() {
+            let k = embeddings::key(img.id, &img.file_name);
+            if let Some(v) = emb.get(k) {
+                keys.push(k);
+                vectors.push(v.to_vec());
+            }
+        }
+        if keys.is_empty() {
+            return;
+        }
+        let (model, mcs) = (emb.model.clone(), self.cluster.min_cluster_size);
+        self.layout_task = Some(Task::spawn("clustering", ctx, move |progress| {
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let l = crate::cluster::layout(&refs, mcs, 42, progress)?;
+            Some(SavedLayout {
+                model,
+                min_cluster_size: mcs,
+                keys,
+                points: l.points,
+                labels: l.labels,
+            })
+        }));
+    }
+
+    /// New cluster labels for the current layout (minimum size changed).
+    fn start_recluster(&mut self, ctx: &egui::Context) {
+        let Some(layout) = self.cluster.layout.clone() else { return };
+        let mcs = self.cluster.min_cluster_size;
+        self.layout_task = Some(Task::spawn("clustering", ctx, move |progress| {
+            use std::sync::atomic::Ordering;
+            progress.total.store(1, Ordering::Relaxed);
+            let labels = crate::cluster::hdbscan(&layout.points, mcs);
+            progress.done.store(1, Ordering::Relaxed);
+            Some(SavedLayout { min_cluster_size: mcs, labels, ..layout })
+        }));
+    }
+
+    /// Writes an HTML report in the background and opens it in the browser.
+    /// `scope`: image ids, `None` for all frames.
+    pub(crate) fn start_report(
+        &mut self,
+        ctx: &egui::Context,
+        title: String,
+        slug: String,
+        scope: Option<std::collections::BTreeSet<fastlabel_core::ImageId>>,
+    ) {
+        if self.report_task.is_some() {
+            return;
+        }
+        let Some(ws) = &self.ws else { return };
+        let state = ws.project.state_dir();
+        let saved_layout;
+        let layout = match &self.cluster.layout {
+            Some(l) => Some(l),
+            None => {
+                saved_layout = SavedLayout::load(&state.join(embeddings::LAYOUT_FILE));
+                saved_layout.as_ref()
+            }
+        };
+        let input = ws.report_input(title, scope.as_ref(), layout);
+        self.report_task = Some(Task::spawn("report", ctx, move |_| {
+            let emb = Embeddings::load(&state.join(embeddings::EMBEDDINGS_FILE));
+            crate::report::write(&input, &emb, &state.join("reports"), &slug)
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    fn poll_cluster_tasks(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.report_task.as_mut().and_then(Task::poll) {
+            self.report_task = None;
+            match result {
+                Ok(path) => {
+                    let opened = std::process::Command::new("xdg-open").arg(&path).spawn().is_ok();
+                    let how = if opened { "opened in the browser" } else { "open it in a browser" };
+                    self.info(format!("Report written to {} ({how})", path.display()));
+                }
+                Err(e) => self.error(format!("Cannot write the report: {e}")),
+            }
+        }
+        if let Some(out) = self.embed_task.as_mut().and_then(Task::poll) {
+            self.embed_task = None;
+            let (Some(ws), Some(emb)) = (&self.ws, &mut self.embeddings) else { return };
+            if let Some(e) = out.error {
+                self.error(e);
+                return;
+            }
+            let n = out.vectors.len();
+            emb.use_model(&out.model);
+            emb.extend(out.vectors);
+            let saved = emb.save(&ws.project.state_dir().join(embeddings::EMBEDDINGS_FILE));
+            self.cluster.dirty = true;
+            if let Err(e) = saved {
+                self.error(format!("Cannot store embeddings: {e}"));
+            } else if !out.failed.is_empty() {
+                self.error(format!(
+                    "{n} frames embedded, {} failed ({})",
+                    out.failed.len(),
+                    out.failed[0]
+                ));
+            } else if out.cancelled {
+                self.info(format!("Embeddings cancelled ({n} frames done and kept)"));
+            } else {
+                self.info(format!("{n} frames embedded; computing the layout…"));
+                self.start_layout(ctx);
+            }
+        }
+        if let Some(result) = self.layout_task.as_mut().and_then(Task::poll) {
+            self.layout_task = None;
+            let Some(layout) = result else {
+                self.info("Clustering cancelled");
+                return;
+            };
+            let clusters = layout.labels.iter().copied().max().map_or(0, |m| m + 1);
+            let noise = layout.labels.iter().filter(|l| **l < 0).count();
+            if let Some(ws) = &self.ws
+                && let Err(e) = layout.save(&ws.project.state_dir().join(embeddings::LAYOUT_FILE))
+            {
+                tracing::warn!("cannot store the cluster layout: {e}");
+            }
+            self.info(format!(
+                "{} frames in {clusters} clusters ({noise} unclustered)",
+                layout.keys.len()
+            ));
+            self.cluster.set_layout(layout);
+        }
+    }
+
+    /// Keys of cluster mode; `None` when the key does nothing there.
+    fn cluster_key(&mut self, key: Key, repeat: bool, m: Modifiers) -> Option<ClusterEvent> {
+        if repeat {
+            return None;
+        }
+        match key {
+            Key::Escape => Some(ClusterEvent::Exit),
+            Key::Num1 => Some(ClusterEvent::Move(Split::Train)),
+            Key::Num2 => Some(ClusterEvent::Move(Split::Val)),
+            Key::Num3 => Some(ClusterEvent::Move(Split::Test)),
+            Key::F if !m.command => Some(ClusterEvent::ToggleDelete),
+            Key::Enter => Some(ClusterEvent::ShowInMosaic),
+            Key::A if m.command => {
+                if let Some(ws) = &self.ws {
+                    self.cluster.select_all_visible(ws);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn cluster_event(&mut self, ctx: &egui::Context, event: ClusterEvent) {
+        let frames =
+            self.ws.as_ref().map(|ws| self.cluster.selected_frames(ws)).unwrap_or_default();
+        let needs_selection = matches!(
+            event,
+            ClusterEvent::Move(_)
+                | ClusterEvent::ShowInMosaic
+                | ClusterEvent::ToggleDelete
+                | ClusterEvent::ReportSelection
+        );
+        if needs_selection && frames.is_empty() {
+            self.error("Select frames first: drag around points");
+            return;
+        }
+        let result = match event {
+            ClusterEvent::ComputeEmbeddings => {
+                self.start_embeddings(ctx);
+                Ok(())
+            }
+            ClusterEvent::Relayout => {
+                self.start_layout(ctx);
+                Ok(())
+            }
+            ClusterEvent::Recluster => {
+                self.start_recluster(ctx);
+                Ok(())
+            }
+            ClusterEvent::Move(split) => {
+                let Some(ws) = &mut self.ws else { return };
+                let r = ws.move_to_split(&frames, split);
+                if r.is_ok() {
+                    self.info(format!(
+                        "{} frames → {} (files are moved on save)",
+                        frames.len(),
+                        split.name()
+                    ));
+                }
+                r
+            }
+            ClusterEvent::ToggleDelete => {
+                self.ws.as_mut().map_or(Ok(()), |ws| ws.toggle_frames_delete(&frames))
+            }
+            ClusterEvent::ShowInMosaic => {
+                let Some(ws) = &mut self.ws else { return };
+                ws.opts.frames = Some(std::sync::Arc::new(self.cluster.selection.clone()));
+                self.set_mode(Mode::Mosaic);
+                if let Some(ws) = &mut self.ws {
+                    ws.rebuild();
+                    ws.select(0);
+                }
+                Ok(())
+            }
+            ClusterEvent::Open(idx) => {
+                if let Some(ws) = &mut self.ws {
+                    ws.go_to_frame(idx);
+                    self.popup = true;
+                }
+                Ok(())
+            }
+            ClusterEvent::Exit => {
+                self.set_mode(Mode::Mosaic);
+                Ok(())
+            }
+            ClusterEvent::ReportAll => {
+                self.start_report(ctx, "All frames".into(), "all".into(), None);
+                Ok(())
+            }
+            ClusterEvent::ReportSelection => {
+                let sel = self.cluster.selection.clone();
+                let title = format!("Selection ({} frames)", sel.len());
+                self.start_report(ctx, title, "selection".into(), Some(sel));
+                Ok(())
+            }
+            ClusterEvent::ReportCluster(label) => {
+                let Some(ws) = &self.ws else { return };
+                let frames = self.cluster.cluster_frames(ws, label);
+                let title = format!("Cluster #{label} ({} frames)", frames.len());
+                self.start_report(ctx, title, format!("cluster{label}"), Some(frames));
+                Ok(())
+            }
+        };
+        if let Err(e) = result {
+            self.error(e);
+        }
+    }
+
+    fn cluster_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let missing = self.embedding_items().len();
+        let busy = self.embed_task.is_some() || self.layout_task.is_some();
+        let (Some(ws), Some(thumbs)) = (&self.ws, &mut self.thumbs) else { return };
+        if self.cluster.dirty {
+            let emb = self.embeddings.as_ref();
+            self.cluster.sync(ws, |k| emb.is_some_and(|e| e.get(k).is_some()));
+        }
+        let setup = Setup { model_path: &mut self.session.embed_model_path, missing, busy };
+        let mut events = self.cluster.setup_bar(ui, setup);
+        ui.separator();
+        events.extend(self.cluster.show(ui, ws, thumbs));
+        for e in events {
+            self.cluster_event(&ctx, e);
         }
     }
 
@@ -865,8 +1275,18 @@ impl FastLabelApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{} / {n}", idx + 1)).strong());
             ui.label(&img.file_name);
-            if let Some(split) = ws.project.dataset.split_of(idx) {
-                ui.label(RichText::new(split.name()).weak());
+            let saved = ws.project.dataset.split_of(idx);
+            match ws.split_of(idx) {
+                Some(split) if Some(split) != saved => {
+                    ui.label(
+                        RichText::new(format!("→ {} (on save)", split.name()))
+                            .color(Color32::from_rgb(245, 150, 30)),
+                    );
+                }
+                Some(split) => {
+                    ui.label(RichText::new(split.name()).weak());
+                }
+                None => {}
             }
             ui.separator();
             ui.label("Tags");
@@ -1006,6 +1426,24 @@ impl FastLabelApp {
                         ui.close();
                     }
                 });
+                if ui
+                    .selectable_label(self.mode == Mode::Cluster, "Clusters (C)")
+                    .on_hover_text("Frames as a point cloud of image embeddings: select clusters, move them to another split")
+                    .clicked()
+                {
+                    if self.mode == Mode::Cluster {
+                        self.set_mode(Mode::Mosaic);
+                    } else {
+                        self.start_cluster_mode(&ctx);
+                    }
+                }
+                if ui
+                    .add_enabled(self.report_task.is_none(), egui::Button::new("Report"))
+                    .on_hover_text("HTML report on all frames: split balance, box statistics, input size guide, similarity between splits (opens in the browser)")
+                    .clicked()
+                {
+                    self.start_report(&ctx, "All frames".into(), "all".into(), None);
+                }
             });
             let Some(ws) = &mut self.ws else { return };
             if ui
@@ -1066,6 +1504,17 @@ impl FastLabelApp {
             if ui.button(dir).clicked() {
                 opts.descending = !opts.descending;
             }
+            if let Some(frames) = &opts.frames
+                && ui
+                    .button(
+                        RichText::new(format!("Cluster selection: {} frames ✕", frames.len()))
+                            .color(Color32::from_rgb(255, 215, 0)),
+                    )
+                    .on_hover_text("The mosaic shows only these frames; click to show all")
+                    .clicked()
+            {
+                opts.frames = None;
+            }
             egui::ComboBox::from_id_salt("split")
                 .selected_text(opts.split.map_or("All splits", |s| s.name()))
                 .show_ui(ui, |ui| {
@@ -1117,7 +1566,7 @@ impl FastLabelApp {
             }
             if let Some(ws) = &self.ws {
                 let n = ws.crops.len();
-                let clean = self.mode == Mode::Clean;
+                let clean = matches!(self.mode, Mode::Clean | Mode::Cluster);
                 if !clean {
                 ui.label(format!("{} / {n}", if n == 0 { 0 } else { ws.selected + 1 }));
                 if let Some(crop) = ws.selected_crop() {
@@ -1128,12 +1577,17 @@ impl FastLabelApp {
                     );
                 }
                 }
+                ui.label(
+                    RichText::new(crate::cluster_view::split_shares(ws.split_totals())).weak(),
+                )
+                .on_hover_text("Frames per split, unsaved split moves included");
                 let c = ws.pending_counts();
                 let pending = [
                     (c.delete, "D"),
                     (c.good, "G"),
                     (c.replace, "R"),
                     (c.frames, "F"),
+                    (c.moves, "split moves"),
                     (c.other, "edits"),
                 ]
                 .iter()
@@ -1178,10 +1632,12 @@ impl FastLabelApp {
                     self.inference.cancel();
                 }
             }
-            let mut cancel = [false; 2];
+            let mut cancel = [false; 4];
             for (i, task) in [
                 self.uniformity_task.as_ref().map(|t| (t.label, t.progress())),
                 self.export_task.as_ref().map(|t| (t.label, t.progress())),
+                self.embed_task.as_ref().map(|t| (t.label, t.progress())),
+                self.layout_task.as_ref().map(|t| (t.label, t.progress())),
             ]
             .into_iter()
             .enumerate()
@@ -1203,6 +1659,16 @@ impl FastLabelApp {
             }
             if cancel[1]
                 && let Some(t) = &self.export_task
+            {
+                t.cancel();
+            }
+            if cancel[2]
+                && let Some(t) = &self.embed_task
+            {
+                t.cancel();
+            }
+            if cancel[3]
+                && let Some(t) = &self.layout_task
             {
                 t.cancel();
             }
@@ -1242,6 +1708,7 @@ impl eframe::App for FastLabelApp {
         }
         self.poll_inference();
         self.poll_tasks(&ctx);
+        self.poll_cluster_tasks(&ctx);
         self.handle_keys(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -1270,6 +1737,10 @@ impl eframe::App for FastLabelApp {
             }
             if self.mode == Mode::Clean {
                 self.clean_panel(ui);
+                return;
+            }
+            if self.mode == Mode::Cluster {
+                self.cluster_panel(ui);
                 return;
             }
             let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };

@@ -155,6 +155,18 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 | Wheel, middle drag or Space + drag | Zoom around cursor, pan |
 | Esc | Deselect (frame mode) / close (popup, also Enter / E) |
 
+| Cluster mode (C) | Action |
+|---|---|
+| Drag (Shift: add, Ctrl: remove) | Lasso selection |
+| Click / Shift+click, Ctrl+A | Select a frame / toggle it, select all visible |
+| Right click | Actions: move to a split, show in mosaic, delete frames |
+| 1 / 2 / 3 | Move the selection to train / val / test (on save) |
+| F | Delete the selected frames (all marked: unmark) |
+| Enter | Show the selection in the mosaic |
+| Double click | Open the frame in the editor popup |
+| Wheel, middle drag or Space + drag | Zoom around cursor, pan |
+| Esc, C, M, Tab, Q | Back to the mosaic |
+
 | Cleaning: overlapping GT | Action |
 |---|---|
 | 1–9 (10+: digits then Enter) | Keep that box, delete the others of the group, next group |
@@ -193,3 +205,12 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 - Matching has no thresholds anymore: pairs need any overlap; FP / FN mean zero overlap; duplicates are "extra".
 - D/G/R on a frame marked F apply and unmark the frame.
 - Cleaning menu, first workflow: overlapping GT boxes (390 groups on the v023 copy).
+
+### M9: Cluster mode (split management)
+
+- `Op::SetSplit` (pending like every edit); save renames moved frames into `images/<split>/` (dataset's own folder names), refuses collisions, rewrites `predictions.json` and carries color-uniformity values over. File moves (trash + split) are recorded in `.fastlabel/moves.json` before the annotation file is written and finished on the next open after a crash (also closes the gap where a crash between save and trash move re-added deleted frames as new images).
+- `fastlabel-infer::Embedder`: ONNX `[N,3,H,W] → [N,D]`, antialiased resize + ImageNet normalization (matches PIL bilinear exactly: cos 1.0000 vs PyTorch on the same frame), batches of 8, 2 decoder threads. DINOv2-S/14 at 224: ~140 ms/frame on the Ryzen 5 5500U.
+- `app::cluster` (pure, no new dependency): PCA (covariance + Jacobi), exact kNN (threads), UMAP (fuzzy graph + SGD with negative sampling, PCA init, seeded), HDBSCAN (mutual reachability MST, condensed tree, excess of mass). Exact kNN and Prim's MST are O(n²): fine for 10k frames, minutes for 100k.
+- v1_exp0 (4,936 frames): embeddings 8.5 min (~103 ms/frame, once, cached), layout 6.5 s, 19 clusters + 51 noise frames; val and test each form their own clusters (no visible leakage).
+- Reports (`app::report`, pure + SVG, no dependency): all frames / selection / cluster, `--report` CLI. v1_exp0: 0.24 s including the cross-split similarity (665 × 4,271 cosines).
+- Cluster view: mesh-drawn points, lasso, context menu, selection strip (virtualized thumbnails), split filter shared with the mosaic, mosaic filter by selected frames.

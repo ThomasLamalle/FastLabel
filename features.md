@@ -123,6 +123,34 @@ Double annotations: GT boxes of the same category that overlap each other (IoU >
 - F: delete the frame, next group. Right / Left: next / previous group. Esc (or M / Tab / Q): back to the mosaic.
 - Decisions are pending edits like any other (undo with U, applied on save). After a save the remaining groups are rescanned; resolved groups (deleted boxes, all boxes kept or reviewed) do not come back.
 
+## Cluster mode: managing the splits
+
+Toolbar *Clusters* or `C` in the mosaic. Every frame is a point of a 2D map built from image embeddings, so similar frames (same scene, same camera, consecutive video frames) sit together. This shows split leakage (near-identical frames in train and val) and lets whole groups be moved at once.
+
+- **Embeddings**: an ONNX image embedder (input `[N, 3, H, W]` ImageNet-normalized RGB, output `[N, D]`), DINOv2-small by default (`scripts/export_dinov2.py`). Computed in the background with progress and cancel, cached per frame in `.fastlabel/embeddings.bin` (frames moved to another split keep their vector; a different model recomputes everything). Only frames without a vector are computed.
+- **Layout**: PCA (50 dims) → UMAP 2D → HDBSCAN clusters (noise in grey), computed in the background and cached in `.fastlabel/clusters.json`. New frames: *Update layout*. *min cluster size* + *Recluster* only recomputes the clusters.
+- **Display**: points colored by split (pending moves included) or by cluster; frames marked F in dark grey. The global split filter (All/train/val/test) applies to the cloud. Wheel zooms around the cursor, middle drag (or Space + drag) pans, *Fit view* resets. Hovering a point shows the frame, its split and cluster. Counts per split are shown for the visible frames and for the selection.
+- **Selection**: drag a lasso around points (Shift adds, Ctrl removes), click a point (Shift/Ctrl toggles), click empty space to clear, Ctrl+A selects all visible frames. The selected frames are listed as thumbnails below the cloud; double click a point or a thumbnail to open the frame in the editor popup.
+- **Actions** (right click on the cloud, or keys), one undo step each:
+  - Move to train / val / test (`1` / `2` / `3`): pending until saved; the save renames the files into the matching `images/<split>/` folder (the folder name already used by the dataset, e.g. `valid`) and updates `predictions.json`. A move whose destination file already exists, or whose path has no split folder, is skipped and reported.
+  - Show in mosaic (`Enter`): the mosaic shows only the crops of the selected frames until the *Cluster selection ✕* chip is cleared.
+  - Delete frames (`F`): F on every selected frame (or un-F when they all are marked).
+- Esc, C, M or Tab: back to the mosaic.
+- Split shares (frames and % per split, pending moves included) are always shown in the status line, and in cluster mode for the visible frames and the selection.
+
+## Reports
+
+*Report* (toolbar, all frames), or in cluster mode *Report: all frames*, *Report on selection*, *Report on cluster #n* (right click on a point, which also offers *Select cluster #n*). Headless: `fastlabel --report out.html <dataset>`. A self-contained HTML page (plots in SVG, light/dark) is written to `.fastlabel/reports/` and opened in the browser. Pending split moves are included; frames marked F and boxes marked D are left out.
+
+- Split balance: images, boxes, images without boxes, boxes per image (mean, median, max) per split, with shares; boxes per category when there are several.
+- Distributions per split, normalized so splits of different sizes compare: boxes per image, box center heatmaps (with mean center and spread), box short side in pixels, box height relative to the image, aspect ratio.
+- Image resolutions per split.
+- Model input size guide: for input sizes 320–1920, the box short side once letterboxed (p5, median) and the share of boxes under 10 px; suggests the smallest size keeping at most 2 % under 10 px.
+- Box quality flags: tiny boxes, boxes touching the image border, extreme aspect ratios.
+- Model results per split (from `predictions.json`): recall, precision, mean IoU, loose pairs.
+- Similarity between splits (needs the embeddings): for each val / test frame, the most similar frame of another split; near duplicates (cosine ≥ 0.95) leak.
+- Clusters × splits (needs the layout): composition of each cluster, share of train frames in scenes val / test never see.
+
 ## Model inference
 
 - ONNX models run through ONNX Runtime, no Python at runtime. CPU only must be fast enough (no GPU on the dev machine); GPU execution providers are optional.
@@ -133,7 +161,7 @@ Double annotations: GT boxes of the same category that overlap each other (IoU >
 
 ## Session
 
-The last session is restored on launch: dataset, mode, scroll position, sort, filters, thresholds, crops per line, margins, model path, confidence.
+The last session is restored on launch: dataset, mode, scroll position, sort, filters, thresholds, crops per line, margins, model path, confidence, embedding model path, minimum cluster size.
 
 
 # TODO: ideas for later (don't implement yet)
@@ -151,12 +179,9 @@ The last session is restored on launch: dataset, mode, scroll position, sort, fi
 
 # Future functionality to consider but don't implement yet
 
-## Manage splitting: clustering
+## Clustering crops
 
-Easily manage and rearrange the train/val/test split. One functionality from the Ultralytics platform that is very good is clustering:
-compute image "embeddings" and display clusters of the images as a point cloud next to the mosaic of images. You can then select points/clusters by drawing around them and apply modifications to them, for example moving a cluster to a different split. There is also a global toggle button that displays All/train/val/test images, and it applies to the point cloud.
-One feature it misses is that you can't easily apply modifications to a cluster: you have to manually select the corresponding images and apply the action. It would be better to right-click the selected cluster and apply an action on it directly.
-We could also apply this clustering feature to the annotations/crops instead of only to the images.
+Apply cluster mode to the annotations/crops instead of only to the images (same pipeline, embedding crops instead of frames).
 
 ## Cleaning dataset
 

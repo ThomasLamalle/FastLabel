@@ -49,11 +49,15 @@ impl Letterbox {
 }
 
 fn resize(img: &RgbImage, w: u32, h: u32) -> RgbImage {
+    resize_with(img, w, h, ResizeAlg::Interpolation(FilterType::Bilinear))
+}
+
+fn resize_with(img: &RgbImage, w: u32, h: u32, alg: ResizeAlg) -> RgbImage {
     if img.dimensions() == (w, h) {
         return img.clone();
     }
     let mut dst = Image::new(w, h, PixelType::U8x3);
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Interpolation(FilterType::Bilinear));
+    let opts = ResizeOptions::new().resize_alg(alg);
     Resizer::new().resize(img, &mut dst, &opts).expect("RGB8 resize");
     RgbImage::from_raw(w, h, dst.into_vec()).expect("buffer size")
 }
@@ -76,9 +80,19 @@ pub fn letterbox_chw(img: &RgbImage, in_w: u32, in_h: u32) -> (Vec<f32>, Letterb
 
 /// Plain resize with ImageNet normalization (DETR-family models).
 pub fn imagenet_chw(img: &RgbImage, in_w: u32, in_h: u32) -> Vec<f32> {
+    normalize_imagenet(&resize(img, in_w, in_h))
+}
+
+/// Antialiased resize (as PIL's bilinear) with ImageNet normalization, for
+/// large downscales (embedding models).
+pub fn imagenet_chw_smooth(img: &RgbImage, in_w: u32, in_h: u32) -> Vec<f32> {
+    normalize_imagenet(&resize_with(img, in_w, in_h, ResizeAlg::Convolution(FilterType::Bilinear)))
+}
+
+fn normalize_imagenet(resized: &RgbImage) -> Vec<f32> {
     const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
     const STD: [f32; 3] = [0.229, 0.224, 0.225];
-    let resized = resize(img, in_w, in_h);
+    let (in_w, in_h) = resized.dimensions();
     let plane = (in_w * in_h) as usize;
     let mut data = vec![0.0; 3 * plane];
     for (i, p) in resized.pixels().enumerate() {

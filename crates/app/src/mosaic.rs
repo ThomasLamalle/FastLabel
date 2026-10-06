@@ -182,7 +182,7 @@ fn tooltip(ws: &Workspace, crop: &Crop, slot: Option<&Slot>) -> String {
 }
 
 fn split_name(ws: &Workspace, crop: &Crop) -> &'static str {
-    ws.project.dataset.split_of(crop.image_idx).map_or("", |s| s.name())
+    ws.split_of(crop.image_idx).map_or("", |s| s.name())
 }
 
 #[allow(clippy::too_many_arguments)]

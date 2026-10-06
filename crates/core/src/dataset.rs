@@ -40,6 +40,28 @@ impl Split {
             Split::Test => "test",
         }
     }
+
+    /// `file_name` moved to the split folder `dir` (e.g. `valid`): the path
+    /// component naming a split is replaced, or `dir` is inserted after a
+    /// leading `images/`. `None` when the path has neither.
+    pub fn move_path(file_name: &str, dir: &str) -> Option<String> {
+        let parts: Vec<&str> = file_name.split('/').collect();
+        let (last, dirs) = parts.split_last()?;
+        if let Some(i) = dirs.iter().rposition(|c| Split::from_path(&format!("{c}/x")).is_some()) {
+            let mut out: Vec<&str> = parts.clone();
+            out[i] = dir;
+            return Some(out.join("/"));
+        }
+        match dirs {
+            ["images", rest @ ..] => {
+                let mut out = vec!["images", dir];
+                out.extend(rest);
+                out.push(last);
+                Some(out.join("/"))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Deletion marks found in files written by the previous tool. They become
@@ -139,6 +161,25 @@ impl Dataset {
         self.splits[image_idx]
     }
 
+    /// Folder name the dataset already uses for `split` (`val` or `valid`...),
+    /// else the canonical name.
+    pub fn split_dir(&self, split: Split) -> String {
+        self.coco
+            .images
+            .iter()
+            .zip(&self.splits)
+            .filter(|(_, s)| **s == Some(split))
+            .find_map(|(img, _)| {
+                img.file_name
+                    .split('/')
+                    .rev()
+                    .skip(1)
+                    .find(|c| Split::from_path(&format!("{c}/x")) == Some(split))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| split.name().to_string())
+    }
+
     pub fn image_path(&self, image: &CocoImage) -> PathBuf {
         self.root.join(&image.file_name)
     }
@@ -202,6 +243,28 @@ mod tests {
         assert_eq!(Split::from_path("test/x/a.jpg"), Some(Split::Test));
         assert_eq!(Split::from_path("images/a.jpg"), None);
         assert_eq!(Split::from_path("images/train.jpg"), None);
+    }
+
+    #[test]
+    fn move_path_replaces_or_inserts_the_split_folder() {
+        let mv = Split::move_path;
+        assert_eq!(mv("images/train/a.jpg", "val").as_deref(), Some("images/val/a.jpg"));
+        assert_eq!(mv("images/valid/x/a.jpg", "test").as_deref(), Some("images/test/x/a.jpg"));
+        assert_eq!(mv("train/images/a.jpg", "valid").as_deref(), Some("valid/images/a.jpg"));
+        assert_eq!(mv("images/x/a.jpg", "val").as_deref(), Some("images/val/x/a.jpg"));
+        assert_eq!(mv("images/train.jpg", "val").as_deref(), Some("images/val/train.jpg"));
+        assert_eq!(mv("other/a.jpg", "val"), None);
+        assert_eq!(mv("a.jpg", "val"), None);
+    }
+
+    #[test]
+    fn split_dir_follows_the_dataset_naming() {
+        let mut coco = test_util::dataset(2, &[]).coco;
+        coco.images[1].file_name = "images/valid/b.jpg".into();
+        let ds = Dataset::new(PathBuf::new(), coco, Path::new("x")).unwrap().0;
+        assert_eq!(ds.split_dir(Split::Val), "valid");
+        assert_eq!(ds.split_dir(Split::Train), "train");
+        assert_eq!(ds.split_dir(Split::Test), "test");
     }
 
     #[test]

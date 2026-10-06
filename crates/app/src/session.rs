@@ -19,6 +19,9 @@ pub struct Session {
     pub view: ViewOptions,
     pub model_path: Option<PathBuf>,
     pub confidence: f64,
+    /// ONNX image embedder for cluster mode.
+    pub embed_model_path: Option<PathBuf>,
+    pub min_cluster_size: usize,
     /// GPU memory budget for crop thumbnails.
     pub texture_budget_mb: usize,
 }
@@ -34,6 +37,8 @@ impl Default for Session {
             view: ViewOptions::default(),
             model_path: None,
             confidence: 0.1,
+            embed_model_path: None,
+            min_cluster_size: 20,
             texture_budget_mb: 256,
         }
     }

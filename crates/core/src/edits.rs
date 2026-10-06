@@ -10,6 +10,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::coco::{AnnId, CategoryId, ImageId};
+use crate::dataset::Split;
 use crate::geom::BBox;
 use crate::predictions::PredRef;
 
@@ -61,6 +62,12 @@ pub enum Op {
         image: ImageId,
         tags: Vec<String>,
     },
+    /// Move a frame to another split (`None`: back to its saved split). The
+    /// image file moves to the matching `images/<split>/` folder on save.
+    SetSplit {
+        image: ImageId,
+        split: Option<Split>,
+    },
     /// Several ops undone/redone as one step (row actions).
     Group {
         ops: Vec<Op>,
@@ -87,6 +94,8 @@ pub struct PendingState {
     /// Category edits of existing annotations.
     pub categories: HashMap<AnnId, CategoryId>,
     pub tags: HashMap<ImageId, Vec<String>>,
+    /// Split moves.
+    pub splits: HashMap<ImageId, Split>,
 }
 
 impl PendingState {
@@ -117,6 +126,14 @@ impl PendingState {
             Op::SetTags { image, tags } => {
                 self.tags.insert(*image, normalize_tags(tags));
             }
+            Op::SetSplit { image, split } => match split {
+                Some(s) => {
+                    self.splits.insert(*image, *s);
+                }
+                None => {
+                    self.splits.remove(image);
+                }
+            },
             Op::Group { ops } => ops.iter().for_each(|op| self.apply(op)),
         }
     }
@@ -339,6 +356,8 @@ mod tests {
                 mark: if a { PredMark::Accept } else { PredMark::Reject },
             }),
             (0..5i64).prop_map(|image| Op::FrameDelete { image }),
+            (0..5i64, 0..4usize)
+                .prop_map(|(image, s)| Op::SetSplit { image, split: Split::ALL.get(s).copied() }),
         ]
     }
 
@@ -376,6 +395,10 @@ mod tests {
                     let expected = if prev.is_none() || prev == Some(mark) { prev } else { None };
                     prop_assert_eq!(st.pred_mark(&pred), expected);
                     prop_assert_eq!(&st.ann_marks, &before.ann_marks);
+                }
+                // Setting a split twice is the same as once.
+                Op::SetSplit { image, split } => {
+                    prop_assert_eq!(st.splits.get(&image).copied(), split);
                 }
                 // Frame deletion is a plain toggle: twice is identity.
                 _ => prop_assert_eq!(st, &before),

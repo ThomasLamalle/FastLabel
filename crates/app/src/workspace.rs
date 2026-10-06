@@ -5,11 +5,11 @@ use std::path::Path;
 
 use fastlabel_core::matching::evaluate;
 use fastlabel_core::project::SaveReport;
-use fastlabel_core::{AnnMark, Evaluation, Op, PredMark, Project};
+use fastlabel_core::{AnnMark, Evaluation, ImageId, Op, PredMark, Project, Split};
 use fastlabel_core::{PredRef, Predictions};
 use fastlabel_infer::{BatchItem, BatchResult};
 
-use crate::crops::{self, Crop, CropId, ViewOptions};
+use crate::crops::{self, Crop, CropId, FrameInfo, ViewOptions};
 use crate::metrics::{self, FrameBoxes, Uniformity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,8 @@ pub struct PendingCounts {
     pub good: usize,
     pub replace: usize,
     pub frames: usize,
+    /// Frames moved to another split.
+    pub moves: usize,
     pub other: usize,
 }
 
@@ -100,13 +102,17 @@ impl Workspace {
         if self.opts.sort == crops::SortKey::ImageDate && self.image_dates.is_none() {
             self.image_dates = Some(file_dates(&p.dataset));
         }
+        let moved = !p.log.state().splits.is_empty();
+        let splits: Option<Vec<_>> =
+            moved.then(|| (0..p.dataset.images().len()).map(|i| self.split_of(i)).collect());
+        let info = FrameInfo { dates: self.image_dates.as_deref(), splits: splits.as_deref() };
         self.crops = crops::build(
             &p.dataset,
             p.predictions.as_ref(),
             self.eval.as_ref(),
             &p.review,
             &self.uniformity,
-            self.image_dates.as_deref(),
+            info,
             &self.opts,
         );
         self.selected = keep
@@ -161,9 +167,136 @@ impl Workspace {
         CropMarks { mark, frame_deleted: st.is_frame_deleted(crop.image_id), reviewed }
     }
 
+    /// Split of a frame, pending moves included.
+    pub fn split_of(&self, image_idx: usize) -> Option<Split> {
+        let ds = &self.project.dataset;
+        let id = ds.images()[image_idx].id;
+        self.project.log.state().splits.get(&id).copied().or_else(|| ds.split_of(image_idx))
+    }
+
+    /// Moves frames (image indices) to `split`, one undo step. Frames
+    /// already there are left alone; frames moved back to their saved split
+    /// drop their pending move.
+    pub fn move_to_split(&mut self, frames: &[usize], split: Split) -> ActionResult {
+        let ds = &self.project.dataset;
+        let ops: Vec<Op> = frames
+            .iter()
+            .filter(|&&i| self.split_of(i) != Some(split))
+            .map(|&i| Op::SetSplit {
+                image: ds.images()[i].id,
+                split: (ds.split_of(i) != Some(split)).then_some(split),
+            })
+            .collect();
+        self.record_all(ops)
+    }
+
+    /// F on many frames, one undo step: marks them all for deletion, or
+    /// unmarks them all when they all are.
+    pub fn toggle_frames_delete(&mut self, frames: &[usize]) -> ActionResult {
+        let ds = &self.project.dataset;
+        let st = self.project.log.state();
+        let ids: Vec<ImageId> = frames.iter().map(|&i| ds.images()[i].id).collect();
+        let all_deleted = ids.iter().all(|id| st.is_frame_deleted(*id));
+        let ops: Vec<Op> = ids
+            .into_iter()
+            .filter(|id| all_deleted || !st.is_frame_deleted(*id))
+            .flat_map(|id| self.frame_delete_ops(id))
+            .collect();
+        self.record_all(ops)
+    }
+
+    /// Frames per split (train, val, test, none), pending moves included.
+    pub fn split_totals(&self) -> [usize; 4] {
+        let mut t = [0; 4];
+        for i in 0..self.project.dataset.images().len() {
+            t[self.split_of(i).map_or(3, |s| s as usize)] += 1;
+        }
+        t
+    }
+
+    /// Report input: every frame, `scope` (image ids, `None` = all) marked
+    /// in scope. Pending split moves count, frames marked F and boxes marked
+    /// D are left out.
+    pub fn report_input(
+        &self,
+        title: String,
+        scope: Option<&std::collections::BTreeSet<ImageId>>,
+        layout: Option<&crate::embeddings::SavedLayout>,
+    ) -> crate::report::ReportInput {
+        use crate::report::{BoxEval, ReportBox, ReportFrame};
+        use fastlabel_core::GtStatus;
+        let ds = &self.project.dataset;
+        let st = self.project.log.state();
+        let clusters: std::collections::HashMap<u64, i32> = layout
+            .map(|l| l.keys.iter().copied().zip(l.labels.iter().copied()).collect())
+            .unwrap_or_default();
+        let preds = self.project.predictions.as_ref();
+        let frames = ds
+            .images()
+            .iter()
+            .enumerate()
+            .filter(|(_, img)| !st.is_frame_deleted(img.id))
+            .map(|(i, img)| {
+                let boxes = ds
+                    .annotations_of(i)
+                    .filter(|a| st.ann_mark(a.id) != Some(AnnMark::Delete))
+                    .map(|a| {
+                        let gt = ds.ann_idx(a.id).and_then(|k| self.eval.as_ref().map(|e| e.gt[k]));
+                        let eval = match gt.map(|g| (g.status, g.iou)) {
+                            Some((GtStatus::Matched, Some(iou))) => BoxEval::Paired(iou),
+                            Some((GtStatus::Fn | GtStatus::Unmatched, _)) => BoxEval::Missed,
+                            _ => BoxEval::Unpredicted,
+                        };
+                        let category = ds.category_name(a.category_id).unwrap_or("?").to_string();
+                        ReportBox { category, bbox: a.bbox, eval }
+                    })
+                    .collect();
+                let fp = match (preds.and_then(|p| p.of(i)), &self.eval) {
+                    (Some(p), Some(e)) => Some((0..p.len()).filter(|&k| e.is_fp(i, k)).count()),
+                    _ => None,
+                };
+                let key = crate::embeddings::key(img.id, &img.file_name);
+                ReportFrame {
+                    file_name: img.file_name.clone(),
+                    split: self.split_of(i),
+                    width: img.width,
+                    height: img.height,
+                    boxes,
+                    key,
+                    cluster: clusters.get(&key).copied(),
+                    in_scope: scope.is_none_or(|s| s.contains(&img.id)),
+                    fp,
+                }
+            })
+            .collect();
+        let mut notes = Vec::new();
+        let c = self.pending_counts();
+        if c.moves + c.frames + c.delete > 0 {
+            notes.push(format!(
+                "Includes unsaved edits: {} split moves, {} frames marked F (left out), {} D marks (boxes left out). Other pending edits are not included.",
+                c.moves, c.frames, c.delete
+            ));
+        }
+        crate::report::ReportInput {
+            title,
+            dataset: self.project.dir.display().to_string(),
+            frames,
+            notes,
+        }
+    }
+
+    pub fn is_frame_deleted_idx(&self, image_idx: usize) -> bool {
+        let id = self.project.dataset.images()[image_idx].id;
+        self.project.log.state().is_frame_deleted(id)
+    }
+
     pub fn pending_counts(&self) -> PendingCounts {
         let st = self.project.log.state();
-        let mut c = PendingCounts { frames: st.deleted_frames.len(), ..Default::default() };
+        let mut c = PendingCounts {
+            frames: st.deleted_frames.len(),
+            moves: st.splits.len(),
+            ..Default::default()
+        };
         for m in st.ann_marks.values() {
             match m {
                 AnnMark::Delete => c.delete += 1,
@@ -455,11 +588,43 @@ impl Workspace {
         Ok(())
     }
 
+    /// Carries color-uniformity values over to the new file names of moved
+    /// frames (values are keyed by file name and box).
+    fn rekey_uniformity(&mut self, moved: &[(String, String)]) {
+        let ds = &self.project.dataset;
+        let preds = self.project.predictions.as_ref();
+        let by_name: std::collections::HashMap<&str, usize> =
+            ds.images().iter().enumerate().map(|(i, img)| (img.file_name.as_str(), i)).collect();
+        let mut values = Vec::new();
+        for (old, new) in moved {
+            let Some(&idx) = by_name.get(new.as_str()) else { continue };
+            let gt = ds.annotations_of(idx).map(|a| a.bbox);
+            let pr = preds.and_then(|p| p.of(idx)).unwrap_or(&[]).iter().map(|p| p.bbox);
+            for b in gt.chain(pr) {
+                if let Some(v) = self.uniformity.get(metrics::key(old, &b)) {
+                    values.push((metrics::key(new, &b), v));
+                }
+            }
+        }
+        if !values.is_empty() {
+            self.uniformity.extend(values);
+            let path = self.project.state_dir().join(metrics::METRICS_FILE);
+            if let Err(e) = self.uniformity.save(&path) {
+                tracing::warn!("cannot store color uniformity: {e}");
+            }
+        }
+    }
+
     /// Saves a new version and rebuilds the view.
     pub fn save(&mut self) -> anyhow::Result<Option<SaveReport>> {
         let ds = &self.project.dataset;
         let current = ds.images().get(self.frame.image_idx).map(|i| i.id);
         let report = self.project.save()?;
+        if let Some(r) = &report
+            && !r.moved_files.is_empty()
+        {
+            self.rekey_uniformity(&r.moved_files);
+        }
         if report.is_some() {
             let ds = &self.project.dataset;
             let n = ds.images().len();
@@ -619,6 +784,45 @@ mod tests {
         assert!(!ws.marks_of(&ws.crops[0]).frame_deleted);
         assert_eq!(ws.marks_of(&ws.crops[0]).mark, Some(Mark::Delete));
         assert_eq!(ws.marks_of(&ws.crops[1]).mark, Some(Mark::Delete));
+    }
+
+    #[test]
+    fn split_moves_filter_undo_and_save() {
+        let (dir, mut ws) = open_fixture(2); // image 1 train (#1 #2 P150), image 2 val (#3)
+        ws.opts.split = Some(Split::Val);
+        ws.rebuild();
+        assert_eq!(ws.crops.len(), 1);
+        ws.move_to_split(&[0, 1], Split::Val).unwrap();
+        assert_eq!(ws.split_of(0), Some(Split::Val));
+        ws.rebuild();
+        assert_eq!(ws.crops.len(), 4, "moved frame shows in the val filter");
+        assert_eq!(ws.pending_counts().moves, 1, "image 2 was already in val");
+        ws.move_to_split(&[0], Split::Train).unwrap();
+        assert!(ws.project.log.state().splits.is_empty(), "back to its split: no pending move");
+        ws.undo().unwrap();
+        assert_eq!(ws.split_of(0), Some(Split::Val));
+
+        let report = ws.save().unwrap().unwrap();
+        assert_eq!(report.summary.moved_frames, 1);
+        assert!(dir.path().join("images/val/a.jpg").exists());
+        assert_eq!(ws.project.dataset.split_of(0), Some(Split::Val));
+        assert_eq!(ws.crops.len(), 4);
+    }
+
+    #[test]
+    fn frames_delete_toggles_as_a_group() {
+        let (_d, mut ws) = open_fixture(2);
+        ws.toggle_frames_delete(&[0]).unwrap();
+        ws.toggle_frames_delete(&[0, 1]).unwrap(); // marks only frame 2
+        assert!(ws.is_frame_deleted_idx(0) && ws.is_frame_deleted_idx(1));
+        ws.toggle_frames_delete(&[0, 1]).unwrap(); // all marked: unmark all
+        assert!(!ws.is_frame_deleted_idx(0) && !ws.is_frame_deleted_idx(1));
+        ws.undo().unwrap();
+        assert!(ws.is_frame_deleted_idx(0) && ws.is_frame_deleted_idx(1));
+
+        ws.opts.frames = Some(std::sync::Arc::new([2].into()));
+        ws.rebuild();
+        assert_eq!(ws.crops.iter().map(|c| c.id).collect::<Vec<_>>(), vec![CropId::Gt(3)]);
     }
 
     #[test]

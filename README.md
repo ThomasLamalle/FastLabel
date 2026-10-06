@@ -22,11 +22,11 @@ Linux / Wayland first (X11 works too). ONNX Runtime is downloaded at build time 
 | `images/{train,val,test}/…` | Images, referenced by `file_name`. The split comes from the path. New files copied here are picked up on open (then *Model → Run on frames without predictions*, sort by *Image date*). |
 | `data.yaml` + `labels/` | YOLO layout, imported when there is no annotation file yet (first save writes `annotations.v001.json`). |
 | `predictions.json` | Model predictions (written by the Model menu). |
-| `.fastlabel/` | Tool state: crash journal of unsaved actions, review state (reviewed boxes, rejected predictions), thumbnail cache, uniformity metrics, `trash/` with deleted frames. |
+| `.fastlabel/` | Tool state: crash journal of unsaved actions, review state (reviewed boxes, rejected predictions), thumbnail cache, uniformity metrics, image embeddings and cluster layout, `trash/` with deleted frames. |
 
 Keyboard troubleshooting: `RUST_LOG=fastlabel=debug ./target/release/fastlabel` logs every key event the app receives.
 
-Nothing changes on disk until you save (`S`). Every action is journaled, so a crash or power cut loses nothing: pending actions are replayed when the dataset is reopened. Deleted frames are moved to `.fastlabel/trash/<version>/`, never deleted.
+Nothing changes on disk until you save (`S`). Every action is journaled, so a crash or power cut loses nothing: pending actions are replayed when the dataset is reopened. Deleted frames are moved to `.fastlabel/trash/<version>/`, never deleted. Frames moved to another split are renamed into `images/<split>/` on save (never overwriting a file); a save interrupted between the annotation file and the file moves is finished on the next open.
 
 ## Essential keys
 
@@ -39,6 +39,16 @@ Nothing changes on disk until you save (`S`). Every action is journaled, so a cr
 | Enter or E, Space (hold) | frame editor popup, peek at the frame |
 | Tab or M | frame mode (draw, move, resize, 1–9 class, tags) |
 | S / Q | save new version / save and quit |
+
+*Clusters* (C) shows every frame as a point (image embeddings, UMAP, HDBSCAN), colored by split or cluster. Drag around points to select them (Shift adds, Ctrl removes), then right click or 1 / 2 / 3 to move them to train / val / test, F to delete the frames, Enter to review them in the mosaic. It needs an ONNX image embedder, e.g. DINOv2-small:
+
+```sh
+python scripts/export_dinov2.py dinov2_vits14.onnx   # any Python with torch + onnx; downloads the weights once
+```
+
+*Report* writes an HTML report (split balance, box distributions per split, model input size guide, per-split model results, near duplicates across splits, clusters × splits) and opens it; in cluster mode it can cover the selection or one cluster. Headless: `fastlabel --report out.html <dataset>`.
+
+Embeddings take ~140 ms per frame on a 6-core laptop CPU, computed once in the background and cached.
 
 *Cleaning → Overlapping GT boxes* reviews double annotations one group at a time: 1–9 keeps that box and deletes the others, A keeps all, D deletes all, Right/Left moves between groups, Esc goes back.
 

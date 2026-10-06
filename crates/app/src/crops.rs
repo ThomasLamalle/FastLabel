@@ -1,6 +1,8 @@
 //! The mosaic's crop list: which crops exist, filtering and sorting.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use fastlabel_core::matching::{GtStatus, PredStatus};
 use fastlabel_core::review::ReviewState;
@@ -66,6 +68,18 @@ pub struct ViewOptions {
     pub fn_only: bool,
     pub hide_reviewed: bool,
     pub split: Option<Split>,
+    /// Only crops of these frames (a cluster selection); not persisted.
+    #[serde(skip)]
+    pub frames: Option<Arc<BTreeSet<ImageId>>>,
+}
+
+/// Per-frame values kept outside the dataset, indexed like its images.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameInfo<'a> {
+    /// File dates, when sorting by date.
+    pub dates: Option<&'a [Option<f64>]>,
+    /// Splits including pending moves; the dataset's when `None`.
+    pub splits: Option<&'a [Option<Split>]>,
 }
 
 /// Stable identity of a crop across rebuilds.
@@ -168,12 +182,17 @@ pub fn build(
     eval: Option<&Evaluation>,
     review: &ReviewState,
     uniformity: &Uniformity,
-    dates: Option<&[Option<f64>]>,
+    frames: FrameInfo,
     opts: &ViewOptions,
 ) -> Vec<Crop> {
     let mut crops = Vec::with_capacity(ds.annotations().len());
+    let dates = frames.dates;
+    let split_of = |idx: usize| frames.splits.map_or_else(|| ds.split_of(idx), |s| s[idx]);
     for (image_idx, img) in ds.images().iter().enumerate() {
-        if opts.split.is_some() && ds.split_of(image_idx) != opts.split {
+        if opts.split.is_some() && split_of(image_idx) != opts.split {
+            continue;
+        }
+        if opts.frames.as_ref().is_some_and(|f| !f.contains(&img.id)) {
             continue;
         }
         let image_preds = preds.and_then(|p| p.of(image_idx));
@@ -339,7 +358,7 @@ pub(crate) mod tests {
             Some(&ev),
             &ReviewState::default(),
             &Uniformity::default(),
-            None,
+            FrameInfo::default(),
             &ViewOptions::default(),
         );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3", "P150"]);
@@ -361,7 +380,7 @@ pub(crate) mod tests {
             None,
             &ReviewState::default(),
             &Uniformity::default(),
-            None,
+            FrameInfo::default(),
             &ViewOptions::default(),
         );
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3"]);
@@ -372,7 +391,15 @@ pub(crate) mod tests {
     fn filters() {
         let (ds, preds, ev) = fixture();
         let run = |opts: ViewOptions, review: &ReviewState| {
-            ids(&build(&ds, Some(&preds), Some(&ev), review, &Uniformity::default(), None, &opts))
+            ids(&build(
+                &ds,
+                Some(&preds),
+                Some(&ev),
+                review,
+                &Uniformity::default(),
+                FrameInfo::default(),
+                &opts,
+            ))
         };
         let none = ReviewState::default();
         assert_eq!(run(ViewOptions { fp_only: true, ..Default::default() }, &none), vec!["P150"]);
@@ -385,6 +412,14 @@ pub(crate) mod tests {
             run(ViewOptions { split: Some(Split::Val), ..Default::default() }, &none),
             vec!["#3"]
         );
+        let frames = Some(Arc::new(BTreeSet::from([2])));
+        assert_eq!(run(ViewOptions { frames, ..Default::default() }, &none), vec!["#3"]);
+        // Pending split moves count: image 1 moved to val, image 2 to test.
+        let splits = [Some(Split::Val), Some(Split::Test)];
+        let info = FrameInfo { splits: Some(&splits), ..Default::default() };
+        let opts = ViewOptions { split: Some(Split::Val), ..Default::default() };
+        let moved = build(&ds, None, None, &none, &Uniformity::default(), info, &opts);
+        assert_eq!(ids(&moved), vec!["#1", "#2"]);
 
         let mut review = ReviewState::default();
         review.reviewed.insert(1);
@@ -405,7 +440,7 @@ pub(crate) mod tests {
                 Some(&ev),
                 &ReviewState::default(),
                 &Uniformity::default(),
-                None,
+                FrameInfo::default(),
                 &ViewOptions { sort, descending, ..Default::default() },
             ))
         };

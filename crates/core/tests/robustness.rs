@@ -8,7 +8,7 @@ use fastlabel_core::matching::evaluate;
 use fastlabel_core::predictions::{PredBox, PredImage, PredictionFile};
 use fastlabel_core::review::ReviewState;
 use fastlabel_core::{
-    AnnMark, BBox, Dataset, EditLog, Op, PredMark, PredRef, Predictions, journal, yolo,
+    AnnMark, BBox, Dataset, EditLog, Op, PredMark, PredRef, Predictions, Split, journal, yolo,
 };
 use proptest::prelude::*;
 use serde_json::Map;
@@ -89,7 +89,7 @@ proptest! {
     fn whole_pipeline_never_panics(
         coco in arb_coco(),
         preds in prop::collection::vec((0..20usize, 0..4i64, arb_box(), 0.0..1.0f64), 0..40),
-        ops in prop::collection::vec((0..8u8, 0..60i64, arb_box()), 0..40),
+        ops in prop::collection::vec((0..9u8, 0..60i64, arb_box()), 0..40),
     ) {
         let (ds, _) = Dataset::new(PathBuf::from("/d"), coco, Path::new("x")).expect("generated dataset is valid");
         // Predictions through the file format (validation path).
@@ -117,13 +117,20 @@ proptest! {
                 4 => Op::FrameDelete { image: ann % 20 + 1 },
                 5 => Op::SetBox { ann, bbox },
                 6 => Op::AddBox { ann: 1000 + ann, image: image_id, category: 1, bbox },
-                _ => Op::SetTags { image: ann % 20 + 1, tags: vec![" x ".into()] },
+                7 => Op::SetTags { image: ann % 20 + 1, tags: vec![" x ".into()] },
+                _ => Op::SetSplit { image: ann % 20 + 1, split: Split::ALL.get(ann as usize % 4).copied() },
             });
         }
         let out = apply(&ds, log.state(), &ReviewState::default());
         // The result is always a valid dataset again, and every new box
         // (drawn or accepted) lies inside its image. Invalid edits of existing
         // boxes are skipped, keeping the original geometry.
+        // Split moves never make two frames share a file.
+        let names: std::collections::HashSet<&str> = out.coco.images.iter().map(|i| i.file_name.as_str()).collect();
+        prop_assert_eq!(names.len(), out.coco.images.len());
+        for (from, to) in &out.moved_files {
+            prop_assert!(from != to && Split::from_path(to).is_some());
+        }
         let (again, _) = Dataset::new(PathBuf::from("/d"), out.coco, Path::new("y")).expect("applied dataset is valid");
         for a in again.annotations() {
             let img = again.image(a.image_id).unwrap();

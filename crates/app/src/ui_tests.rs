@@ -702,3 +702,117 @@ fn real_cleaning_shot() {
     settle(&mut h);
     save_shot(&mut h, "real_clean_2.png");
 }
+
+#[test]
+fn cluster_mode_lasso_move_split_and_show_in_mosaic() {
+    use crate::app::Mode;
+    use crate::embeddings::{self, SavedLayout};
+    use fastlabel_core::Split;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    // Precomputed layout: frames 1-3 on the left, 4-6 on the right.
+    let layout = SavedLayout {
+        model: "test".into(),
+        min_cluster_size: 2,
+        keys: (1..=6).map(|id| embeddings::key(id, &format!("images/train/{id:03}.jpg"))).collect(),
+        points: (0..6).map(|i| [if i < 3 { 0.0 } else { 10.0 }, (i % 3) as f32]).collect(),
+        labels: (0..6).map(|i| i / 3).collect(),
+    };
+    layout.save(&tmp.path().join(".fastlabel").join(embeddings::LAYOUT_FILE)).unwrap();
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+
+    h.key_press(Key::C);
+    h.run_steps(3);
+    assert_eq!(h.state().mode, Mode::Cluster);
+    settle(&mut h);
+    save_shot(&mut h, "20_cluster.png");
+
+    // Lasso around the left half.
+    h.drag_at(egui::pos2(20.0, 150.0));
+    h.run_steps(1);
+    for p in [(500.0, 150.0), (500.0, 650.0), (20.0, 650.0), (20.0, 160.0)] {
+        h.hover_at(egui::pos2(p.0, p.1));
+        h.run_steps(1);
+    }
+    h.drop_at(egui::pos2(20.0, 160.0));
+    h.run_steps(3);
+    assert_eq!(h.state().cluster.selection.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    settle(&mut h);
+    save_shot(&mut h, "21_cluster_selected.png");
+
+    h.key_press(Key::Num2); // → val
+    h.run_steps(2);
+    let ws = h.state().ws();
+    assert_eq!((0..6).map(|i| ws.split_of(i)).filter(|s| *s == Some(Split::Val)).count(), 3);
+    h.key_press(Key::F); // delete them all
+    h.run_steps(2);
+    assert!((0..3).all(|i| h.state().ws().is_frame_deleted_idx(i)));
+    h.key_press(Key::U); // and undo, in one step
+    h.run_steps(2);
+    assert!((0..3).all(|i| !h.state().ws().is_frame_deleted_idx(i)));
+
+    h.key_press(Key::Enter); // show the selection in the mosaic
+    h.run_steps(3);
+    assert_eq!(h.state().mode, Mode::Mosaic);
+    let ws = h.state().ws();
+    assert!(ws.crops.iter().all(|c| c.image_id <= 3));
+    assert_eq!(ws.crops.len(), 7, "3 frames x 2 GT + the FP of frame 1");
+
+    h.key_press(Key::S);
+    h.run_steps(2);
+    for id in 1..=3 {
+        assert!(tmp.path().join(format!("images/val/{id:03}.jpg")).exists());
+    }
+    assert!(tmp.path().join("images/train/004.jpg").exists());
+    let ws = h.state().ws();
+    assert_eq!(ws.project.dataset.split_of(0), Some(Split::Val));
+    assert!(!ws.project.log.is_dirty());
+
+    // The layout still places the moved frames (keys ignore the folder).
+    h.key_press(Key::C);
+    h.run_steps(3);
+    assert_eq!(h.state().cluster.unplaced, 0);
+    assert_eq!(h.state().cluster.selection.len(), 3);
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Mosaic);
+}
+
+/// Opt-in: embeddings + layout on a real dataset copy, with timings and shots.
+/// `FASTLABEL_SHOT_DATASET=<copy> FASTLABEL_EMBED_MODEL=<dinov2.onnx> FASTLABEL_SHOT_DIR=<out> cargo test --release -p fastlabel real_clusters -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn real_clusters() {
+    use crate::cluster_view::{ClusterEvent, ColorBy};
+    let dataset =
+        PathBuf::from(std::env::var("FASTLABEL_SHOT_DATASET").expect("FASTLABEL_SHOT_DATASET"));
+    let model =
+        PathBuf::from(std::env::var("FASTLABEL_EMBED_MODEL").expect("FASTLABEL_EMBED_MODEL"));
+    let mut h = harness(dataset, egui::vec2(1500.0, 950.0));
+    settle(&mut h);
+    h.state_mut().session_mut().embed_model_path = Some(model);
+    h.key_press(Key::C);
+    h.run_steps(2);
+    let ctx = h.ctx.clone();
+    let start = std::time::Instant::now();
+    h.state_mut().cluster_event(&ctx, ClusterEvent::ComputeEmbeddings);
+    let wait = |h: &mut Harness<'static, FastLabelApp>| {
+        while h.state().cluster_busy() {
+            h.step();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    wait(&mut h);
+    eprintln!("embeddings + layout: {:.1?}, RSS {:.0} MB", start.elapsed(), rss_mb());
+    let t = std::time::Instant::now();
+    h.state_mut().cluster_event(&ctx, ClusterEvent::Relayout);
+    wait(&mut h);
+    eprintln!("layout alone: {:.1?}", t.elapsed());
+    h.run_steps(3);
+    settle(&mut h);
+    save_shot(&mut h, "real_clusters_split.png");
+    h.state_mut().cluster.color_by = ColorBy::Cluster;
+    h.run_steps(3);
+    save_shot(&mut h, "real_clusters_clusters.png");
+}
