@@ -19,7 +19,7 @@ Linux / Wayland first (X11 works too). ONNX Runtime is downloaded at build time 
 | File | Role |
 |---|---|
 | `annotations.vNNN.json` | COCO annotations, one new file per save (never overwritten). The newest is opened. Legacy `annotations.draft.json` / `annotations.json` are read too. |
-| `images/…` | Images, referenced by `file_name`. The split is the image's `split` field (older files: the `train` / `val` / `test` folder in the path). New files copied here are picked up on open (then *Model → Run on frames without predictions*, sort by *Image date*). |
+| `images/…` | Images, referenced by `file_name`. The split is the image's `split` field (older files: the `train` / `val` / `test` folder in the path). *Add* copies new images here as `images/<content hash>.<ext>` (duplicates skipped, original path kept as `source_name`); files copied by hand are picked up on open too. Then *Model → Run on frames without predictions*, sort by *Image date*. |
 | `data.yaml` + `labels/` | YOLO layout, imported when there is no annotation file yet (first save writes `annotations.v001.json`). |
 | `predictions.json` | Model predictions (written by the Model menu). |
 | `.fastlabel/` | Tool state: crash journal of unsaved actions, review state (reviewed boxes, rejected predictions), thumbnail cache, uniformity metrics, image embeddings and cluster layout, `trash/` with deleted frames. |
@@ -39,6 +39,8 @@ Nothing changes on disk until you save (`S`). Every action is journaled, so a cr
 | Enter or E, Space (hold) | frame editor popup, peek at the frame |
 | Tab or M | frame mode (draw, move, resize, 1–9 class, tags) |
 | S / Q | save new version / save and quit |
+
+*To do* (T) lists frames without any box (e.g. just added), newest first: Enter to draw boxes, G when there is nothing to annotate, F to delete.
 
 *Clusters* (C) shows every frame as a point (image embeddings, UMAP, HDBSCAN), colored by split or cluster. Drag around points to select them (Shift adds, Ctrl removes), then right click or 1 / 2 / 3 to move them to train / val / test, F to delete the frames, Enter to review them in the mosaic. It needs an ONNX image embedder, e.g. DINOv2-small:
 

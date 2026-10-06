@@ -27,6 +27,8 @@ pub enum Mode {
     Clean,
     /// Frames as a point cloud of image embeddings, to manage splits.
     Cluster,
+    /// Frames without any box (e.g. just added), to annotate.
+    Todo,
 }
 
 /// Finished embedding run: model id, (image key, vector), failures, cancelled.
@@ -76,6 +78,9 @@ pub struct FastLabelApp {
     uniformity_task: Option<Task<std::collections::HashMap<u64, f32>>>,
     export_task: Option<Task<Result<(fastlabel_core::export::ExportReport, PathBuf), String>>>,
     pub(crate) cluster: ClusterView,
+    pub(crate) todo: crate::todo::TodoState,
+    /// Frame mode was opened from the To do tab (Tab / Esc go back to it).
+    frame_from_todo: bool,
     /// Loaded when cluster mode is first opened.
     embeddings: Option<Embeddings>,
     embed_task: Option<Task<EmbedOutcome>>,
@@ -83,6 +88,7 @@ pub struct FastLabelApp {
     report_task: Option<Task<Result<PathBuf, String>>>,
     /// Export dialog open.
     export_dialog: bool,
+    add_task: Option<Task<fastlabel_core::add::AddReport>>,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
     exit_ok: bool,
@@ -117,11 +123,14 @@ impl FastLabelApp {
             uniformity_task: None,
             export_task: None,
             cluster: ClusterView::default(),
+            todo: Default::default(),
+            frame_from_todo: false,
             embeddings: None,
             embed_task: None,
             layout_task: None,
             report_task: None,
             export_dialog: false,
+            add_task: None,
             status: None,
             exit_ok: false,
             #[cfg(test)]
@@ -194,7 +203,8 @@ impl FastLabelApp {
                 self.embeddings = None;
                 self.embed_task = None;
                 self.layout_task = None;
-                if self.mode == Mode::Cluster {
+                self.todo = Default::default();
+                if matches!(self.mode, Mode::Cluster | Mode::Todo) {
                     self.mode = Mode::Mosaic;
                 }
                 self.mosaic.ensure_visible = true;
@@ -256,6 +266,7 @@ impl FastLabelApp {
                     t.retry_failed();
                 }
                 self.cluster.dirty = true;
+                self.refresh_todo();
                 if report.trash.failed.is_empty() {
                     self.info(parts.join(" · "));
                 } else {
@@ -415,6 +426,70 @@ impl FastLabelApp {
             })
             .map_err(|e| format!("{e} ({})", out.display()))
         }));
+    }
+
+    /// Copies picked images (files or whole folders) into `images/` under
+    /// content-hash names in the background; registered when done.
+    fn start_add(&mut self, ctx: &egui::Context, folders: bool) {
+        let Some(ws) = &self.ws else { return };
+        if self.add_task.is_some() {
+            return;
+        }
+        let dialog = rfd::FileDialog::new()
+            .set_directory(ws.project.dir.parent().unwrap_or(&ws.project.dir));
+        let picked = if folders {
+            dialog.set_title("Folders of images to add").pick_folders()
+        } else {
+            dialog
+                .set_title("Images to add")
+                .add_filter("images", &fastlabel_core::yolo::IMAGE_EXTENSIONS)
+                .pick_files()
+        };
+        let Some(paths) = picked.filter(|p| !p.is_empty()) else { return };
+        let dir = ws.project.dir.clone();
+        self.add_task = Some(Task::spawn("adding images", ctx, move |progress| {
+            use std::sync::atomic::Ordering;
+            let sources = fastlabel_core::add::collect(&paths);
+            fastlabel_core::add::copy_sources(&dir, &sources, |done, total| {
+                progress.done.store(done, Ordering::Relaxed);
+                progress.total.store(total, Ordering::Relaxed);
+                !progress.cancel.load(Ordering::Relaxed)
+            })
+        }));
+    }
+
+    fn poll_add(&mut self) {
+        let Some(r) = self.add_task.as_mut().and_then(Task::poll) else { return };
+        self.add_task = None;
+        let Some(ws) = &mut self.ws else { return };
+        let split = self.session.add_split;
+        match ws.register_added(&r.copied, split) {
+            Ok(n) => {
+                self.cluster.dirty = true;
+                self.mosaic.ensure_visible = true;
+                self.refresh_todo();
+                let mut msg = format!("Added {n} images");
+                if let Some(s) = split {
+                    msg.push_str(&format!(" to {}", s.name()));
+                }
+                if !r.duplicates.is_empty() {
+                    msg.push_str(&format!(", {} already in the dataset", r.duplicates.len()));
+                }
+                if r.cancelled {
+                    msg.push_str(" (cancelled)");
+                }
+                msg.push_str(
+                    " — saved with the next version; Model → Run on frames without predictions",
+                );
+                if r.failed.is_empty() {
+                    self.info(msg);
+                } else {
+                    let (name, why) = &r.failed[0];
+                    self.error(format!("{msg}; {} failed ({name}: {why})", r.failed.len()));
+                }
+            }
+            Err(e) => self.error(format!("Images copied into images/ but not registered: {e}")),
+        }
     }
 
     /// Format, splits and destination; Export saves, then asks where.
@@ -635,10 +710,15 @@ impl FastLabelApp {
 
     fn set_mode(&mut self, mode: Mode) {
         let Some(ws) = &mut self.ws else { return };
+        if mode != Mode::Frame {
+            ws.frame_order = None;
+            self.frame_from_todo = false;
+        }
         match mode {
             Mode::Frame => ws.focus_selected_crop(),
+            Mode::Todo => self.todo.refresh(ws),
             Mode::Mosaic => {
-                if self.mode == Mode::Cluster {
+                if matches!(self.mode, Mode::Cluster | Mode::Todo) {
                     // Split moves change what the split filter shows.
                     ws.rebuild();
                 }
@@ -674,7 +754,7 @@ impl FastLabelApp {
                     self.popup = false;
                 } else if self.mode == Mode::Clean {
                     self.exit_clean();
-                } else if self.mode == Mode::Cluster {
+                } else if matches!(self.mode, Mode::Cluster | Mode::Todo) {
                     self.set_mode(Mode::Mosaic);
                 } else {
                     self.inference.shutdown();
@@ -701,6 +781,35 @@ impl FastLabelApp {
             }
             Key::C if plain && !m.shift && !repeat && !self.popup && self.mode == Mode::Mosaic => {
                 self.start_cluster_mode(ctx);
+                return;
+            }
+            Key::Tab | Key::M | Key::T | Key::Escape
+                if plain && !m.shift && !self.popup && self.mode == Mode::Todo =>
+            {
+                self.set_mode(Mode::Mosaic);
+                return;
+            }
+            Key::T if plain && !m.shift && !repeat && !self.popup && self.mode == Mode::Mosaic => {
+                self.set_mode(Mode::Todo);
+                return;
+            }
+            Key::Tab | Key::M | Key::T
+                if plain
+                    && !m.shift
+                    && !self.popup
+                    && self.mode == Mode::Frame
+                    && self.frame_from_todo =>
+            {
+                self.back_to_todo();
+                return;
+            }
+            Key::Escape
+                if !self.popup
+                    && self.mode == Mode::Frame
+                    && self.frame_from_todo
+                    && self.ws.as_ref().is_some_and(|ws| ws.frame.sel.is_none()) =>
+            {
+                self.back_to_todo();
                 return;
             }
             Key::Tab | Key::M if plain && !m.shift && !self.popup => {
@@ -733,6 +842,12 @@ impl FastLabelApp {
         if self.mode == Mode::Cluster && !self.popup {
             if let Some(event) = self.cluster_key(key, repeat, m) {
                 self.cluster_event(ctx, event);
+            }
+            return;
+        }
+        if self.mode == Mode::Todo && !self.popup {
+            if let Err(e) = self.todo_key(key, repeat, m) {
+                self.error(e);
             }
             return;
         }
@@ -811,8 +926,9 @@ impl FastLabelApp {
                 Ok(())
             }
             Key::Home | Key::End if !popup => {
-                let last = ws.project.dataset.images().len() - 1;
-                ws.go_to_frame(if key == Key::Home { 0 } else { last });
+                if let Some(i) = ws.edge_frame(key == Key::End) {
+                    ws.go_to_frame(i);
+                }
                 Ok(())
             }
             Key::J | Key::K | Key::ArrowDown | Key::ArrowUp => {
@@ -820,6 +936,20 @@ impl FastLabelApp {
                 Ok(())
             }
             Key::D if !repeat => ws.mark_sel(Mark::Delete),
+            Key::G
+                if !repeat && ws.frame.sel.is_none() && ws.frame_is_empty(ws.frame.image_idx) =>
+            {
+                // No box at all: background, nothing to annotate; then move on.
+                let idx = ws.frame.image_idx;
+                ws.toggle_confirm_frame(idx)?;
+                if !popup
+                    && ws.todo_tile(idx).confirmed
+                    && let Some(i) = ws.step_frame(1, false)
+                {
+                    ws.go_to_frame(i);
+                }
+                Ok(())
+            }
             Key::G if !repeat => ws.mark_sel(Mark::Good),
             Key::F if !repeat => {
                 ws.toggle_frame_delete()?;
@@ -1066,6 +1196,78 @@ impl FastLabelApp {
             ));
             self.cluster.set_layout(layout);
         }
+    }
+
+    /// Re-lists the to-do frames (after a save or an add); frame mode opened
+    /// from To do keeps navigating the new list.
+    fn refresh_todo(&mut self) {
+        let Some(ws) = &mut self.ws else { return };
+        if self.mode == Mode::Todo || self.frame_from_todo {
+            self.todo.refresh(ws);
+        }
+        if ws.frame_order.is_some() {
+            ws.frame_order = Some(self.todo.frames.clone());
+        }
+    }
+
+    /// Frame mode on a to-do frame (k-th tile), navigating the to-do list.
+    fn open_todo_frame(&mut self, k: usize) {
+        let Some(ws) = &mut self.ws else { return };
+        let Some(&idx) = self.todo.frames.get(k) else { return };
+        self.todo.selected = k;
+        ws.frame_order = Some(self.todo.frames.clone());
+        ws.go_to_frame(idx);
+        ws.frame.sel = None;
+        self.popup = false;
+        self.frame_from_todo = true;
+        self.mode = Mode::Frame;
+    }
+
+    /// From frame mode back to the To do grid, on the frame reached.
+    fn back_to_todo(&mut self) {
+        let Some(ws) = &mut self.ws else { return };
+        if let Some(k) = self.todo.frames.iter().position(|&f| f == ws.frame.image_idx) {
+            self.todo.selected = k;
+        }
+        ws.frame_order = None;
+        self.frame_from_todo = false;
+        self.set_mode(Mode::Todo);
+    }
+
+    /// Keys of the To do tab.
+    fn todo_key(&mut self, key: Key, repeat: bool, m: Modifiers) -> Result<(), String> {
+        let Some(ws) = &mut self.ws else { return Ok(()) };
+        let cols = ws.columns.max(1) as isize;
+        let t = &mut self.todo;
+        match key {
+            Key::ArrowLeft | Key::H => t.move_selection(-1),
+            Key::ArrowRight | Key::L => t.move_selection(1),
+            Key::ArrowUp | Key::K => t.move_selection(-cols),
+            Key::ArrowDown | Key::J => t.move_selection(cols),
+            Key::PageUp => t.move_selection(-cols * 4),
+            Key::PageDown => t.move_selection(cols * 4),
+            Key::Home => t.move_selection(isize::MIN / 2),
+            Key::End => t.move_selection(isize::MAX / 2),
+            Key::Enter | Key::E if !repeat && !m.command => {
+                let k = t.selected;
+                self.open_todo_frame(k);
+            }
+            Key::G | Key::F if !repeat && !m.command => {
+                let Some(idx) = t.selected_frame() else { return Ok(()) };
+                let r = if key == Key::G {
+                    ws.toggle_confirm_frame(idx)
+                } else {
+                    ws.toggle_frame_delete_idx(idx)
+                };
+                let t = ws.todo_tile(idx);
+                if t.confirmed || t.deleted {
+                    self.todo.advance(ws);
+                }
+                return r;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Keys of cluster mode; `None` when the key does nothing there.
@@ -1404,6 +1606,9 @@ impl FastLabelApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{} / {n}", idx + 1)).strong());
             ui.label(&img.file_name);
+            if let Some(src) = img.extra.get(fastlabel_core::add::SOURCE_FIELD).and_then(|v| v.as_str()) {
+                ui.label(RichText::new(src).weak()).on_hover_text("Original path (source_name)");
+            }
             let saved = ws.project.dataset.split_of(idx);
             match ws.split_of(idx) {
                 Some(split) if Some(split) != saved => {
@@ -1440,6 +1645,32 @@ impl FastLabelApp {
             {
                 error = Some(e);
             }
+            if ws.frame_is_empty(idx) {
+                let confirmed = ws.todo_tile(idx).confirmed;
+                if ui
+                    .selectable_label(confirmed, "G  background")
+                    .on_hover_text("Nothing to annotate on this frame (G with no box selected)")
+                    .clicked()
+                    && let Err(e) = ws.toggle_confirm_frame(idx)
+                {
+                    error = Some(e);
+                }
+            }
+            if !popup && self.frame_from_todo {
+                ui.separator();
+                let (pos, total) = match &ws.frame_order {
+                    Some(order) => (order.iter().position(|&i| i == idx).map_or(0, |p| p + 1), order.len()),
+                    None => (0, self.todo.frames.len()),
+                };
+                let mut only = ws.frame_order.is_some();
+                if ui
+                    .checkbox(&mut only, format!("To do only ({pos} / {total})"))
+                    .on_hover_text("h / l and arrows move through the to-do frames, newest first; Tab or Esc: back to the grid")
+                    .changed()
+                {
+                    ws.frame_order = only.then(|| self.todo.frames.clone());
+                }
+            }
             if ui.button("Run model on this frame").clicked() {
                 run_here = true;
             }
@@ -1473,6 +1704,13 @@ impl FastLabelApp {
                 }
                 EditorAction::SetBox(id, b) => ws.set_box(id, b),
                 EditorAction::AddBox(b) => ws.add_box(b).map(|_| ()),
+                // Frame mode only (the popup and the cleaning view stay put).
+                EditorAction::Next => {
+                    if !popup && let Some(i) = ws.step_frame(1, false) {
+                        ws.go_to_frame(i);
+                    }
+                    Ok(())
+                }
             };
             if let Err(e) = r {
                 error = Some(e);
@@ -1536,6 +1774,34 @@ impl FastLabelApp {
             if ui.add_enabled(has_ws, egui::Button::new("💾 Save (S)")).clicked() {
                 self.save();
             }
+            ui.add_enabled_ui(has_ws && self.add_task.is_none(), |ui| {
+                ui.menu_button("Add", |ui| {
+                    ui.label(
+                        RichText::new("Copied into images/ with unique content-hash names; duplicates are skipped")
+                            .weak(),
+                    );
+                    if ui.button("Images…").clicked() {
+                        self.start_add(&ctx, false);
+                        ui.close();
+                    }
+                    if ui.button("Folders…").on_hover_text("All images inside, subfolders included").clicked() {
+                        self.start_add(&ctx, true);
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Split of the added frames");
+                        egui::ComboBox::from_id_salt("add-split")
+                            .selected_text(self.session.add_split.map_or("none", |s| s.name()))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.session.add_split, None, "none");
+                                for s in Split::ALL {
+                                    ui.selectable_value(&mut self.session.add_split, Some(s), s.name());
+                                }
+                            });
+                    });
+                });
+            });
             if ui
                 .add_enabled(has_ws && self.export_task.is_none(), egui::Button::new("Export…"))
                 .on_hover_text("YOLO, COCO or Ultralytics NDJSON, laid out by split, to a zip or a folder")
@@ -1555,6 +1821,14 @@ impl FastLabelApp {
                         ui.close();
                     }
                 });
+                if ui
+                    .selectable_label(self.mode == Mode::Todo, "To do (T)")
+                    .on_hover_text("Frames without any box (e.g. just added), newest first: draw boxes, or G for background")
+                    .clicked()
+                {
+                    let next = if self.mode == Mode::Todo { Mode::Mosaic } else { Mode::Todo };
+                    self.set_mode(next);
+                }
                 if ui
                     .selectable_label(self.mode == Mode::Cluster, "Clusters (C)")
                     .on_hover_text("Frames as a point cloud of image embeddings: select clusters, move them to another split")
@@ -1645,11 +1919,10 @@ impl FastLabelApp {
                 opts.frames = None;
             }
             egui::ComboBox::from_id_salt("split")
-                .selected_text(opts.split.map_or("All splits", |s| s.name()))
+                .selected_text(opts.split.label())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut opts.split, None, "All splits");
-                    for s in Split::ALL {
-                        ui.selectable_value(&mut opts.split, Some(s), s.name());
+                    for f in crate::crops::SplitFilter::choices() {
+                        ui.selectable_value(&mut opts.split, f, f.label());
                     }
                 });
             ui.toggle_value(&mut opts.hide_reviewed, "Hide reviewed");
@@ -1695,7 +1968,7 @@ impl FastLabelApp {
             }
             if let Some(ws) = &self.ws {
                 let n = ws.crops.len();
-                let clean = matches!(self.mode, Mode::Clean | Mode::Cluster);
+                let clean = matches!(self.mode, Mode::Clean | Mode::Cluster | Mode::Todo);
                 if !clean {
                 ui.label(format!("{} / {n}", if n == 0 { 0 } else { ws.selected + 1 }));
                 if let Some(crop) = ws.selected_crop() {
@@ -1761,8 +2034,9 @@ impl FastLabelApp {
                     self.inference.cancel();
                 }
             }
-            let mut cancel = [false; 4];
+            let mut cancel = [false; 5];
             for (i, task) in [
+                self.add_task.as_ref().map(|t| (t.label, t.progress())),
                 self.uniformity_task.as_ref().map(|t| (t.label, t.progress())),
                 self.export_task.as_ref().map(|t| (t.label, t.progress())),
                 self.embed_task.as_ref().map(|t| (t.label, t.progress())),
@@ -1782,21 +2056,26 @@ impl FastLabelApp {
                 cancel[i] = ui.button("Cancel").clicked();
             }
             if cancel[0]
-                && let Some(t) = &self.uniformity_task
+                && let Some(t) = &self.add_task
             {
                 t.cancel();
             }
             if cancel[1]
-                && let Some(t) = &self.export_task
+                && let Some(t) = &self.uniformity_task
             {
                 t.cancel();
             }
             if cancel[2]
-                && let Some(t) = &self.embed_task
+                && let Some(t) = &self.export_task
             {
                 t.cancel();
             }
             if cancel[3]
+                && let Some(t) = &self.embed_task
+            {
+                t.cancel();
+            }
+            if cancel[4]
                 && let Some(t) = &self.layout_task
             {
                 t.cancel();
@@ -1838,6 +2117,7 @@ impl eframe::App for FastLabelApp {
         self.poll_inference();
         self.poll_tasks(&ctx);
         self.poll_cluster_tasks(&ctx);
+        self.poll_add();
         self.handle_keys(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -1870,6 +2150,20 @@ impl eframe::App for FastLabelApp {
             }
             if self.mode == Mode::Cluster {
                 self.cluster_panel(ui);
+                return;
+            }
+            if self.mode == Mode::Todo {
+                let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
+                let mut open = None;
+                for ev in crate::todo::show(ui, ws, thumbs, &mut self.todo) {
+                    match ev {
+                        crate::todo::TodoEvent::Select(k) => self.todo.selected = k,
+                        crate::todo::TodoEvent::Open(k) => open = Some(k),
+                    }
+                }
+                if let Some(k) = open {
+                    self.open_todo_frame(k);
+                }
                 return;
             }
             let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };

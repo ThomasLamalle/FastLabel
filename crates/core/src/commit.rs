@@ -171,6 +171,12 @@ pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Appl
 
     write_splits(ds, &mut coco, pending, &mut summary);
 
+    for &image in &pending.confirmed_frames {
+        if !frames.contains(&image) && dims.contains_key(&image) {
+            review.empty_frames.insert(image);
+            summary.confirmed += 1;
+        }
+    }
     let kept: HashSet<AnnId> = coco.annotations.iter().map(|a| a.id).collect();
     review.retain(|a| kept.contains(&a), |i| !frames.contains(&i));
     Applied { coco, review, trashed_files, summary }
@@ -287,6 +293,8 @@ mod tests {
         });
         log.push(Op::FrameDelete { image: 3 });
         log.push(Op::SetTags { image: 2, tags: vec!["blurry".into()] });
+        log.push(Op::ConfirmFrame { image: 2 });
+        log.push(Op::ConfirmFrame { image: 3 }); // deleted: ignored
 
         let out = apply(&ds, log.state(), &ReviewState::default());
         let anns: Vec<_> = out
@@ -309,11 +317,12 @@ mod tests {
         assert_eq!(out.trashed_files, vec!["images/train/0003.jpg"]);
         assert_eq!(out.review.reviewed.iter().copied().collect::<Vec<_>>(), vec![2, 3, 5, 6]);
         assert!(out.review.is_rejected(&pred(2, b(40.0))));
+        assert_eq!(out.review.empty_frames.iter().copied().collect::<Vec<_>>(), vec![2]);
         assert_eq!(
             out.summary,
             Summary {
                 deleted_annotations: 2,
-                confirmed: 1,
+                confirmed: 2,
                 replaced: 1,
                 edited: 1,
                 added: 1,

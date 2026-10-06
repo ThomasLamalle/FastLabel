@@ -146,7 +146,7 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 
 | Frame mode and popup | Action |
 |---|---|
-| h / l, ← / → (Ctrl: annotated only), Home / End | Previous / next / first / last frame (frame mode only) |
+| h / l, ← / → (Ctrl: annotated only), Home / End, right click | Previous / next / first / last frame, next frame (frame mode only) |
 | j / k, ↓ / ↑ | Next / previous box (GT, then predictions) |
 | D / G | Delete-or-reject / accept-or-confirm the selected box |
 | F | Toggle frame deletion (frame mode: then next frame) |
@@ -154,6 +154,13 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 | Drag on empty area / box / handle | Draw / move / resize |
 | Wheel, middle drag or Space + drag | Zoom around cursor, pan |
 | Esc | Deselect (frame mode) / close (popup, also Enter / E) |
+
+| To do (T) | Action |
+|---|---|
+| Arrows / hjkl, PgUp / PgDn, Home / End | Move |
+| Enter / E / double click | Frame mode through the to-do frames only (h / l next / previous, G background + next, Tab / Esc back to the grid) |
+| G / F | Background (nothing to annotate) / delete frame (toggles, advance) |
+| Esc, T, M, Tab, Q | Back to the mosaic |
 
 | Cluster mode (C) | Action |
 |---|---|
@@ -213,6 +220,10 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 - `app::cluster` (pure, no new dependency): PCA (covariance + Jacobi), exact kNN (threads), UMAP (fuzzy graph + SGD with negative sampling, PCA init, seeded), HDBSCAN (mutual reachability MST, condensed tree, excess of mass). Exact kNN and Prim's MST are O(n²): fine for 10k frames, minutes for 100k.
 - v1_exp0 (4,936 frames): embeddings 8.5 min (~103 ms/frame, once, cached), layout 6.5 s, 19 clusters + 51 noise frames; val and test each form their own clusters (no visible leakage).
 - Export (`core::export`): YOLO, COCO per split (Roboflow / RF-DETR), COCO single file, Ultralytics NDJSON; zip (atomic) or folder (temp sibling + rename, hardlinks with copy fallback); `--export` CLI. BibBoxes (4,612 frames): Ultralytics' YOLO loader and NDJSON converter read the exports with identical counts (one truncated source JPEG, `images/test/0000023_0355.jpg`, is skipped by Ultralytics).
+- Add images (`core::add`): content-hash names (SHA-256, 16 hex), duplicates skipped, temp + rename copies, `source_name` field; `Project::register_added` assigns ids, writes `.fastlabel/sources.json` and rewrites the journal header so a crash before the save replays onto the same frames.
+- `date_added` image field (set by Add, used by the date sort; BibBoxes backfilled in v003 from the original files' creation times). Split filter gains *no split* (`SplitFilter`, reads the old session format).
+- To do tab (`T`): frames without GT boxes, newest first; G confirms background (`Op::ConfirmFrame`, `review.empty_frames`), F deletes, Enter opens frame mode restricted to the to-do list (`Workspace::frame_order`).
+- BibBoxes (`~/Projects/Datasets/BibBoxes`): fresh dataset from v1_exp0 v042, real copies under content-hash names, split + source_name fields, predictions and embedding/cluster caches re-keyed.
 - Auto-split (`cluster::auto_split`): whole clusters, capped share per cluster, seeded order, fillers last; one undo step.
 - Reports (`app::report`, pure + SVG, no dependency): all frames / selection / cluster, `--report` CLI. v1_exp0: 0.24 s including the cross-split similarity (665 × 4,271 cosines).
 - Cluster view: mesh-drawn points, lasso, context menu, selection strip (virtualized thumbnails), split filter shared with the mosaic, mosaic filter by selected frames.

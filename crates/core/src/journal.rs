@@ -76,6 +76,20 @@ impl Journal {
     }
 }
 
+/// Replaces the header's added images, keeping the entries (temporary file +
+/// rename), and continues the journal.
+pub fn rewrite(path: &Path, base: &str, added_images: &[(ImageId, String)]) -> Result<Journal> {
+    let entries = read(path)?.map(|r| r.entries).unwrap_or_default();
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut j = Journal::create(&tmp, base, added_images)?;
+    for e in &entries {
+        j.append(e)?;
+    }
+    j.file.sync_all().map_err(|e| Error::io(&tmp, e))?;
+    fs::rename(&tmp, path).map_err(|e| Error::io(path, e))?;
+    Journal::open_append(path)
+}
+
 /// Contents of a journal file: the base it applies to and its entries.
 #[derive(Debug, PartialEq)]
 pub struct Recorded {

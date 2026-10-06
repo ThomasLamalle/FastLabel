@@ -23,6 +23,8 @@ pub struct Session {
     pub embed_model_path: Option<PathBuf>,
     pub min_cluster_size: usize,
     pub export: ExportSettings,
+    /// Split given to added images (`None`: no split).
+    pub add_split: Option<fastlabel_core::Split>,
     pub auto_split: crate::cluster::AutoSplit,
     /// GPU memory budget for crop thumbnails.
     pub texture_budget_mb: usize,
@@ -42,6 +44,7 @@ impl Default for Session {
             embed_model_path: None,
             min_cluster_size: 20,
             export: ExportSettings::default(),
+            add_split: None,
             auto_split: crate::cluster::AutoSplit::default(),
             texture_budget_mb: 256,
         }

@@ -15,6 +15,7 @@ mod report;
 mod session;
 mod tasks;
 mod thumbs;
+mod todo;
 #[cfg(test)]
 mod ui_tests;
 mod workspace;

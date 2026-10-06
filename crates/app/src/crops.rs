@@ -59,6 +59,65 @@ impl SortKey {
     }
 }
 
+/// Split filter: all frames, one split, or frames without a split.
+/// Stored like the former `Option<Split>` (`null`, `"Train"`…) plus `"None"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Option<String>", into = "Option<String>")]
+pub enum SplitFilter {
+    #[default]
+    All,
+    Only(Split),
+    NoSplit,
+}
+
+impl SplitFilter {
+    pub fn matches(self, split: Option<Split>) -> bool {
+        match self {
+            SplitFilter::All => true,
+            SplitFilter::Only(s) => split == Some(s),
+            SplitFilter::NoSplit => split.is_none(),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SplitFilter::All => "All splits",
+            SplitFilter::Only(s) => s.name(),
+            SplitFilter::NoSplit => "no split",
+        }
+    }
+
+    pub fn choices() -> [SplitFilter; 5] {
+        [
+            SplitFilter::All,
+            SplitFilter::Only(Split::Train),
+            SplitFilter::Only(Split::Val),
+            SplitFilter::Only(Split::Test),
+            SplitFilter::NoSplit,
+        ]
+    }
+}
+
+impl From<Option<String>> for SplitFilter {
+    fn from(v: Option<String>) -> Self {
+        match v.as_deref() {
+            Some("None") => SplitFilter::NoSplit,
+            Some(s) => Split::parse(s).map_or(SplitFilter::All, SplitFilter::Only),
+            None => SplitFilter::All,
+        }
+    }
+}
+
+impl From<SplitFilter> for Option<String> {
+    fn from(f: SplitFilter) -> Self {
+        match f {
+            SplitFilter::All => None,
+            SplitFilter::Only(s) => Some(format!("{s:?}")),
+            SplitFilter::NoSplit => Some("None".into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewOptions {
@@ -67,7 +126,7 @@ pub struct ViewOptions {
     pub fp_only: bool,
     pub fn_only: bool,
     pub hide_reviewed: bool,
-    pub split: Option<Split>,
+    pub split: SplitFilter,
     /// Only crops of these frames (a cluster selection); not persisted.
     #[serde(skip)]
     pub frames: Option<Arc<BTreeSet<ImageId>>>,
@@ -189,7 +248,7 @@ pub fn build(
     let dates = frames.dates;
     let split_of = |idx: usize| frames.splits.map_or_else(|| ds.split_of(idx), |s| s[idx]);
     for (image_idx, img) in ds.images().iter().enumerate() {
-        if opts.split.is_some() && split_of(image_idx) != opts.split {
+        if !opts.split.matches(split_of(image_idx)) {
             continue;
         }
         if opts.frames.as_ref().is_some_and(|f| !f.contains(&img.id)) {
@@ -409,7 +468,7 @@ pub(crate) mod tests {
             vec!["#2", "P150"]
         );
         assert_eq!(
-            run(ViewOptions { split: Some(Split::Val), ..Default::default() }, &none),
+            run(ViewOptions { split: SplitFilter::Only(Split::Val), ..Default::default() }, &none),
             vec!["#3"]
         );
         let frames = Some(Arc::new(BTreeSet::from([2])));
@@ -417,9 +476,15 @@ pub(crate) mod tests {
         // Pending split moves count: image 1 moved to val, image 2 to test.
         let splits = [Some(Split::Val), Some(Split::Test)];
         let info = FrameInfo { splits: Some(&splits), ..Default::default() };
-        let opts = ViewOptions { split: Some(Split::Val), ..Default::default() };
+        let opts = ViewOptions { split: SplitFilter::Only(Split::Val), ..Default::default() };
         let moved = build(&ds, None, None, &none, &Uniformity::default(), info, &opts);
         assert_eq!(ids(&moved), vec!["#1", "#2"]);
+        let mut no_split = splits;
+        no_split[1] = None;
+        let info = FrameInfo { splits: Some(&no_split), ..Default::default() };
+        let opts = ViewOptions { split: SplitFilter::NoSplit, ..Default::default() };
+        let none_left = build(&ds, None, None, &none, &Uniformity::default(), info, &opts);
+        assert_eq!(ids(&none_left), vec!["#3"]);
 
         let mut review = ReviewState::default();
         review.reviewed.insert(1);
@@ -428,6 +493,17 @@ pub(crate) mod tests {
             run(ViewOptions { hide_reviewed: true, ..Default::default() }, &review),
             vec!["#2", "#3"]
         );
+    }
+
+    #[test]
+    fn split_filter_reads_the_old_session_format() {
+        let parse = |j: &str| serde_json::from_str::<SplitFilter>(j).unwrap();
+        assert_eq!(parse("null"), SplitFilter::All);
+        assert_eq!(parse("\"Test\""), SplitFilter::Only(Split::Test));
+        assert_eq!(parse("\"None\""), SplitFilter::NoSplit);
+        for f in SplitFilter::choices() {
+            assert_eq!(parse(&serde_json::to_string(&f).unwrap()), f);
+        }
     }
 
     #[test]

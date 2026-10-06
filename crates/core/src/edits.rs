@@ -68,6 +68,10 @@ pub enum Op {
         image: ImageId,
         split: Option<Split>,
     },
+    /// Toggle: confirm a frame without boxes as background (nothing to annotate).
+    ConfirmFrame {
+        image: ImageId,
+    },
     /// Several ops undone/redone as one step (row actions).
     Group {
         ops: Vec<Op>,
@@ -96,6 +100,8 @@ pub struct PendingState {
     pub tags: HashMap<ImageId, Vec<String>>,
     /// Split moves.
     pub splits: HashMap<ImageId, Split>,
+    /// Frames confirmed as background.
+    pub confirmed_frames: HashSet<ImageId>,
 }
 
 impl PendingState {
@@ -106,6 +112,11 @@ impl PendingState {
             Op::FrameDelete { image } => {
                 if !self.deleted_frames.remove(image) {
                     self.deleted_frames.insert(*image);
+                }
+            }
+            Op::ConfirmFrame { image } => {
+                if !self.confirmed_frames.remove(image) {
+                    self.confirmed_frames.insert(*image);
                 }
             }
             Op::AddBox { ann, image, category, bbox } => {

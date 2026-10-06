@@ -55,6 +55,22 @@ pub struct Workspace {
     pub uniformity: Uniformity,
     /// Image file dates, read when sorting by date (indexed like images).
     image_dates: Option<Vec<Option<f64>>>,
+    /// Frame mode restricted to these frames, in this order (To do).
+    pub frame_order: Option<Vec<usize>>,
+}
+
+/// What a to-do frame shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TodoTile {
+    /// G: background, nothing to annotate (pending).
+    pub confirmed: bool,
+    pub deleted: bool,
+    /// Boxes drawn on it (pending).
+    pub drawn: usize,
+    /// Predictions, `None` when the model was not run on it.
+    pub predictions: Option<usize>,
+    /// Image date (seconds since epoch).
+    pub date: Option<f64>,
 }
 
 /// Outcome of a user action, for the status line.
@@ -74,6 +90,7 @@ impl Workspace {
             frame: Default::default(),
             uniformity,
             image_dates: None,
+            frame_order: None,
         };
         ws.rebuild();
         Ok(ws)
@@ -100,7 +117,7 @@ impl Workspace {
             self.opts.sort = crops::SortKey::Id;
         }
         if self.opts.sort == crops::SortKey::ImageDate && self.image_dates.is_none() {
-            self.image_dates = Some(file_dates(&p.dataset));
+            self.image_dates = Some(image_dates(&p.dataset));
         }
         let moved = !p.log.state().splits.is_empty();
         let splits: Option<Vec<_>> =
@@ -318,6 +335,7 @@ impl Workspace {
                 PredMark::Accept => c.good += 1,
             }
         }
+        c.good += st.confirmed_frames.len();
         c.other = st.added.len() + st.boxes.len() + st.categories.len() + st.tags.len();
         c
     }
@@ -350,6 +368,9 @@ impl Workspace {
         let st = self.project.log.state();
         if st.is_frame_deleted(image_id) {
             return ops;
+        }
+        if st.confirmed_frames.contains(&image_id) {
+            ops.push(Op::ConfirmFrame { image: image_id });
         }
         let ds = &self.project.dataset;
         if let Some(idx) = ds.image_idx(image_id) {
@@ -596,6 +617,83 @@ impl Workspace {
         Ok(())
     }
 
+    /// Registers copied images as new frames, gives them `split` (pending,
+    /// one undo step) and rebuilds. Returns how many frames were added.
+    pub fn register_added(
+        &mut self,
+        copied: &[fastlabel_core::add::Copied],
+        split: Option<Split>,
+    ) -> Result<usize, String> {
+        let ids = self.project.register_added(copied).map_err(|e| e.to_string())?;
+        if let Some(split) = split {
+            let ds = &self.project.dataset;
+            let assign: Vec<(usize, Split)> =
+                ids.iter().filter_map(|id| ds.image_idx(*id)).map(|i| (i, split)).collect();
+            self.assign_splits(&assign)?;
+        }
+        self.image_dates = None;
+        self.rebuild();
+        Ok(ids.len())
+    }
+
+    /// To do: frames without GT boxes that are not confirmed as background
+    /// (saved), matching the split filter, newest first (image date).
+    /// Frames being handled (boxes drawn, G or F pending) stay listed until
+    /// the save.
+    pub fn todo_frames(&mut self) -> Vec<usize> {
+        if self.image_dates.is_none() {
+            self.image_dates = Some(image_dates(&self.project.dataset));
+        }
+        let ds = &self.project.dataset;
+        let dates = self.image_dates.as_deref().unwrap_or(&[]);
+        let review = &self.project.review;
+        let mut frames: Vec<usize> = (0..ds.images().len())
+            .filter(|&i| ds.annotations_of(i).next().is_none())
+            .filter(|&i| !review.empty_frames.contains(&ds.images()[i].id))
+            .filter(|&i| self.opts.split.matches(self.split_of(i)))
+            .collect();
+        let date = |i: usize| dates.get(i).copied().flatten().unwrap_or(f64::MIN);
+        frames.sort_by(|&a, &b| date(b).total_cmp(&date(a)).then(a.cmp(&b)));
+        frames
+    }
+
+    /// State of a to-do frame, for its tile.
+    pub fn todo_tile(&self, image_idx: usize) -> TodoTile {
+        let ds = &self.project.dataset;
+        let id = ds.images()[image_idx].id;
+        let st = self.project.log.state();
+        TodoTile {
+            confirmed: st.confirmed_frames.contains(&id),
+            deleted: st.is_frame_deleted(id),
+            drawn: st.added.values().filter(|b| b.image == id).count(),
+            predictions: self
+                .project
+                .predictions
+                .as_ref()
+                .and_then(|p| p.of(image_idx))
+                .map(<[_]>::len),
+            date: self.image_dates.as_deref().and_then(|d| d.get(image_idx).copied().flatten()),
+        }
+    }
+
+    /// G on a to-do frame: toggles "background" (nothing to annotate); a
+    /// frame marked F is kept, in the same undo step.
+    pub fn toggle_confirm_frame(&mut self, image_idx: usize) -> ActionResult {
+        let id = self.project.dataset.images()[image_idx].id;
+        let mut ops = vec![Op::ConfirmFrame { image: id }];
+        if self.project.log.state().is_frame_deleted(id) {
+            ops.insert(0, Op::FrameDelete { image: id });
+        }
+        self.record_all(ops)
+    }
+
+    /// F on one frame (clears its other marks, like in the mosaic).
+    pub fn toggle_frame_delete_idx(&mut self, image_idx: usize) -> ActionResult {
+        let id = self.project.dataset.images()[image_idx].id;
+        let ops = self.frame_delete_ops(id);
+        self.record_all(ops)
+    }
+
     /// Saves a new version and rebuilds the view.
     pub fn save(&mut self) -> anyhow::Result<Option<SaveReport>> {
         let ds = &self.project.dataset;
@@ -616,12 +714,18 @@ impl Workspace {
     }
 }
 
-/// File date of each image: creation time when the filesystem records it
-/// (a copied file gets a new one), else modification time.
-fn file_dates(ds: &fastlabel_core::Dataset) -> Vec<Option<f64>> {
+/// Date of each image: its `date_added` field (set by Add; survives copies),
+/// else the file's creation time when the filesystem records it (a copied
+/// file gets a new one), else its modification time.
+pub(crate) fn image_dates(ds: &fastlabel_core::Dataset) -> Vec<Option<f64>> {
+    use fastlabel_core::add::DATE_FIELD;
     ds.images()
         .iter()
         .map(|img| {
+            let field = img.extra.get(DATE_FIELD).and_then(|v| v.as_str());
+            if let Some(t) = field.and_then(fastlabel_core::dates::parse_iso) {
+                return Some(t as f64);
+            }
             let meta = std::fs::metadata(ds.image_path(img)).ok()?;
             let t = meta.created().or_else(|_| meta.modified()).ok()?;
             Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64())
@@ -765,7 +869,7 @@ mod tests {
     #[test]
     fn split_moves_filter_undo_and_save() {
         let (dir, mut ws) = open_fixture(2); // image 1 train (#1 #2 P150), image 2 val (#3)
-        ws.opts.split = Some(Split::Val);
+        ws.opts.split = crops::SplitFilter::Only(Split::Val);
         ws.rebuild();
         assert_eq!(ws.crops.len(), 1);
         ws.move_to_split(&[0, 1], Split::Val).unwrap();
@@ -783,6 +887,68 @@ mod tests {
         assert!(dir.path().join("images/train/a.jpg").exists(), "files stay where they are");
         assert_eq!(ws.project.dataset.split_of(0), Some(Split::Val));
         assert_eq!(ws.crops.len(), 4);
+    }
+
+    #[test]
+    fn added_images_become_frames_with_the_chosen_split() {
+        let (dir, mut ws) = open_fixture(2);
+        let src = dir.path().join("incoming.png");
+        let img = image::RgbImage::from_pixel(40, 30, image::Rgb([1, 2, 3]));
+        img.save(&src).unwrap();
+        let sources = fastlabel_core::add::collect(std::slice::from_ref(&src));
+        let r = fastlabel_core::add::copy_sources(dir.path(), &sources, |_, _| true);
+        assert_eq!(ws.register_added(&r.copied, Some(Split::Val)).unwrap(), 1);
+        let idx = ws.project.dataset.images().len() - 1;
+        assert_eq!(ws.split_of(idx), Some(Split::Val), "pending split");
+        assert_eq!(ws.project.dataset.split_of(idx), None, "no split folder in its path");
+        assert!(ws.project.has_unsaved_changes());
+        ws.undo().unwrap(); // the split, not the add
+        assert_eq!(ws.split_of(idx), None);
+        assert_eq!(ws.project.dataset.images().len(), 3);
+        assert_eq!(ws.register_added(&r.copied, None).unwrap(), 0, "already registered");
+    }
+
+    #[test]
+    fn todo_lists_unannotated_frames_newest_first_until_saved() {
+        let (dir, mut ws) = open_fixture(2); // both fixture frames have boxes
+        assert!(ws.todo_frames().is_empty());
+        for (name, date) in
+            [("old.png", "2020-01-01T00:00:00Z"), ("new.png", "2026-01-01T00:00:00Z")]
+        {
+            let src = dir.path().join(name);
+            let px = if name == "old.png" { 1 } else { 2 };
+            image::RgbImage::from_pixel(8, 8, image::Rgb([px, 0, 0])).save(&src).unwrap();
+            let r = fastlabel_core::add::copy_sources(
+                dir.path(),
+                &fastlabel_core::add::collect(std::slice::from_ref(&src)),
+                |_, _| true,
+            );
+            ws.register_added(&r.copied, None).unwrap();
+            let last = ws.project.dataset.images().len() - 1;
+            let mut coco = ws.project.dataset.coco.clone();
+            coco.images[last].extra.insert(fastlabel_core::add::DATE_FIELD.into(), date.into());
+            ws.project.dataset =
+                fastlabel_core::Dataset::new(dir.path().into(), coco, dir.path()).unwrap().0;
+        }
+        ws.image_dates = None;
+        assert_eq!(ws.todo_frames(), vec![3, 2], "newest first");
+        ws.opts.split = crops::SplitFilter::NoSplit;
+        assert_eq!(ws.todo_frames().len(), 2);
+        ws.opts.split = crops::SplitFilter::Only(Split::Train);
+        assert!(ws.todo_frames().is_empty());
+        ws.opts.split = crops::SplitFilter::All;
+
+        ws.toggle_frame_delete_idx(3).unwrap();
+        ws.toggle_confirm_frame(3).unwrap(); // G keeps the frame
+        let t = ws.todo_tile(3);
+        assert!(t.confirmed && !t.deleted);
+        ws.undo().unwrap();
+        assert!(ws.todo_tile(3).deleted && !ws.todo_tile(3).confirmed, "one undo step");
+        ws.toggle_confirm_frame(3).unwrap();
+        ws.toggle_frame_delete_idx(2).unwrap();
+        ws.save().unwrap().unwrap();
+        assert!(ws.project.review.empty_frames.contains(&4));
+        assert!(ws.todo_frames().is_empty(), "background confirmed, other frame deleted");
     }
 
     #[test]

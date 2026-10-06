@@ -179,7 +179,7 @@ impl ClusterView {
             .iter()
             .enumerate()
             .filter_map(|(i, p)| p.map(|(pos, l)| (i, pos, l)))
-            .filter(|(i, ..)| ws.opts.split.is_none() || ws.split_of(*i) == ws.opts.split)
+            .filter(|(i, ..)| ws.opts.split.matches(ws.split_of(*i)))
             .collect()
     }
 

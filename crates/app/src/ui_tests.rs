@@ -833,3 +833,88 @@ fn real_clusters() {
     h.run_steps(3);
     save_shot(&mut h, "real_clusters_clusters.png");
 }
+
+#[test]
+fn todo_tab_lists_added_frames_and_confirms_background() {
+    use crate::app::Mode;
+    let tmp = tempfile::tempdir().unwrap();
+    synthetic_dataset(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+    // Two new frames, no boxes.
+    let incoming = tmp.path().join("incoming");
+    std::fs::create_dir_all(&incoming).unwrap();
+    for (i, name) in ["a.jpg", "b.jpg"].iter().enumerate() {
+        let img = image::RgbImage::from_pixel(320, 240, image::Rgb([50 * i as u8, 90, 140]));
+        std::fs::write(incoming.join(name), encode_jpeg(&img, 90).unwrap()).unwrap();
+    }
+    let r = fastlabel_core::add::copy_sources(
+        tmp.path(),
+        &fastlabel_core::add::collect(std::slice::from_ref(&incoming)),
+        |_, _| true,
+    );
+    h.state_mut().ws_mut().register_added(&r.copied, None).unwrap();
+
+    h.key_press(Key::T);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Todo);
+    assert_eq!(h.state().todo.frames.len(), 2);
+    settle(&mut h);
+    save_shot(&mut h, "30_todo.png");
+
+    let (first, second) = (h.state().todo.frames[0], h.state().todo.frames[1]);
+    h.key_press(Key::G); // background from the grid, advance
+    h.run_steps(2);
+    assert!(h.state().ws().todo_tile(first).confirmed);
+    assert_eq!(h.state().todo.selected, 1);
+    h.key_press(Key::U); // undo it
+    h.key_press(Key::Home);
+    h.run_steps(2);
+    assert!(!h.state().ws().todo_tile(first).confirmed);
+    h.run_steps(2);
+
+    // Enter: frame mode through the to-do frames only.
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Frame);
+    assert_eq!(h.state().ws().frame.image_idx, first);
+    h.key_press(Key::L);
+    h.run_steps(2);
+    assert_eq!(h.state().ws().frame.image_idx, second, "next to-do frame, not the next image");
+    // Right click on the frame: next to-do frame too.
+    h.key_press(Key::H);
+    h.run_steps(2);
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: egui::pos2(500.0, 400.0),
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+    assert_eq!(h.state().ws().frame.image_idx, second, "right click: next frame");
+    h.key_press(Key::H);
+    h.run_steps(2);
+    h.key_press(Key::G); // no box selected, empty frame: background, then next
+    h.run_steps(2);
+    assert!(h.state().ws().todo_tile(first).confirmed);
+    assert_eq!(h.state().ws().frame.image_idx, second);
+    settle(&mut h);
+    save_shot(&mut h, "31_todo_frame.png");
+    h.key_press(Key::Tab); // back to the grid, on the frame reached
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Todo);
+    assert_eq!(h.state().todo.selected, 1);
+    assert!(h.state().ws().frame_order.is_none());
+
+    h.key_press(Key::S);
+    h.run_steps(2);
+    assert_eq!(h.state().todo.frames.len(), 1, "the background frame is done");
+    let id = h.state().ws().project.dataset.images()[first].id;
+    assert!(h.state().ws().project.review.empty_frames.contains(&id));
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().mode, Mode::Mosaic);
+}

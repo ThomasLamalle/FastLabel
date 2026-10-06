@@ -114,6 +114,8 @@ pub enum EditorAction {
     Select(Option<Sel>),
     SetBox(AnnId, BBox),
     AddBox(BBox),
+    /// Right click: go to the next frame.
+    Next,
 }
 
 pub struct FrameData<'a> {
@@ -203,6 +205,9 @@ impl EditorView {
         let xf = self.xform(rect, data.img_w, data.img_h);
         if data.interactive {
             self.handle_pointer(ui, &resp, &xf, data, &mut actions);
+            if resp.secondary_clicked() {
+                actions.push(EditorAction::Next);
+            }
         }
 
         let img_rect = xf.rect(&BBox::new(0.0, 0.0, data.img_w, data.img_h));

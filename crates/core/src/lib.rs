@@ -1,9 +1,11 @@
 //! FastLabel core: dataset model, versioning, predictions, matching and
 //! pending edits. Pure logic and file I/O; no GUI, no threads.
 
+pub mod add;
 pub mod coco;
 pub mod commit;
 pub mod dataset;
+pub mod dates;
 pub mod edits;
 pub mod error;
 pub mod export;

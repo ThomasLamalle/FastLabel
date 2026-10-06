@@ -29,7 +29,7 @@ This file is the source of truth. The functional spec of the previous Python too
   - `cache/`: thumbnail cache.
   - `trash/`: deleted frames.
 - **Frame deletion moves images to `.fastlabel/trash/vNNN/<original path>`**, never a hard delete. Metadata is always written (atomically) before any image is moved.
-- **Adding images**: copy them anywhere under `images/` (e.g. `images/train/`). On open, images not referenced by the annotation file are added (no annotations yet) and recorded by the next save. Run the model on them with *Model → Run on frames without predictions*, then review their predictions in the mosaic, sorted by image date.
+- **Adding images**: *Add → Images… / Folders…* copies them into `images/` under a unique content-hash name (`images/<first 16 hex of SHA-256>.<ext>`); the original path is kept in the image's `source_name` field. An image whose content is already in the dataset is skipped (reported). Copying runs in the background (progress, cancel); the new frames appear at once, optionally with a split (*Split of the added frames*, pending like any split change), and are recorded by the next save (crash-safe: source names in `.fastlabel/sources.json`, ids in the journal header). Each added image gets a `date_added` field (ISO 8601 UTC), which the image date sort uses (file dates do not survive copies). Annotate them in the **To do** tab, or run the model on them with *Model → Run on frames without predictions* and review the predictions in the mosaic, sorted by image date. Images copied by hand anywhere under `images/` are still picked up on open.
 - **Export** (*Export…*, or `fastlabel --export OUT --format yolo|coco|coco1|ndjson <dataset>`): pending edits are saved first, then the dataset is written laid out by split, to a zip or to a new folder (images hardlinked, so it is instant and takes no space; a cancelled or failed export leaves nothing):
   - **YOLO** (Ultralytics, YOLO26): `data.yaml`, `images/<split>/`, `labels/<split>/*.txt` (normalized, clipped to the image; empty file for frames without boxes).
   - **COCO per split** (Roboflow layout, RF-DETR): `train/`, `valid/`, `test/`, each with `_annotations.coco.json` next to its images.
@@ -86,7 +86,7 @@ Others:
 - by IoU with prediction
 - by prediction confidence
 - by color uniformity: grayscale standard deviation inside the bbox. Ascending surfaces suspiciously uniform crops (blank/occluded), descending surfaces very busy crops. Computed in the background and cached.
-- by image date: file creation time (a copied file gets a new one; falls back to modification time), newest first, to review recently added images.
+- by image date: the image's `date_added` field, else the file creation time (falls back to modification time), newest first, to review recently added images.
 
 ### Filters
 
@@ -94,14 +94,14 @@ Similar to sorting, toggle buttons allow to:
 - display only FP: predictions overlapping no GT box (IoU 0 with all of them)
 - display only FN: GT boxes overlapping no prediction
 - hide reviewed crops
-- filter by split
+- filter by split (All / train / val / test / no split)
 
 No thresholds to tune. Each GT box is paired with its best-overlapping prediction (any overlap); the pair is shown in one crop with its IoU, and loose boxes are found with the IoU ascending sort. An unpaired prediction overlapping an already paired GT (a duplicate) is labelled "extra".
 
 
 ## Frame mode
 
-- Navigate frame by frame (h/l, arrows; Ctrl to jump to the next annotated frame).
+- Navigate frame by frame (h/l, arrows; Ctrl to jump to the next annotated frame; right click on the frame: next frame).
 - Draw new boxes, select, move, resize with 8 handles (corners + edges), delete with D.
 - Zoom (wheel) and pan (middle-drag / Space-drag).
 - Change the category of the selected box with keys 1–9.
@@ -127,6 +127,16 @@ Double annotations: GT boxes of the same category that overlap each other (IoU >
 - Boxes stay editable (move, resize, draw) before deciding.
 - F: delete the frame, next group. Right / Left: next / previous group. Esc (or M / Tab / Q): back to the mosaic.
 - Decisions are pending edits like any other (undo with U, applied on save). After a save the remaining groups are rescanned; resolved groups (deleted boxes, all boxes kept or reviewed) do not come back.
+
+## To do tab
+
+Toolbar *To do* or `T` in the mosaic: frames without any GT box (typically just added) that are not confirmed as background, as whole-frame tiles, newest first (image date), with their source name, split, date and whether the model was run on them. The split filter applies (*no split* finds frames added without a split).
+
+- Enter / E / double click: frame mode restricted to the to-do frames (*To do only* in its header, on by default): h / l, arrows and right click go to the next / previous to-do frame in the same order, with the full editor (draw, zoom, categories, tags, run the model on the frame). G with no box selected marks the frame as background and moves on; F deletes it and moves on. Tab (or Esc with no box selected) goes back to the grid, on the frame reached. The tile of a frame with new boxes shows "boxes drawn".
+- G: background, nothing to annotate (toggle; persisted in `review.json`, so the frame leaves the list for good). In frame mode, G with no box selected does the same on any frame without boxes.
+- F: delete the frame (toggle). G and F advance to the next undecided frame; both are pending until saved, U undoes.
+- Arrows / hjkl, PageUp / PageDown, Home / End: move. Esc, T, M or Tab: back to the mosaic.
+- After a save, frames with boxes or confirmed as background leave the list.
 
 ## Cluster mode: managing the splits
 

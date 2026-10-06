@@ -179,6 +179,16 @@ impl Workspace {
     /// Previous / next frame (`dir` = ±1), optionally only frames with GT.
     /// Stops at the ends (returns `None`).
     pub fn step_frame(&self, dir: isize, annotated_only: bool) -> Option<usize> {
+        if let Some(order) = &self.frame_order {
+            // Restricted to a list (To do): its order, wherever the frame is.
+            let pos = order.iter().position(|&i| i == self.frame.image_idx);
+            let next = match pos {
+                Some(p) => p as isize + dir,
+                None if dir > 0 => 0,
+                None => order.len() as isize - 1,
+            };
+            return usize::try_from(next).ok().and_then(|n| order.get(n).copied());
+        }
         let n = self.project.dataset.images().len() as isize;
         let mut i = self.frame.image_idx as isize + dir;
         while (0..n).contains(&i) {
@@ -188,6 +198,24 @@ impl Workspace {
             i += dir;
         }
         None
+    }
+
+    /// First / last frame (of the restricted list when there is one).
+    pub fn edge_frame(&self, last: bool) -> Option<usize> {
+        match &self.frame_order {
+            Some(order) if last => order.last().copied(),
+            Some(order) => order.first().copied(),
+            None if last => self.project.dataset.images().len().checked_sub(1),
+            None => (!self.project.dataset.images().is_empty()).then_some(0),
+        }
+    }
+
+    /// True when the frame has no GT box, saved or drawn.
+    pub fn frame_is_empty(&self, image_idx: usize) -> bool {
+        let ds = &self.project.dataset;
+        let id = ds.images()[image_idx].id;
+        ds.annotations_of(image_idx).next().is_none()
+            && !self.project.log.state().added.values().any(|b| b.image == id)
     }
 
     pub fn go_to_frame(&mut self, image_idx: usize) {

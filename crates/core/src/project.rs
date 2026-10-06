@@ -95,7 +95,20 @@ impl Project {
                     .filter(|r| r.base == v.file_name())
                     .map(|r| r.added_images)
                     .unwrap_or_default();
-                add_untracked_images(dir, &mut coco, &hint, &mut warnings)
+                let sources =
+                    crate::add::read_sources(&dir.join(STATE_DIR).join(crate::add::SOURCES_FILE));
+                let added = add_untracked_images(dir, &mut coco, &hint, &mut warnings);
+                for img in &mut coco.images {
+                    if let Some(p) = sources.get(&img.file_name) {
+                        img.extra
+                            .insert(crate::add::SOURCE_FIELD.into(), p.source_name.clone().into());
+                        if !p.date_added.is_empty() {
+                            img.extra
+                                .insert(crate::add::DATE_FIELD.into(), p.date_added.clone().into());
+                        }
+                    }
+                }
+                added
             }
             None => Vec::new(),
         };
@@ -271,9 +284,10 @@ impl Project {
         self.added_images.clear();
         self.log = EditLog::new(self.dataset.coco.next_annotation_id());
         self.journal = None;
-        let jp = self.journal_path();
-        if jp.exists() {
-            fs::remove_file(&jp).map_err(|e| Error::io(&jp, e))?;
+        for f in [self.journal_path(), state_dir.join(crate::add::SOURCES_FILE)] {
+            if f.exists() {
+                fs::remove_file(&f).map_err(|e| Error::io(&f, e))?;
+            }
         }
 
         if let Some(file) = &mut self.prediction_file {
@@ -285,6 +299,57 @@ impl Project {
             self.predictions = Some(Predictions::from_file(file, &self.dataset));
         }
         Ok(Some(SaveReport { path, summary: applied.summary, trash }))
+    }
+
+    /// Registers images copied into `images/` (see [`crate::add`]) as new
+    /// frames, with their source names; saved with the next version. Returns
+    /// their ids. Crash-safe: the source names go to `.fastlabel/sources.json`
+    /// and the ids to the journal header, so a replay finds the same frames.
+    pub fn register_added(&mut self, copied: &[crate::add::Copied]) -> Result<Vec<ImageId>> {
+        let mut coco = self.dataset.coco.clone();
+        let first = coco.images.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+        let tracked: HashSet<String> = coco.images.iter().map(|i| i.file_name.clone()).collect();
+        let mut ids = Vec::new();
+        let now = crate::dates::iso(crate::dates::now());
+        let new = copied.iter().filter(|c| !tracked.contains(&c.file_name));
+        for (next, c) in (first..).zip(new) {
+            let path = self.dir.join(&c.file_name);
+            let size = imagesize::size(&path).map_err(|e| Error::invalid(&path, e.to_string()))?;
+            let mut extra = serde_json::Map::new();
+            extra.insert(crate::add::SOURCE_FIELD.into(), c.source_name.clone().into());
+            extra.insert(crate::add::DATE_FIELD.into(), now.clone().into());
+            coco.images.push(crate::coco::CocoImage {
+                id: next,
+                file_name: c.file_name.clone(),
+                width: size.width as u32,
+                height: size.height as u32,
+                tags: Vec::new(),
+                extra,
+            });
+            self.added_images.push((next, c.file_name.clone()));
+            ids.push(next);
+        }
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        let sources_path = self.state_dir().join(crate::add::SOURCES_FILE);
+        let mut sources = crate::add::read_sources(&sources_path);
+        sources.extend(copied.iter().map(|c| {
+            let p =
+                crate::add::Pending { source_name: c.source_name.clone(), date_added: now.clone() };
+            (c.file_name.clone(), p)
+        }));
+        crate::add::write_sources(&sources_path, &sources)?;
+        let jp = self.journal_path();
+        if self.journal.is_some() || jp.exists() {
+            self.journal = Some(journal::rewrite(&jp, &self.base_name(), &self.added_images)?);
+        }
+        let source = self.source.as_ref().map_or_else(|| self.dir.clone(), |v| v.path.clone());
+        self.dataset = Dataset::new(self.dir.clone(), coco, &source)?.0;
+        if let Some(file) = &self.prediction_file {
+            self.predictions = Some(Predictions::from_file(file, &self.dataset));
+        }
+        Ok(ids)
     }
 
     /// Replaces all predictions and writes `predictions.json`.
@@ -556,6 +621,43 @@ mod tests {
         assert!(dir.join("images/train/0002.jpg").exists(), "never trashed");
         assert!(!dir.join(STATE_DIR).join(MOVES_FILE).exists());
         assert_eq!(p.dataset.images().len(), 1);
+    }
+
+    #[test]
+    fn added_images_survive_a_crash_and_are_saved_with_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        write_dataset(dir);
+        let incoming = dir.join("incoming");
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("x.png"), crate::yolo::tests::png_header(30, 20)).unwrap();
+        let mut p = Project::open(dir).unwrap();
+        p.record(Op::FrameDelete { image: 1 }).unwrap(); // journal exists before the add
+        let r = crate::add::copy_sources(
+            dir,
+            &crate::add::collect(std::slice::from_ref(&incoming)),
+            |_, _| true,
+        );
+        let ids = p.register_added(&r.copied).unwrap();
+        assert_eq!(ids, vec![3]);
+        assert_eq!(p.dataset.image(3).unwrap().width, 30);
+        p.record(Op::SetSplit { image: 3, split: Some(crate::Split::Val) }).unwrap();
+        drop(p); // crash
+
+        let mut p = Project::open(dir).unwrap();
+        let img = p.dataset.image(3).expect("same id after replay");
+        assert_eq!(img.extra[crate::add::SOURCE_FIELD], "incoming/x.png");
+        let added = crate::dates::parse_iso(img.extra[crate::add::DATE_FIELD].as_str().unwrap());
+        assert!(added.is_some_and(|t| (crate::dates::now() - t).abs() < 60));
+        assert_eq!(p.log.state().splits.get(&3), Some(&crate::Split::Val));
+        assert!(p.log.state().is_frame_deleted(1));
+        p.save().unwrap().unwrap();
+        assert!(!dir.join(STATE_DIR).join(crate::add::SOURCES_FILE).exists());
+        let p = Project::open(dir).unwrap();
+        let img = p.dataset.image(3).unwrap();
+        assert_eq!(img.extra[crate::add::SOURCE_FIELD], "incoming/x.png");
+        assert_eq!(p.dataset.split_of(p.dataset.image_idx(3).unwrap()), Some(crate::Split::Val));
+        assert!(img.file_name.starts_with("images/") && img.file_name.len() == 27);
     }
 
     #[test]

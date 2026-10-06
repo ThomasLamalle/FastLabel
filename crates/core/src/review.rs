@@ -28,6 +28,9 @@ pub struct RejectedPred {
 pub struct ReviewState {
     pub reviewed: BTreeSet<AnnId>,
     pub rejected: Vec<RejectedPred>,
+    /// Frames confirmed to have nothing to annotate (background frames).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub empty_frames: BTreeSet<ImageId>,
     #[serde(skip)]
     rejected_by_image: HashMap<ImageId, Vec<usize>>,
 }
@@ -85,6 +88,7 @@ impl ReviewState {
     ) {
         self.reviewed.retain(|&a| keep_ann(a));
         self.rejected.retain(|r| keep_image(r.image_id));
+        self.empty_frames.retain(|&i| keep_image(i));
         self.reindex();
     }
 }
