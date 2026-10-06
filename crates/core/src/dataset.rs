@@ -8,6 +8,10 @@ use crate::coco::{
 };
 use crate::error::{Error, Result};
 
+/// Image field holding the split (`"train"`, `"val"`, `"test"`). The split
+/// is data, independent of where the file is; exports lay files out by split.
+pub const SPLIT_FIELD: &str = "split";
+
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -20,17 +24,32 @@ pub enum Split {
 impl Split {
     pub const ALL: [Split; 3] = [Split::Train, Split::Val, Split::Test];
 
+    /// `train`, `val` / `valid` / `validation` or `test`, any case.
+    pub fn parse(name: &str) -> Option<Split> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "train" => Some(Split::Train),
+            "val" | "valid" | "validation" => Some(Split::Val),
+            "test" => Some(Split::Test),
+            _ => None,
+        }
+    }
+
     /// Split from any path component named train / val / valid / test.
     pub fn from_path(file_name: &str) -> Option<Split> {
         Path::new(file_name).components().rev().skip(1).find_map(|c| match c {
-            Component::Normal(s) => match s.to_str()?.to_ascii_lowercase().as_str() {
-                "train" => Some(Split::Train),
-                "val" | "valid" | "validation" => Some(Split::Val),
-                "test" => Some(Split::Test),
-                _ => None,
-            },
+            Component::Normal(s) => Split::parse(s.to_str()?),
             _ => None,
         })
+    }
+
+    /// Split of an image: its `split` field, else its path (older files).
+    pub fn of_image(image: &CocoImage) -> Option<Split> {
+        image
+            .extra
+            .get(SPLIT_FIELD)
+            .and_then(|v| v.as_str())
+            .and_then(Split::parse)
+            .or_else(|| Split::from_path(&image.file_name))
     }
 
     pub fn name(self) -> &'static str {
@@ -38,28 +57,6 @@ impl Split {
             Split::Train => "train",
             Split::Val => "val",
             Split::Test => "test",
-        }
-    }
-
-    /// `file_name` moved to the split folder `dir` (e.g. `valid`): the path
-    /// component naming a split is replaced, or `dir` is inserted after a
-    /// leading `images/`. `None` when the path has neither.
-    pub fn move_path(file_name: &str, dir: &str) -> Option<String> {
-        let parts: Vec<&str> = file_name.split('/').collect();
-        let (last, dirs) = parts.split_last()?;
-        if let Some(i) = dirs.iter().rposition(|c| Split::from_path(&format!("{c}/x")).is_some()) {
-            let mut out: Vec<&str> = parts.clone();
-            out[i] = dir;
-            return Some(out.join("/"));
-        }
-        match dirs {
-            ["images", rest @ ..] => {
-                let mut out = vec!["images", dir];
-                out.extend(rest);
-                out.push(last);
-                Some(out.join("/"))
-            }
-            _ => None,
         }
     }
 }
@@ -120,7 +117,7 @@ impl Dataset {
             };
             anns_by_image[img].push(i);
         }
-        let splits = coco.images.iter().map(|i| Split::from_path(&i.file_name)).collect();
+        let splits = coco.images.iter().map(Split::of_image).collect();
         Ok((Self { root, coco, image_index, ann_index, anns_by_image, splits }, legacy))
     }
 
@@ -159,25 +156,6 @@ impl Dataset {
 
     pub fn split_of(&self, image_idx: usize) -> Option<Split> {
         self.splits[image_idx]
-    }
-
-    /// Folder name the dataset already uses for `split` (`val` or `valid`...),
-    /// else the canonical name.
-    pub fn split_dir(&self, split: Split) -> String {
-        self.coco
-            .images
-            .iter()
-            .zip(&self.splits)
-            .filter(|(_, s)| **s == Some(split))
-            .find_map(|(img, _)| {
-                img.file_name
-                    .split('/')
-                    .rev()
-                    .skip(1)
-                    .find(|c| Split::from_path(&format!("{c}/x")) == Some(split))
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| split.name().to_string())
     }
 
     pub fn image_path(&self, image: &CocoImage) -> PathBuf {
@@ -246,25 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn move_path_replaces_or_inserts_the_split_folder() {
-        let mv = Split::move_path;
-        assert_eq!(mv("images/train/a.jpg", "val").as_deref(), Some("images/val/a.jpg"));
-        assert_eq!(mv("images/valid/x/a.jpg", "test").as_deref(), Some("images/test/x/a.jpg"));
-        assert_eq!(mv("train/images/a.jpg", "valid").as_deref(), Some("valid/images/a.jpg"));
-        assert_eq!(mv("images/x/a.jpg", "val").as_deref(), Some("images/val/x/a.jpg"));
-        assert_eq!(mv("images/train.jpg", "val").as_deref(), Some("images/val/train.jpg"));
-        assert_eq!(mv("other/a.jpg", "val"), None);
-        assert_eq!(mv("a.jpg", "val"), None);
-    }
-
-    #[test]
-    fn split_dir_follows_the_dataset_naming() {
-        let mut coco = test_util::dataset(2, &[]).coco;
-        coco.images[1].file_name = "images/valid/b.jpg".into();
+    fn split_field_wins_over_the_path() {
+        let mut coco = test_util::dataset(3, &[]).coco;
+        coco.images[0].extra.insert(SPLIT_FIELD.into(), "valid".into());
+        coco.images[1].extra.insert(SPLIT_FIELD.into(), "nonsense".into());
+        coco.images[2].file_name = "images/c.jpg".into();
         let ds = Dataset::new(PathBuf::new(), coco, Path::new("x")).unwrap().0;
-        assert_eq!(ds.split_dir(Split::Val), "valid");
-        assert_eq!(ds.split_dir(Split::Train), "train");
-        assert_eq!(ds.split_dir(Split::Test), "test");
+        assert_eq!(ds.split_of(0), Some(Split::Val));
+        assert_eq!(ds.split_of(1), Some(Split::Train), "unknown value: the path decides");
+        assert_eq!(ds.split_of(2), None);
     }
 
     #[test]

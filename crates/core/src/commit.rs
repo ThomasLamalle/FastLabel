@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::coco::{AnnId, CocoAnnotation, CocoFile, ImageId};
-use crate::dataset::{Dataset, Split};
+use crate::dataset::{Dataset, SPLIT_FIELD};
 use crate::edits::{AnnMark, PendingState, PredMark};
 use crate::error::{Error, Result};
 use crate::geom::BBox;
@@ -24,9 +24,6 @@ pub struct Summary {
     pub deleted_frames: usize,
     /// Frames moved to another split.
     pub moved_frames: usize,
-    /// Split moves dropped: no split folder in the path, or the destination
-    /// file already exists.
-    pub moves_skipped: usize,
     /// Edits dropped because the box became invalid (outside the image, < 1 px).
     pub invalid_skipped: usize,
 }
@@ -38,9 +35,6 @@ pub struct Applied {
     /// `file_name`s of deleted frames, to move to the trash once the new
     /// annotation file is safely written.
     pub trashed_files: Vec<String>,
-    /// (old, new) `file_name`s of frames moved to another split, to rename
-    /// once the new annotation file is safely written.
-    pub moved_files: Vec<(String, String)>,
     pub summary: Summary,
 }
 
@@ -49,19 +43,9 @@ pub struct Applied {
 /// Order: geometry/category edits, marks (confirm / replace / delete), drawn
 /// boxes, accepted predictions (an accepted prediction identical to an
 /// existing box keeps that box, even if it was marked for deletion), then
-/// whole-frame deletion, which removes everything on the frame, and split
-/// moves of the remaining frames.
+/// whole-frame deletion, which removes everything on the frame. Every
+/// remaining frame with a known split gets its `split` field.
 pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Applied {
-    apply_checked(ds, pending, review, &|_| false)
-}
-
-/// [`apply`], skipping split moves whose destination `exists` on disk.
-pub fn apply_checked(
-    ds: &Dataset,
-    pending: &PendingState,
-    review: &ReviewState,
-    exists: &dyn Fn(&str) -> bool,
-) -> Applied {
     let mut coco = ds.coco.clone();
     let mut review = review.clone();
     let mut summary = Summary::default();
@@ -185,48 +169,24 @@ pub fn apply_checked(
     coco.annotations.retain(|a| !frames.contains(&a.image_id) && !deleted.contains(&a.id));
     summary.deleted_annotations = before - coco.annotations.len();
 
-    let moved_files = move_splits(ds, &mut coco, pending, exists, &mut summary);
+    write_splits(ds, &mut coco, pending, &mut summary);
 
     let kept: HashSet<AnnId> = coco.annotations.iter().map(|a| a.id).collect();
     review.retain(|a| kept.contains(&a), |i| !frames.contains(&i));
-    Applied { coco, review, trashed_files, moved_files, summary }
+    Applied { coco, review, trashed_files, summary }
 }
 
-/// Rewrites the `file_name` of frames moved to another split. A destination
-/// already used by a frame of the dataset, by another move or by a file on
-/// disk is refused (the frame stays where it is).
-fn move_splits(
-    ds: &Dataset,
-    coco: &mut CocoFile,
-    pending: &PendingState,
-    exists: &dyn Fn(&str) -> bool,
-    summary: &mut Summary,
-) -> Vec<(String, String)> {
-    if pending.splits.is_empty() {
-        return Vec::new();
-    }
-    let dirs: HashMap<Split, String> = Split::ALL.map(|s| (s, ds.split_dir(s))).into();
-    let taken: HashSet<&str> = ds.images().iter().map(|i| i.file_name.as_str()).collect();
-    let mut claimed = HashSet::new();
-    let mut moved = Vec::new();
+/// Writes each frame's split (pending moves included) as its `split` field,
+/// so the annotation file no longer depends on folder names.
+fn write_splits(ds: &Dataset, coco: &mut CocoFile, pending: &PendingState, summary: &mut Summary) {
     for img in &mut coco.images {
-        let Some(&split) = pending.splits.get(&img.id) else { continue };
-        if Split::from_path(&img.file_name) == Some(split) {
-            continue;
-        }
-        match Split::move_path(&img.file_name, &dirs[&split]) {
-            Some(new)
-                if !taken.contains(new.as_str())
-                    && !exists(&new)
-                    && claimed.insert(new.clone()) =>
-            {
-                moved.push((std::mem::replace(&mut img.file_name, new.clone()), new));
-                summary.moved_frames += 1;
-            }
-            _ => summary.moves_skipped += 1,
+        let saved = ds.image_idx(img.id).and_then(|i| ds.split_of(i));
+        let split = pending.splits.get(&img.id).copied().or(saved);
+        summary.moved_frames += usize::from(split != saved);
+        if let Some(s) = split {
+            img.extra.insert(SPLIT_FIELD.into(), s.name().into());
         }
     }
-    moved
 }
 
 fn set_bbox(ann: &mut CocoAnnotation, b: BBox) {
@@ -277,29 +237,6 @@ pub fn move_to_trash(
     report
 }
 
-/// Renames split-moved frames (`file_name` pairs relative to `root`). A
-/// source already gone was moved before (recovery after a crash).
-pub fn move_split_files(root: &Path, moves: &[(String, String)], report: &mut TrashReport) {
-    for (from, to) in moves {
-        let (src, dst) = (root.join(from), root.join(to));
-        let safe = [from, to]
-            .iter()
-            .all(|p| Path::new(p).components().all(|c| matches!(c, Component::Normal(_))));
-        if !safe {
-            report.failed.push((src, "path is outside the dataset folder".into()));
-        } else if !src.exists() {
-            continue;
-        } else if dst.exists() {
-            report.failed.push((src, format!("{} already exists", dst.display())));
-        } else {
-            match move_file(&src, &dst) {
-                Ok(()) => report.moved.push(dst),
-                Err(e) => report.failed.push((src, e.to_string())),
-            }
-        }
-    }
-}
-
 fn move_file(src: &Path, dst: &Path) -> Result<()> {
     if let Some(dir) = dst.parent() {
         fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
@@ -315,6 +252,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::Split;
     use crate::dataset::test_util::dataset;
     use crate::edits::{EditLog, Op};
     use crate::predictions::PredRef;
@@ -383,7 +321,6 @@ mod tests {
                 rejected: 1,
                 deleted_frames: 1,
                 moved_frames: 0,
-                moves_skipped: 0,
                 invalid_skipped: 0
             }
         );
@@ -403,74 +340,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_pending_state_is_identity() {
+    fn empty_pending_state_only_records_splits() {
         let ds = dataset(2, &[(1, b(0.0)), (2, b(5.0))]);
-        let out = apply(&ds, &PendingState::default(), &ReviewState::default());
+        let mut out = apply(&ds, &PendingState::default(), &ReviewState::default());
+        for img in &mut out.coco.images {
+            assert_eq!(img.extra.remove(SPLIT_FIELD), Some("train".into()));
+        }
         assert_eq!(out.coco, ds.coco);
+        assert_eq!(out.summary, Summary::default());
         assert!(out.trashed_files.is_empty());
     }
 
     #[test]
-    fn split_moves_rewrite_paths_and_refuse_collisions() {
-        let mut coco = dataset(4, &[(1, b(0.0))]).coco;
-        coco.images[3].file_name = "images/valid/0002.jpg".into();
+    fn splits_are_written_as_fields_without_touching_paths() {
+        let mut coco = dataset(3, &[(1, b(0.0))]).coco;
+        coco.images[2].file_name = "images/0003.jpg".into(); // no split
         let ds = Dataset::new("/d".into(), coco, Path::new("t")).unwrap().0;
         let mut log = EditLog::new(10);
         log.push(Op::SetSplit { image: 1, split: Some(Split::Test) });
-        log.push(Op::SetSplit { image: 2, split: Some(Split::Val) }); // valid/0002 is taken
         log.push(Op::SetSplit { image: 3, split: Some(Split::Val) });
-        log.push(Op::SetSplit { image: 4, split: Some(Split::Val) }); // already there
-        let out = apply_checked(&ds, log.state(), &ReviewState::default(), &|n| {
-            n == "images/test/0001.jpg"
-        });
-        assert_eq!(
-            out.moved_files,
-            vec![("images/train/0003.jpg".into(), "images/valid/0003.jpg".into())]
-        );
-        let names: Vec<_> = out.coco.images.iter().map(|i| i.file_name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "images/train/0001.jpg",
-                "images/train/0002.jpg",
-                "images/valid/0003.jpg",
-                "images/valid/0002.jpg"
-            ]
-        );
-        assert_eq!((out.summary.moved_frames, out.summary.moves_skipped), (1, 2));
-        assert_eq!(out.coco.annotations.len(), 1, "annotations follow their image id");
-
-        // A frame both moved and deleted goes to the trash from where it is.
-        log.push(Op::FrameDelete { image: 3 });
         let out = apply(&ds, log.state(), &ReviewState::default());
-        assert_eq!(out.trashed_files, vec!["images/train/0003.jpg"]);
-        assert!(!out.moved_files.iter().any(|(f, _)| f.ends_with("0003.jpg")));
-    }
-
-    #[test]
-    fn move_split_files_renames_and_tolerates_replays() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir_all(root.join("images/train")).unwrap();
-        fs::write(root.join("images/train/a.jpg"), b"a").unwrap();
-        fs::write(root.join("images/train/b.jpg"), b"b").unwrap();
-        fs::create_dir_all(root.join("images/val")).unwrap();
-        fs::write(root.join("images/val/b.jpg"), b"other").unwrap();
-        let moves = [
-            ("images/train/a.jpg", "images/val/a.jpg"),
-            ("images/train/b.jpg", "images/val/b.jpg"),
-            ("images/train/a.jpg", "../x.jpg"),
-        ]
-        .map(|(a, b)| (a.to_string(), b.to_string()));
-        let mut report = TrashReport::default();
-        move_split_files(root, &moves[..2], &mut report);
-        assert_eq!(report.moved, vec![root.join("images/val/a.jpg")]);
-        assert_eq!(report.failed.len(), 1, "never overwrites");
-        assert_eq!(fs::read(root.join("images/val/b.jpg")).unwrap(), b"other");
-        let mut again = TrashReport::default();
-        move_split_files(root, &moves, &mut again);
-        assert!(again.moved.is_empty());
-        assert_eq!(again.failed.len(), 2, "b still blocked, unsafe path refused");
+        let fields: Vec<_> =
+            out.coco.images.iter().map(|i| i.extra[SPLIT_FIELD].as_str().unwrap()).collect();
+        assert_eq!(fields, ["test", "train", "val"]);
+        let names: Vec<_> = out.coco.images.iter().map(|i| i.file_name.as_str()).collect();
+        assert_eq!(names, ["images/train/0001.jpg", "images/train/0002.jpg", "images/0003.jpg"]);
+        assert_eq!(out.summary.moved_frames, 2);
+        let again = Dataset::new("/d".into(), out.coco, Path::new("t")).unwrap().0;
+        assert_eq!(again.split_of(0), Some(Split::Test), "the field wins over the path");
     }
 
     #[test]

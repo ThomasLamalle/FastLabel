@@ -19,14 +19,14 @@ Linux / Wayland first (X11 works too). ONNX Runtime is downloaded at build time 
 | File | Role |
 |---|---|
 | `annotations.vNNN.json` | COCO annotations, one new file per save (never overwritten). The newest is opened. Legacy `annotations.draft.json` / `annotations.json` are read too. |
-| `images/{train,val,test}/…` | Images, referenced by `file_name`. The split comes from the path. New files copied here are picked up on open (then *Model → Run on frames without predictions*, sort by *Image date*). |
+| `images/…` | Images, referenced by `file_name`. The split is the image's `split` field (older files: the `train` / `val` / `test` folder in the path). New files copied here are picked up on open (then *Model → Run on frames without predictions*, sort by *Image date*). |
 | `data.yaml` + `labels/` | YOLO layout, imported when there is no annotation file yet (first save writes `annotations.v001.json`). |
 | `predictions.json` | Model predictions (written by the Model menu). |
 | `.fastlabel/` | Tool state: crash journal of unsaved actions, review state (reviewed boxes, rejected predictions), thumbnail cache, uniformity metrics, image embeddings and cluster layout, `trash/` with deleted frames. |
 
 Keyboard troubleshooting: `RUST_LOG=fastlabel=debug ./target/release/fastlabel` logs every key event the app receives.
 
-Nothing changes on disk until you save (`S`). Every action is journaled, so a crash or power cut loses nothing: pending actions are replayed when the dataset is reopened. Deleted frames are moved to `.fastlabel/trash/<version>/`, never deleted. Frames moved to another split are renamed into `images/<split>/` on save (never overwriting a file); a save interrupted between the annotation file and the file moves is finished on the next open.
+Nothing changes on disk until you save (`S`). Every action is journaled, so a crash or power cut loses nothing: pending actions are replayed when the dataset is reopened. Deleted frames are moved to `.fastlabel/trash/<version>/`, never deleted. Changing a split only changes the `split` field; files never move. A save interrupted between the annotation file and the trash moves is finished on the next open.
 
 ## Essential keys
 
@@ -45,6 +45,8 @@ Nothing changes on disk until you save (`S`). Every action is journaled, so a cr
 ```sh
 python scripts/export_dinov2.py dinov2_vits14.onnx   # any Python with torch + onnx; downloads the weights once
 ```
+
+*Export…* writes YOLO (Ultralytics / YOLO26), COCO per split (Roboflow layout, RF-DETR), COCO single file or Ultralytics NDJSON, laid out by split, to a zip or a folder of hardlinks. Headless: `fastlabel --export out.zip --format yolo <dataset>`. In cluster mode, *Auto-split…* assigns whole clusters to train / val / test.
 
 *Report* writes an HTML report (split balance, box distributions per split, model input size guide, per-split model results, near duplicates across splits, clusters × splits) and opens it; in cluster mode it can cover the selection or one cluster. Headless: `fastlabel --report out.html <dataset>`.
 

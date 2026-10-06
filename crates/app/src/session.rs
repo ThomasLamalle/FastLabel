@@ -22,6 +22,8 @@ pub struct Session {
     /// ONNX image embedder for cluster mode.
     pub embed_model_path: Option<PathBuf>,
     pub min_cluster_size: usize,
+    pub export: ExportSettings,
+    pub auto_split: crate::cluster::AutoSplit,
     /// GPU memory budget for crop thumbnails.
     pub texture_budget_mb: usize,
 }
@@ -39,8 +41,27 @@ impl Default for Session {
             confidence: 0.1,
             embed_model_path: None,
             min_cluster_size: 20,
+            export: ExportSettings::default(),
+            auto_split: crate::cluster::AutoSplit::default(),
             texture_budget_mb: 256,
         }
+    }
+}
+
+/// Last choices of the export dialog.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExportSettings {
+    pub format: fastlabel_core::export::ExportFormat,
+    /// Train, val, test included.
+    pub splits: [bool; 3],
+    /// Zip file, else a folder (hardlinked images).
+    pub zip: bool,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self { format: Default::default(), splits: [true; 3], zip: true }
     }
 }
 

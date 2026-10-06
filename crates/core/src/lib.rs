@@ -18,7 +18,7 @@ pub mod versions;
 pub mod yolo;
 
 pub use coco::{AnnId, CategoryId, ImageId};
-pub use dataset::{Dataset, Split};
+pub use dataset::{Dataset, SPLIT_FIELD, Split};
 pub use edits::{AnnMark, EditLog, Op, PendingState, PredMark};
 pub use error::{Error, Result};
 pub use geom::BBox;

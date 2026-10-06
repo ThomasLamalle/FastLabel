@@ -36,6 +36,48 @@ struct Cli {
     /// Write an HTML report on the dataset to this file and exit (no window).
     #[arg(long, value_name = "OUT.html")]
     report: Option<PathBuf>,
+    /// Export the saved dataset and exit: a `.zip` path, else a new folder.
+    #[arg(long, value_name = "OUT")]
+    export: Option<PathBuf>,
+    /// Export format: yolo, coco (per split), coco1 (single file) or ndjson.
+    #[arg(long, default_value = "yolo", requires = "export")]
+    format: String,
+}
+
+/// `--export`: same as the Export dialog (all splits), without the GUI.
+fn write_export(
+    dataset: &std::path::Path,
+    out: &std::path::Path,
+    format: &str,
+) -> anyhow::Result<()> {
+    use fastlabel_core::export::{self, ExportFormat, ExportOptions, Target};
+    let format = ExportFormat::ALL
+        .into_iter()
+        .find(|f| f.slug() == format)
+        .ok_or_else(|| anyhow!("unknown format {format} (yolo, coco, coco1, ndjson)"))?;
+    let project = fastlabel_core::Project::open(dataset)?;
+    if project.has_unsaved_changes() {
+        anyhow::bail!("the dataset has unsaved edits: save them in the app first");
+    }
+    let name = dataset.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let opts = ExportOptions { format, splits: fastlabel_core::Split::ALL.to_vec(), name };
+    let target = if out.extension().is_some_and(|e| e == "zip") {
+        Target::Zip(out.to_path_buf())
+    } else {
+        Target::Folder(out.to_path_buf())
+    };
+    let r = export::export(&project.dir, &project.dataset.coco, &opts, &target, |_, _| true)?;
+    println!(
+        "{}: {} images (train {}, val {}, test {}), {} without split, {} missing",
+        out.display(),
+        r.images(),
+        r.per_split[0],
+        r.per_split[1],
+        r.per_split[2],
+        r.no_split,
+        r.missing.len()
+    );
+    Ok(())
 }
 
 /// `--report`: the same report as the Report button, without the GUI.
@@ -70,6 +112,11 @@ fn main() -> anyhow::Result<()> {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
         return write_report(&dir, out);
+    }
+    if let Some(out) = &cli.export {
+        let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
+        let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
+        return write_export(&dir, out, &cli.format);
     }
     let session_path = Session::default_path();
     let session = session_path.as_deref().map(Session::load).unwrap_or_default();

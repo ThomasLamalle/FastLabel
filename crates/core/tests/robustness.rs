@@ -125,11 +125,12 @@ proptest! {
         // The result is always a valid dataset again, and every new box
         // (drawn or accepted) lies inside its image. Invalid edits of existing
         // boxes are skipped, keeping the original geometry.
-        // Split moves never make two frames share a file.
-        let names: std::collections::HashSet<&str> = out.coco.images.iter().map(|i| i.file_name.as_str()).collect();
-        prop_assert_eq!(names.len(), out.coco.images.len());
-        for (from, to) in &out.moved_files {
-            prop_assert!(from != to && Split::from_path(to).is_some());
+        // Every frame keeps its file and gets its split as a field.
+        for img in &out.coco.images {
+            let base = ds.image(img.id).unwrap();
+            prop_assert_eq!(&img.file_name, &base.file_name);
+            let want = log.state().splits.get(&img.id).copied().or_else(|| Split::from_path(&base.file_name));
+            prop_assert_eq!(Split::of_image(img), want);
         }
         let (again, _) = Dataset::new(PathBuf::from("/d"), out.coco, Path::new("y")).expect("applied dataset is valid");
         for a in again.annotations() {

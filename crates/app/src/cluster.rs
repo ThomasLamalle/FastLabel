@@ -558,6 +558,66 @@ pub fn hdbscan(points: &[[f32; 2]], min_cluster_size: usize) -> Vec<i32> {
     raw.iter().map(|c| c.map_or(-1, |c| rank[&c])).collect()
 }
 
+/// Targets of an automatic split by cluster.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AutoSplit {
+    /// Shares of frames for val and test (train gets the rest).
+    pub val: f64,
+    pub test: f64,
+    /// Largest share of a split's target one group may fill, so val / test
+    /// span several scenes; bigger groups stay in train.
+    pub max_group_share: f64,
+    pub seed: u64,
+}
+
+impl Default for AutoSplit {
+    fn default() -> Self {
+        Self { val: 0.1, test: 0.1, max_group_share: 0.25, seed: 1 }
+    }
+}
+
+/// Assigns whole groups (clusters; noise frames are groups of one) to
+/// splits so near-identical frames never straddle two splits. Groups are
+/// visited in a seeded random order, small ones (fillers) last and largest
+/// first; each goes to val or test when it fits there (at most
+/// `max_group_share` of the split's target, and getting the split closer to
+/// its target), otherwise to train.
+pub fn auto_split(sizes: &[usize], p: &AutoSplit) -> Vec<fastlabel_core::Split> {
+    use fastlabel_core::Split;
+    let total: usize = sizes.iter().sum();
+    let targets = [p.val.clamp(0.0, 1.0) * total as f64, p.test.clamp(0.0, 1.0) * total as f64];
+    let mut counts = [0.0f64; 2];
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    let mut rng = Rng(p.seed);
+    for i in (1..order.len()).rev() {
+        order.swap(i, rng.below(i + 1));
+    }
+    let filler = (p.max_group_share * targets[0].min(targets[1]) / 4.0).max(1.0);
+    order.sort_by_key(|&g| {
+        let small = sizes[g] as f64 <= filler;
+        (small, if small { usize::MAX - sizes[g] } else { 0 })
+    });
+    let mut out = vec![Split::Train; sizes.len()];
+    for g in order {
+        let s = sizes[g] as f64;
+        let best = (0..2)
+            .filter(|&k| {
+                let cap = (p.max_group_share * targets[k]).max(1.0);
+                s <= cap && (targets[k] - (counts[k] + s)).abs() < (targets[k] - counts[k]).abs()
+            })
+            .max_by(|&a, &b| {
+                let need = |k: usize| (targets[k] - counts[k]) / targets[k].max(1.0);
+                need(a).total_cmp(&need(b))
+            });
+        if let Some(k) = best {
+            counts[k] += s;
+            out[g] = [Split::Val, Split::Test][k];
+        }
+    }
+    out
+}
+
 /// Ray casting: is `p` inside the polygon?
 pub fn in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
     let mut inside = false;
@@ -667,6 +727,33 @@ mod tests {
 
         progress.cancel.store(true, Ordering::Relaxed);
         assert!(layout(&refs, 15, 1, &progress).is_none());
+    }
+
+    #[test]
+    fn auto_split_hits_targets_with_whole_groups() {
+        use fastlabel_core::Split;
+        // One huge scene, a few medium ones and many singletons (noise).
+        let mut sizes = vec![500, 40, 35, 30, 30, 25, 20, 20, 15, 10];
+        sizes.extend(std::iter::repeat_n(1, 75));
+        let total: usize = sizes.iter().sum(); // 800
+        let p = AutoSplit::default();
+        let out = auto_split(&sizes, &p);
+        let count = |s: Split| {
+            sizes.iter().zip(&out).filter(|(_, o)| **o == s).map(|(n, _)| n).sum::<usize>()
+        };
+        for s in [Split::Val, Split::Test] {
+            let share = count(s) as f64 / total as f64;
+            assert!((share - 0.1).abs() < 0.02, "{s:?}: {share}");
+        }
+        assert_eq!(out[0], Split::Train, "a group above 25% of the val target stays in train");
+        assert_eq!(auto_split(&sizes, &p), out, "deterministic");
+        assert_ne!(
+            auto_split(&sizes, &AutoSplit { seed: 2, ..p }),
+            out,
+            "another seed, another split"
+        );
+        let none = AutoSplit { val: 0.0, test: 0.0, ..p };
+        assert!(auto_split(&sizes, &none).iter().all(|s| *s == Split::Train));
     }
 
     #[test]

@@ -19,7 +19,7 @@ This file is the source of truth. The functional spec of the previous Python too
 ## Data
 
 - **Format: COCO** (`images`, `annotations`, `categories`). Existing files open unchanged.
-- Image paths encode the split: `images/{train,val,test}/...`.
+- **The split is data**: each image has a `split` field (`train` / `val` / `test`) in the annotation file, so changing a split never moves files and every version records the split. Files without the field (older versions, YOLO imports) take the split from the path (`images/{train,val,test}/...`); the next save writes the field. Images can sit anywhere under `images/`.
 - YOLO/Ultralytics datasets (`data.yaml`, `images/`, `labels/`) can be imported; reviewed data is saved as COCO.
 - **Versioning**: each save writes a new `annotations.vNNN.json` (never overwrites). On open, the most recent of `annotations.vNNN.json` / legacy `annotations.draft.json` is loaded.
 - **Predictions** are stored separately in `predictions.json` (same schema as today: `version`, `model`, `confidence`, `images{id → {file_name, width, height, boxes[{id, category_id, bbox, score}]}}`). Loaded automatically on open.
@@ -30,7 +30,12 @@ This file is the source of truth. The functional spec of the previous Python too
   - `trash/`: deleted frames.
 - **Frame deletion moves images to `.fastlabel/trash/vNNN/<original path>`**, never a hard delete. Metadata is always written (atomically) before any image is moved.
 - **Adding images**: copy them anywhere under `images/` (e.g. `images/train/`). On open, images not referenced by the annotation file are added (no annotations yet) and recorded by the next save. Run the model on them with *Model → Run on frames without predictions*, then review their predictions in the mosaic, sorted by image date.
-- **Export**: one action produces a zip with the current annotation file + `images/` tree (same layout as today's `v19.zip`), ready to import into Ultralytics.
+- **Export** (*Export…*, or `fastlabel --export OUT --format yolo|coco|coco1|ndjson <dataset>`): pending edits are saved first, then the dataset is written laid out by split, to a zip or to a new folder (images hardlinked, so it is instant and takes no space; a cancelled or failed export leaves nothing):
+  - **YOLO** (Ultralytics, YOLO26): `data.yaml`, `images/<split>/`, `labels/<split>/*.txt` (normalized, clipped to the image; empty file for frames without boxes).
+  - **COCO per split** (Roboflow layout, RF-DETR): `train/`, `valid/`, `test/`, each with `_annotations.coco.json` next to its images.
+  - **COCO single file**: `annotations.json` with `split` fields + `images/<split>/`.
+  - **Ultralytics NDJSON**: `<dataset>.ndjson` (local `path`) + `images/<split>/`, readable by Ultralytics' NDJSON converter.
+  - Splits to include are chosen in the dialog; frames without a split are left out and counted. Two frames of a split with the same file name get an `<id>_` prefix.
 
 
 ## Mosaic mode
@@ -132,9 +137,10 @@ Toolbar *Clusters* or `C` in the mosaic. Every frame is a point of a 2D map buil
 - **Display**: points colored by split (pending moves included) or by cluster; frames marked F in dark grey. The global split filter (All/train/val/test) applies to the cloud. Wheel zooms around the cursor, middle drag (or Space + drag) pans, *Fit view* resets. Hovering a point shows the frame, its split and cluster. Counts per split are shown for the visible frames and for the selection.
 - **Selection**: drag a lasso around points (Shift adds, Ctrl removes), click a point (Shift/Ctrl toggles), click empty space to clear, Ctrl+A selects all visible frames. The selected frames are listed as thumbnails below the cloud; double click a point or a thumbnail to open the frame in the editor popup.
 - **Actions** (right click on the cloud, or keys), one undo step each:
-  - Move to train / val / test (`1` / `2` / `3`): pending until saved; the save renames the files into the matching `images/<split>/` folder (the folder name already used by the dataset, e.g. `valid`) and updates `predictions.json`. A move whose destination file already exists, or whose path has no split folder, is skipped and reported.
+  - Move to train / val / test (`1` / `2` / `3`): pending until saved (the `split` field changes; files stay where they are).
   - Show in mosaic (`Enter`): the mosaic shows only the crops of the selected frames until the *Cluster selection ✕* chip is cleared.
   - Delete frames (`F`): F on every selected frame (or un-F when they all are marked).
+- **Auto-split…** (cluster mode toolbar): target shares for val and test (default 10 % each); whole clusters go to one split so near-identical frames never straddle two splits, and a cluster may fill at most a set share of the val / test target (default 25 %, so val and test span several scenes; bigger clusters stay in train). Unclustered frames are placed one by one, frames marked F are left alone. Groups are drawn in a seeded random order: *Reroll* tries another draw. One undo step, pending until saved; check it with the report.
 - Esc, C, M or Tab: back to the mosaic.
 - Split shares (frames and % per split, pending moves included) are always shown in the status line, and in cluster mode for the visible frames and the selection.
 

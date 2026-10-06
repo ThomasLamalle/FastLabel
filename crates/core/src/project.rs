@@ -17,8 +17,9 @@ use crate::versions::{self, VersionFile};
 use crate::yolo;
 
 pub const STATE_DIR: &str = ".fastlabel";
-/// File moves of a save in progress (trash + split moves), finished on the
-/// next open if the app stopped after writing the annotation file.
+/// Trash moves of a save in progress, finished on the next open if the app
+/// stopped after writing the annotation file (otherwise the frames would come
+/// back as new images).
 const MOVES_FILE: &str = "moves.json";
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -28,15 +29,11 @@ struct PendingMoves {
     /// Trash folder relative to the dataset folder.
     trash_dir: String,
     trashed: Vec<String>,
-    moved: Vec<(String, String)>,
 }
 
 impl PendingMoves {
     fn run(&self, dir: &Path, retained: &CocoFile) -> TrashReport {
-        let mut report =
-            commit::move_to_trash(dir, &dir.join(&self.trash_dir), &self.trashed, retained);
-        commit::move_split_files(dir, &self.moved, &mut report);
-        report
+        commit::move_to_trash(dir, &dir.join(&self.trash_dir), &self.trashed, retained)
     }
 }
 
@@ -62,10 +59,7 @@ pub struct Project {
 pub struct SaveReport {
     pub path: PathBuf,
     pub summary: Summary,
-    /// Trash and split moves done (`moved`) or not (`failed`).
     pub trash: TrashReport,
-    /// (old, new) `file_name`s of frames moved to another split.
-    pub moved_files: Vec<(String, String)>,
 }
 
 impl Project {
@@ -243,10 +237,7 @@ impl Project {
         if !self.has_unsaved_changes() {
             return Ok(None);
         }
-        let root = self.dir.clone();
-        let applied = commit::apply_checked(&self.dataset, self.log.state(), &self.review, &|n| {
-            root.join(n).exists()
-        });
+        let applied = commit::apply(&self.dataset, self.log.state(), &self.review);
         let files = versions::discover(&self.dir)?;
         let path = versions::next_path(&self.dir, &files);
         let state_dir = self.state_dir();
@@ -256,10 +247,9 @@ impl Project {
             version: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             trash_dir: format!("{STATE_DIR}/trash/{version_stem}"),
             trashed: applied.trashed_files.clone(),
-            moved: applied.moved_files.clone(),
         };
         let moves_path = state_dir.join(MOVES_FILE);
-        let has_moves = !moves.trashed.is_empty() || !moves.moved.is_empty();
+        let has_moves = !moves.trashed.is_empty();
         if has_moves {
             crate::fsutil::write_json_atomic(&moves_path, &moves)?;
         }
@@ -287,24 +277,14 @@ impl Project {
         }
 
         if let Some(file) = &mut self.prediction_file {
-            if !applied.trashed_files.is_empty() || !applied.moved_files.is_empty() {
+            if !applied.trashed_files.is_empty() {
                 let ds = &self.dataset;
                 file.images.retain(|k, _| k.parse().ok().and_then(|id| ds.image(id)).is_some());
-                for (key, entry) in &mut file.images {
-                    if let Some(img) = key.parse().ok().and_then(|id| ds.image(id)) {
-                        entry.file_name.clone_from(&img.file_name);
-                    }
-                }
                 file.save(&self.dir.join(PREDICTIONS_FILE))?;
             }
             self.predictions = Some(Predictions::from_file(file, &self.dataset));
         }
-        Ok(Some(SaveReport {
-            path,
-            summary: applied.summary,
-            trash,
-            moved_files: applied.moved_files,
-        }))
+        Ok(Some(SaveReport { path, summary: applied.summary, trash }))
     }
 
     /// Replaces all predictions and writes `predictions.json`.
@@ -526,35 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn split_moves_rename_files_and_update_predictions() {
+    fn split_moves_are_saved_as_fields_and_files_stay() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         write_dataset(dir);
         let mut p = Project::open(dir).unwrap();
-        let preds = vec![PredRef {
-            image_id: 2,
-            category_id: 1,
-            bbox: BBox::new(1.0, 1.0, 5.0, 5.0),
-            score: 0.5,
-        }];
-        p.set_image_predictions(1, preds, "m", 0.1).unwrap();
         p.record(Op::SetSplit { image: 2, split: Some(crate::Split::Val) }).unwrap();
         let report = p.save().unwrap().unwrap();
         assert_eq!(report.summary.moved_frames, 1);
-        assert_eq!(
-            report.moved_files,
-            vec![("images/train/0002.jpg".into(), "images/val/0002.jpg".into())]
-        );
-        assert!(dir.join("images/val/0002.jpg").exists());
-        assert!(!dir.join("images/train/0002.jpg").exists());
-        assert!(!dir.join(STATE_DIR).join(MOVES_FILE).exists());
+        assert!(dir.join("images/train/0002.jpg").exists(), "files never move");
         assert_eq!(p.dataset.split_of(1), Some(crate::Split::Val));
-        assert_eq!(p.predictions.as_ref().unwrap().of(1).unwrap().len(), 1, "still matched");
-
         let p = Project::open(dir).unwrap();
-        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
-        assert!(p.added_images.is_empty());
-        assert_eq!(p.predictions.as_ref().unwrap().of(1).unwrap().len(), 1);
+        assert_eq!(p.dataset.split_of(1), Some(crate::Split::Val));
+        assert_eq!(p.dataset.split_of(0), Some(crate::Split::Train));
+        assert!(p.added_images.is_empty() && p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[test]
@@ -562,37 +527,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         write_dataset(dir);
-        // Crash after writing v002 (image 2 moved to val, image 1 deleted)
-        // but before any file was moved.
+        // Crash after writing v002 (image 1 deleted) but before the trash move.
         let mut coco = CocoFile::load(&dir.join("annotations.v001.json")).unwrap();
         coco.images.retain(|i| i.id == 2);
         coco.annotations.retain(|a| a.image_id == 2);
-        coco.images[0].file_name = "images/val/0002.jpg".into();
         coco.save(&dir.join("annotations.v002.json")).unwrap();
         let moves = PendingMoves {
             version: "annotations.v002.json".into(),
             trash_dir: ".fastlabel/trash/annotations.v002".into(),
             trashed: vec!["images/train/0001.jpg".into()],
-            moved: vec![("images/train/0002.jpg".into(), "images/val/0002.jpg".into())],
         };
         crate::fsutil::write_json_atomic(&dir.join(STATE_DIR).join(MOVES_FILE), &moves).unwrap();
 
         let p = Project::open(dir).unwrap();
-        assert!(p.added_images.is_empty(), "moved files are not new images");
-        assert!(dir.join("images/val/0002.jpg").exists());
+        assert!(p.added_images.is_empty(), "the deleted frame does not come back");
         assert!(dir.join(".fastlabel/trash/annotations.v002/images/train/0001.jpg").exists());
         assert!(!dir.join(STATE_DIR).join(MOVES_FILE).exists());
         assert!(p.warnings.iter().any(|w| w.contains("interrupted save")), "{:?}", p.warnings);
 
         // Moves of a save whose annotation file was never written are dropped.
-        let moves = PendingMoves { version: "annotations.v003.json".into(), ..moves };
+        let moves = PendingMoves {
+            version: "annotations.v003.json".into(),
+            trashed: vec!["images/train/0002.jpg".into()],
+            ..moves
+        };
         crate::fsutil::write_json_atomic(&dir.join(STATE_DIR).join(MOVES_FILE), &moves).unwrap();
-        fs::write(dir.join("images/train/0002.jpg"), crate::yolo::tests::png_header(100, 100))
-            .unwrap();
         let p = Project::open(dir).unwrap();
-        assert!(dir.join("images/train/0002.jpg").exists());
+        assert!(dir.join("images/train/0002.jpg").exists(), "never trashed");
         assert!(!dir.join(STATE_DIR).join(MOVES_FILE).exists());
-        assert_eq!(p.added_images.len(), 1);
+        assert_eq!(p.dataset.images().len(), 1);
     }
 
     #[test]

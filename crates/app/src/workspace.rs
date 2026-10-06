@@ -178,16 +178,24 @@ impl Workspace {
     /// already there are left alone; frames moved back to their saved split
     /// drop their pending move.
     pub fn move_to_split(&mut self, frames: &[usize], split: Split) -> ActionResult {
+        let assign: Vec<(usize, Split)> = frames.iter().map(|&i| (i, split)).collect();
+        self.assign_splits(&assign).map(|_| ())
+    }
+
+    /// Sets the split of many frames (image index, split), one undo step;
+    /// returns how many frames changed.
+    pub fn assign_splits(&mut self, assign: &[(usize, Split)]) -> Result<usize, String> {
         let ds = &self.project.dataset;
-        let ops: Vec<Op> = frames
+        let ops: Vec<Op> = assign
             .iter()
-            .filter(|&&i| self.split_of(i) != Some(split))
-            .map(|&i| Op::SetSplit {
+            .filter(|(i, s)| self.split_of(*i) != Some(*s))
+            .map(|&(i, split)| Op::SetSplit {
                 image: ds.images()[i].id,
                 split: (ds.split_of(i) != Some(split)).then_some(split),
             })
             .collect();
-        self.record_all(ops)
+        let n = ops.len();
+        self.record_all(ops).map(|()| n)
     }
 
     /// F on many frames, one undo step: marks them all for deletion, or
@@ -588,43 +596,11 @@ impl Workspace {
         Ok(())
     }
 
-    /// Carries color-uniformity values over to the new file names of moved
-    /// frames (values are keyed by file name and box).
-    fn rekey_uniformity(&mut self, moved: &[(String, String)]) {
-        let ds = &self.project.dataset;
-        let preds = self.project.predictions.as_ref();
-        let by_name: std::collections::HashMap<&str, usize> =
-            ds.images().iter().enumerate().map(|(i, img)| (img.file_name.as_str(), i)).collect();
-        let mut values = Vec::new();
-        for (old, new) in moved {
-            let Some(&idx) = by_name.get(new.as_str()) else { continue };
-            let gt = ds.annotations_of(idx).map(|a| a.bbox);
-            let pr = preds.and_then(|p| p.of(idx)).unwrap_or(&[]).iter().map(|p| p.bbox);
-            for b in gt.chain(pr) {
-                if let Some(v) = self.uniformity.get(metrics::key(old, &b)) {
-                    values.push((metrics::key(new, &b), v));
-                }
-            }
-        }
-        if !values.is_empty() {
-            self.uniformity.extend(values);
-            let path = self.project.state_dir().join(metrics::METRICS_FILE);
-            if let Err(e) = self.uniformity.save(&path) {
-                tracing::warn!("cannot store color uniformity: {e}");
-            }
-        }
-    }
-
     /// Saves a new version and rebuilds the view.
     pub fn save(&mut self) -> anyhow::Result<Option<SaveReport>> {
         let ds = &self.project.dataset;
         let current = ds.images().get(self.frame.image_idx).map(|i| i.id);
         let report = self.project.save()?;
-        if let Some(r) = &report
-            && !r.moved_files.is_empty()
-        {
-            self.rekey_uniformity(&r.moved_files);
-        }
         if report.is_some() {
             let ds = &self.project.dataset;
             let n = ds.images().len();
@@ -804,7 +780,7 @@ mod tests {
 
         let report = ws.save().unwrap().unwrap();
         assert_eq!(report.summary.moved_frames, 1);
-        assert!(dir.path().join("images/val/a.jpg").exists());
+        assert!(dir.path().join("images/train/a.jpg").exists(), "files stay where they are");
         assert_eq!(ws.project.dataset.split_of(0), Some(Split::Val));
         assert_eq!(ws.crops.len(), 4);
     }

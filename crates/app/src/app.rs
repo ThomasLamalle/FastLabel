@@ -74,13 +74,15 @@ pub struct FastLabelApp {
     drop_focus: bool,
     /// Color-uniformity computation; sorts by it when done.
     uniformity_task: Option<Task<std::collections::HashMap<u64, f32>>>,
-    export_task: Option<Task<Result<fastlabel_core::export::ExportReport, String>>>,
+    export_task: Option<Task<Result<(fastlabel_core::export::ExportReport, PathBuf), String>>>,
     pub(crate) cluster: ClusterView,
     /// Loaded when cluster mode is first opened.
     embeddings: Option<Embeddings>,
     embed_task: Option<Task<EmbedOutcome>>,
     layout_task: Option<Task<Option<SavedLayout>>>,
     report_task: Option<Task<Result<PathBuf, String>>>,
+    /// Export dialog open.
+    export_dialog: bool,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
     exit_ok: bool,
@@ -119,6 +121,7 @@ impl FastLabelApp {
             embed_task: None,
             layout_task: None,
             report_task: None,
+            export_dialog: false,
             status: None,
             exit_ok: false,
             #[cfg(test)]
@@ -244,7 +247,6 @@ impl FastLabelApp {
                     (s.added + s.edited, "edited"),
                     (s.deleted_frames, "frames moved to trash"),
                     (s.moved_frames, "frames moved to another split"),
-                    (s.moves_skipped, "split moves skipped (no split folder or file exists)"),
                 ] {
                     if n > 0 {
                         parts.push(format!("{n} {what}"));
@@ -349,39 +351,127 @@ impl FastLabelApp {
         true
     }
 
+    /// Saves pending edits, asks where to write, then exports in the
+    /// background with the dialog's settings.
     fn start_export(&mut self, ctx: &egui::Context) {
+        use fastlabel_core::export::{ExportOptions, Target};
         if self.export_task.is_some() || !self.save() {
             return;
         }
         let Some(ws) = &self.ws else { return };
         let p = &ws.project;
         let Some(source) = &p.source else { return };
-        let name = source.file_name();
+        let settings = self.session.export.clone();
+        let splits: Vec<Split> =
+            Split::ALL.into_iter().filter(|s| settings.splits[*s as usize]).collect();
+        if splits.is_empty() {
+            self.error("Choose at least one split to export");
+            return;
+        }
         let dir_name =
             p.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let stem = name.trim_start_matches("annotations.").trim_end_matches(".json");
-        let Some(out) = rfd::FileDialog::new()
-            .set_directory(p.dir.parent().unwrap_or(&p.dir))
-            .set_file_name(format!("{dir_name}_{stem}.zip"))
-            .add_filter("zip", &["zip"])
-            .save_file()
-        else {
-            return;
+        let stem = source.file_name();
+        let stem = stem.trim_start_matches("annotations.").trim_end_matches(".json");
+        let name = format!("{dir_name}_{stem}_{}", settings.format.slug());
+        let start_dir = p.dir.parent().unwrap_or(&p.dir).to_path_buf();
+        let target = if settings.zip {
+            let Some(out) = rfd::FileDialog::new()
+                .set_directory(&start_dir)
+                .set_file_name(format!("{name}.zip"))
+                .add_filter("zip", &["zip"])
+                .save_file()
+            else {
+                return;
+            };
+            Target::Zip(out)
+        } else {
+            let Some(parent) = rfd::FileDialog::new()
+                .set_title("Folder to create the export in")
+                .set_directory(&start_dir)
+                .pick_folder()
+            else {
+                return;
+            };
+            let out = parent.join(&name);
+            if out.exists() {
+                self.error(format!("{} already exists", out.display()));
+                return;
+            }
+            Target::Folder(out)
         };
+        let opts = ExportOptions { format: settings.format, splits, name: dir_name };
         let (root, coco) = (p.dir.clone(), p.dataset.coco.clone());
         self.export_task = Some(Task::spawn("export", ctx, move |progress| {
             use std::sync::atomic::Ordering;
-            fastlabel_core::export::export_zip(&root, &coco, &name, &out, |done, total| {
+            let (Target::Zip(out) | Target::Folder(out)) = &target;
+            fastlabel_core::export::export(&root, &coco, &opts, &target, |done, total| {
                 progress.done.store(done, Ordering::Relaxed);
                 progress.total.store(total, Ordering::Relaxed);
                 !progress.cancel.load(Ordering::Relaxed)
             })
             .map(|mut r| {
                 r.missing.truncate(5);
-                r
+                (r, out.clone())
             })
             .map_err(|e| format!("{e} ({})", out.display()))
         }));
+    }
+
+    /// Format, splits and destination; Export saves, then asks where.
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        use fastlabel_core::export::ExportFormat;
+        let Some(ws) = &self.ws else { return };
+        let totals = ws.split_totals();
+        let mut export = false;
+        let modal = egui::Modal::new(egui::Id::new("export-dialog")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.heading("Export");
+            let s = &mut self.session.export;
+            ui.label("Format");
+            for f in ExportFormat::ALL {
+                ui.radio_value(&mut s.format, f, f.label());
+            }
+            ui.add_space(6.0);
+            ui.label("Splits");
+            ui.horizontal(|ui| {
+                for split in Split::ALL {
+                    let k = split as usize;
+                    ui.checkbox(&mut s.splits[k], format!("{} ({})", split.name(), totals[k]));
+                }
+            });
+            if totals[3] > 0 {
+                ui.label(
+                    RichText::new(format!("{} frames without a split are left out", totals[3]))
+                        .color(Color32::from_rgb(245, 150, 30)),
+                );
+            }
+            ui.add_space(6.0);
+            ui.label("Destination");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut s.zip, true, "Zip file");
+                ui.radio_value(&mut s.zip, false, "Folder (images hardlinked)");
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Pending edits are saved first (new version); frames marked F are not exported.")
+                    .weak(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Export…").clicked() {
+                    export = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.export_dialog = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.export_dialog = false;
+        }
+        if export {
+            self.export_dialog = false;
+            self.start_export(ctx);
+        }
     }
 
     fn poll_tasks(&mut self, ctx: &egui::Context) {
@@ -402,13 +492,23 @@ impl FastLabelApp {
         if let Some(result) = self.export_task.as_mut().and_then(Task::poll) {
             self.export_task = None;
             match result {
-                Ok(r) if r.cancelled => self.info("Export cancelled"),
-                Ok(r) if r.missing.is_empty() => self.info(format!("Exported {} images", r.images)),
-                Ok(r) => self.error(format!(
-                    "Exported {} images; missing: {}",
-                    r.images,
-                    r.missing.join(", ")
-                )),
+                Ok((r, _)) if r.cancelled => self.info("Export cancelled"),
+                Ok((r, out)) => {
+                    let [t, v, te] = r.per_split;
+                    let mut msg = format!(
+                        "Exported {} images (train {t}, val {v}, test {te}) to {}",
+                        r.images(),
+                        out.display()
+                    );
+                    if r.no_split > 0 {
+                        msg.push_str(&format!("; {} without a split left out", r.no_split));
+                    }
+                    if r.missing.is_empty() {
+                        self.info(msg);
+                    } else {
+                        self.error(format!("{msg}; missing: {}", r.missing.join(", ")));
+                    }
+                }
                 Err(e) => self.error(format!("Export failed: {e}")),
             }
         }
@@ -551,6 +651,9 @@ impl FastLabelApp {
     }
 
     fn handle_key(&mut self, ctx: &egui::Context, key: Key, repeat: bool, m: Modifiers) {
+        if self.export_dialog {
+            return;
+        }
         if self.ws.is_none() {
             if key == Key::O && m.command {
                 self.pick_and_open(ctx);
@@ -1050,6 +1153,27 @@ impl FastLabelApp {
                 self.set_mode(Mode::Mosaic);
                 Ok(())
             }
+            ClusterEvent::AutoSplit => {
+                let Some(ws) = &mut self.ws else { return };
+                let groups = self.cluster.split_groups(ws);
+                let sizes: Vec<usize> = groups.iter().map(Vec::len).collect();
+                let splits = crate::cluster::auto_split(&sizes, &self.session.auto_split);
+                let assign: Vec<(usize, Split)> = groups
+                    .iter()
+                    .zip(&splits)
+                    .flat_map(|(g, s)| g.iter().map(move |&i| (i, *s)))
+                    .collect();
+                match ws.assign_splits(&assign) {
+                    Ok(n) => {
+                        let shares = crate::cluster_view::split_shares(ws.split_totals());
+                        self.info(format!(
+                            "Auto-split: {n} frames changed split — {shares} (pending; U undoes)"
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             ClusterEvent::ReportAll => {
                 self.start_report(ctx, "All frames".into(), "all".into(), None);
                 Ok(())
@@ -1082,7 +1206,12 @@ impl FastLabelApp {
             let emb = self.embeddings.as_ref();
             self.cluster.sync(ws, |k| emb.is_some_and(|e| e.get(k).is_some()));
         }
-        let setup = Setup { model_path: &mut self.session.embed_model_path, missing, busy };
+        let setup = Setup {
+            model_path: &mut self.session.embed_model_path,
+            missing,
+            busy,
+            auto_split: &mut self.session.auto_split,
+        };
         let mut events = self.cluster.setup_bar(ui, setup);
         ui.separator();
         events.extend(self.cluster.show(ui, ws, thumbs));
@@ -1408,11 +1537,11 @@ impl FastLabelApp {
                 self.save();
             }
             if ui
-                .add_enabled(has_ws && self.export_task.is_none(), egui::Button::new("Export zip…"))
-                .on_hover_text("Saves pending edits, then zips the annotation file and images")
+                .add_enabled(has_ws && self.export_task.is_none(), egui::Button::new("Export…"))
+                .on_hover_text("YOLO, COCO or Ultralytics NDJSON, laid out by split, to a zip or a folder")
                 .clicked()
             {
-                self.start_export(&ctx);
+                self.export_dialog = true;
             }
             self.model_menu(ui);
             ui.add_enabled_ui(has_ws, |ui| {
@@ -1765,6 +1894,9 @@ impl eframe::App for FastLabelApp {
             }
         });
 
+        if self.export_dialog {
+            self.export_dialog(&ctx);
+        }
         if self.popup && self.ws.is_some() {
             let size = ctx.content_rect().size() * 0.92;
             let modal = egui::Modal::new(egui::Id::new("frame-editor")).show(&ctx, |ui| {

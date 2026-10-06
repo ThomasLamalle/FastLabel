@@ -73,6 +73,8 @@ pub enum ClusterEvent {
     ReportAll,
     ReportSelection,
     ReportCluster(i32),
+    /// Assign whole clusters to splits (settings in the session).
+    AutoSplit,
     Exit,
 }
 
@@ -82,6 +84,7 @@ pub struct Setup<'a> {
     /// Frames without an embedding yet.
     pub missing: usize,
     pub busy: bool,
+    pub auto_split: &'a mut crate::cluster::AutoSplit,
 }
 
 pub struct ClusterView {
@@ -178,6 +181,26 @@ impl ClusterView {
             .filter_map(|(i, p)| p.map(|(pos, l)| (i, pos, l)))
             .filter(|(i, ..)| ws.opts.split.is_none() || ws.split_of(*i) == ws.opts.split)
             .collect()
+    }
+
+    /// Frames (image indices) grouped for an auto-split: one group per
+    /// cluster, one per unclustered frame; frames marked F are left out.
+    pub fn split_groups(&self, ws: &Workspace) -> Vec<Vec<usize>> {
+        let mut clusters: std::collections::BTreeMap<i32, Vec<usize>> = Default::default();
+        let mut groups = Vec::new();
+        for (i, p) in self.points.iter().enumerate() {
+            let Some((_, label)) = p else { continue };
+            if ws.is_frame_deleted_idx(i) {
+                continue;
+            }
+            if *label >= 0 {
+                clusters.entry(*label).or_default().push(i);
+            } else {
+                groups.push(vec![i]);
+            }
+        }
+        groups.extend(clusters.into_values());
+        groups
     }
 
     /// Frames of a cluster (whatever the split filter).
@@ -297,6 +320,54 @@ impl ClusterView {
             if ui.button("Fit view").clicked() {
                 self.scale = 0.0;
             }
+            let has_layout = self.layout.is_some();
+            ui.add_enabled_ui(has_layout, |ui| {
+                ui.menu_button("Auto-split…", |ui| {
+                    ui.set_min_width(330.0);
+                    let a = &mut *setup.auto_split;
+                    let mut val = a.val * 100.0;
+                    let mut test = a.test * 100.0;
+                    let mut cap = a.max_group_share * 100.0;
+                    ui.label(
+                        RichText::new(
+                            "Whole clusters go to one split, so similar frames never sit on both sides. \
+                             Unclustered frames are placed one by one. Frames marked F are left alone.",
+                        )
+                        .weak(),
+                    );
+                    egui::Grid::new("auto-split").num_columns(2).show(ui, |ui| {
+                        ui.label("val");
+                        ui.add(egui::DragValue::new(&mut val).range(0.0..=50.0).suffix(" %"));
+                        ui.end_row();
+                        ui.label("test");
+                        ui.add(egui::DragValue::new(&mut test).range(0.0..=50.0).suffix(" %"));
+                        ui.end_row();
+                        ui.label("max cluster share")
+                            .on_hover_text("A cluster may fill at most this share of the val / test target (more scenes per split); larger clusters stay in train");
+                        ui.add(egui::DragValue::new(&mut cap).range(5.0..=100.0).suffix(" %"));
+                        ui.end_row();
+                    });
+                    a.val = val / 100.0;
+                    a.test = test / 100.0;
+                    a.max_group_share = cap / 100.0;
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            events.push(ClusterEvent::AutoSplit);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Reroll")
+                            .on_hover_text("Another random draw; it replaces the previous auto-split")
+                            .clicked()
+                        {
+                            a.seed = a.seed.wrapping_add(1);
+                            events.push(ClusterEvent::AutoSplit);
+                        }
+                        ui.label(RichText::new(format!("draw #{}", a.seed)).weak());
+                    });
+                    ui.label(RichText::new("Pending until saved; U undoes it in one step. Check the result with the report.").weak());
+                });
+            });
             if ui
                 .button("Report: all frames")
                 .on_hover_text("HTML report: split balance, box statistics, input size guide, similarity between splits")

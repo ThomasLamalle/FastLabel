@@ -679,6 +679,7 @@ fn overlapping_gt_cleaning_workflow() {
     assert!(tmp.path().join("annotations.v002.json").exists());
     assert!(h.state().clean.as_ref().unwrap().groups.is_empty());
     assert_eq!(h.state().ws().project.dataset.annotations().len(), 12 + 13 - 1 - 10);
+
     h.key_press(Key::Escape);
     h.run_steps(2);
     assert_eq!(h.state().mode, Mode::Mosaic);
@@ -761,19 +762,35 @@ fn cluster_mode_lasso_move_split_and_show_in_mosaic() {
 
     h.key_press(Key::S);
     h.run_steps(2);
-    for id in 1..=3 {
-        assert!(tmp.path().join(format!("images/val/{id:03}.jpg")).exists());
-    }
-    assert!(tmp.path().join("images/train/004.jpg").exists());
+    // The split is saved as a field; files stay where they are.
+    let saved = std::fs::read_to_string(tmp.path().join("annotations.v002.json")).unwrap();
+    assert_eq!(saved.matches(r#""split": "val""#).count(), 3);
+    assert!(tmp.path().join("images/train/001.jpg").exists());
     let ws = h.state().ws();
     assert_eq!(ws.project.dataset.split_of(0), Some(Split::Val));
     assert!(!ws.project.log.is_dirty());
 
-    // The layout still places the moved frames (keys ignore the folder).
+    // The layout still places the moved frames.
     h.key_press(Key::C);
     h.run_steps(3);
     assert_eq!(h.state().cluster.unplaced, 0);
     assert_eq!(h.state().cluster.selection.len(), 3);
+    // Auto-split: whole clusters (3 frames each) go to one split.
+    use crate::cluster::AutoSplit;
+    h.state_mut().session_mut().auto_split =
+        AutoSplit { val: 0.5, test: 0.0, max_group_share: 1.0, seed: 3 };
+    let ctx = h.ctx.clone();
+    h.state_mut().cluster_event(&ctx, crate::cluster_view::ClusterEvent::AutoSplit);
+    h.run_steps(2);
+    let splits: Vec<_> = (0..6).map(|i| h.state().ws().split_of(i)).collect();
+    assert_eq!(splits.iter().filter(|s| **s == Some(Split::Val)).count(), 3, "{splits:?}");
+    assert_eq!(splits[0], splits[1]);
+    assert_eq!(splits[1], splits[2]);
+    assert_eq!(splits[3], splits[4]);
+    h.key_press(Key::U);
+    h.run_steps(2);
+    assert!((3..6).all(|i| h.state().ws().split_of(i) == Some(Split::Train)), "one undo step");
+
     h.key_press(Key::Escape);
     h.run_steps(2);
     assert_eq!(h.state().mode, Mode::Mosaic);
