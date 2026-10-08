@@ -9,7 +9,7 @@ use eframe::egui::{
 use fastlabel_core::{AnnId, BBox, CategoryId, PredRef};
 
 use crate::frame::{EditBox, Sel};
-use crate::mosaic::{GT_COLOR, PRED_COLOR};
+use crate::mosaic::{GT_COLOR, PRED_COLOR, small_suffix};
 use crate::workspace::Mark;
 
 const SELECT_COLOR: Color32 = Color32::from_rgb(255, 215, 0);
@@ -132,6 +132,8 @@ pub struct FrameData<'a> {
     pub categories: &'a [(CategoryId, String)],
     /// Big labels on some GT boxes (cleaning: the key that keeps the box).
     pub numbers: &'a [(AnnId, String)],
+    /// Shorter boxes are tagged (left out of exports).
+    pub min_box_height: f64,
 }
 
 struct Xform {
@@ -404,7 +406,12 @@ impl EditorView {
                     if selected { SELECT_COLOR } else { color },
                 ),
             );
-            let mut text = format!("pred {:.2}{}", p.score, label_of(p.category_id));
+            let mut text = format!(
+                "pred {:.2}{}{}",
+                p.score,
+                label_of(p.category_id),
+                small_suffix(&p.bbox, data.min_box_height)
+            );
             if let Some(m) = mark {
                 text.push_str(if *m == Mark::Good { "  G" } else { "  D" });
             }
@@ -445,9 +452,10 @@ impl EditorView {
             // Numbered boxes carry their number badge instead.
             if number.is_none() {
                 let text = format!(
-                    "GT{}{}{}",
+                    "GT{}{}{}{}",
                     label_of(b.category),
                     if b.added { " new" } else { "" },
+                    small_suffix(&bbox, data.min_box_height),
                     suffix
                 );
                 tag(painter, r.left_top() - Vec2::new(0.0, 1.0), Align2::LEFT_BOTTOM, &text, color);

@@ -95,6 +95,8 @@ pub struct ExportOptions {
     /// Dataset name (NDJSON header and file name).
     pub name: String,
     pub resize: Option<Resize>,
+    /// Boxes less tall than this (source pixels) are left out; 0 keeps all.
+    pub min_box_height: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -381,15 +383,17 @@ fn json_bytes(v: &impl serde::Serialize) -> Vec<u8> {
     out
 }
 
-/// Annotations of the exported frames, by image id.
+/// Annotations of the exported frames, by image id, without the boxes
+/// below `min_height`.
 fn annotations_of<'a>(
     coco: &'a CocoFile,
     entries: &[Entry],
+    min_height: f64,
 ) -> BTreeMap<i64, Vec<&'a CocoAnnotation>> {
     let ids: HashSet<i64> = entries.iter().map(|e| e.image.id).collect();
     let mut by_image: BTreeMap<i64, Vec<&CocoAnnotation>> = BTreeMap::new();
     for a in &coco.annotations {
-        if ids.contains(&a.image_id) {
+        if ids.contains(&a.image_id) && a.bbox.h >= min_height {
             by_image.entry(a.image_id).or_default().push(a);
         }
     }
@@ -402,7 +406,7 @@ fn write_texts(
     opts: &ExportOptions,
     entries: &[Entry],
 ) -> Result<()> {
-    let anns = annotations_of(coco, entries);
+    let anns = annotations_of(coco, entries, opts.min_box_height);
     let (index, names) = class_indices(coco);
     let yolo_lines = |e: &Entry, decimals: usize| -> Vec<(usize, [f64; 4])> {
         anns.get(&e.image.id)
@@ -544,7 +548,13 @@ mod tests {
     }
 
     fn opts(format: ExportFormat) -> ExportOptions {
-        ExportOptions { format, splits: Split::ALL.to_vec(), name: "Bibs".into(), resize: None }
+        ExportOptions {
+            format,
+            splits: Split::ALL.to_vec(),
+            name: "Bibs".into(),
+            resize: None,
+            min_box_height: 0.0,
+        }
     }
 
     fn read(dir: &Path, rel: &str) -> String {
@@ -711,6 +721,16 @@ mod tests {
             serde_json::from_str(&read(&out, "train/_annotations.coco.json")).unwrap();
         assert_eq!((train.images[0].width, train.images[0].height), (100, 50));
         assert_eq!(train.annotations[0].bbox, BBox::new(5.0, 10.0, 10.0, 5.0));
+    }
+
+    #[test]
+    fn short_boxes_are_left_out() {
+        let (d, coco) = fixture(); // box heights: 10 (train), 20 (val)
+        let o = ExportOptions { min_box_height: 15.0, ..opts(ExportFormat::Yolo) };
+        let out = d.path().join("min");
+        export(d.path(), &coco, &o, &Target::Folder(out.clone()), |_, _| true).unwrap();
+        assert_eq!(read(&out, "labels/train/0001.txt"), "", "image kept, box dropped");
+        assert_eq!(read(&out, "labels/val/0001.txt").lines().count(), 1);
     }
 
     #[test]

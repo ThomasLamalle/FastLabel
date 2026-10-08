@@ -519,8 +519,13 @@ impl FastLabelApp {
             max_side,
             resize: fastlabel_media::decode::resize_batch,
         });
-        let opts =
-            ExportOptions { format: settings.format, splits, name: self.export_name().0, resize };
+        let opts = ExportOptions {
+            format: settings.format,
+            splits,
+            name: self.export_name().0,
+            resize,
+            min_box_height: self.session.min_box_height,
+        };
         let (root, coco) = (p.dir.clone(), p.dataset.coco.clone());
         self.export_task = Some(Task::spawn("export", ctx, move |progress| {
             use std::sync::atomic::Ordering;
@@ -668,6 +673,15 @@ impl FastLabelApp {
                         .weak(),
                 );
             }
+            if self.session.min_box_height > 0.0 {
+                ui.label(
+                    RichText::new(format!(
+                        "Boxes under {} px high are left out (Settings).",
+                        self.session.min_box_height
+                    ))
+                    .weak(),
+                );
+            }
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Pending edits are saved first (new version); frames marked F are not exported.")
@@ -730,6 +744,24 @@ impl FastLabelApp {
             }
         }
         let _ = ctx;
+    }
+
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Settings", |ui| {
+            let s = &mut self.session;
+            ui.horizontal(|ui| {
+                ui.label("Min box height (px)");
+                ui.add(egui::DragValue::new(&mut s.min_box_height).range(0.0..=1000.0).speed(0.5));
+            })
+            .response
+            .on_hover_text("Smaller GT boxes and predictions are tagged <N px and left out of exports; 0 keeps all");
+            ui.horizontal(|ui| {
+                ui.label("Thumbnail GPU memory (MB)");
+                ui.add(egui::DragValue::new(&mut s.texture_budget_mb).range(32..=4096).speed(8));
+            })
+            .response
+            .on_hover_text("Applies when a dataset is opened");
+        });
     }
 
     fn model_menu(&mut self, ui: &mut egui::Ui) {
@@ -1851,6 +1883,7 @@ impl FastLabelApp {
             interactive: true,
             categories: &categories,
             numbers: &numbers,
+            min_box_height: self.session.min_box_height,
         };
         for action in self.editor.show(ui, &data) {
             let r = match action {
@@ -1903,6 +1936,7 @@ impl FastLabelApp {
             interactive: false,
             categories: &[],
             numbers: &[],
+            min_box_height: self.session.min_box_height,
         };
         let peek = &mut self.peek;
         egui::Area::new(egui::Id::new("peek"))
@@ -2032,6 +2066,7 @@ impl FastLabelApp {
                 self.start_report(&ctx, "All frames".into(), "all".into(), None);
             }
             self.model_menu(ui);
+            self.settings_menu(ui);
             ui.add_enabled_ui(has_ws, |ui| {
                 ui.menu_button("Cleaning", |ui| {
                     if ui
@@ -2389,7 +2424,7 @@ impl eframe::App for FastLabelApp {
                 return;
             }
             let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
-            for ev in mosaic::show(ui, ws, thumbs, &mut self.mosaic) {
+            for ev in mosaic::show(ui, ws, thumbs, &mut self.mosaic, self.session.min_box_height) {
                 match ev {
                     MosaicEvent::Select(i) => ws.select(i),
                     MosaicEvent::Open(i) => {

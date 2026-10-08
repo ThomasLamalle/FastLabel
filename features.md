@@ -36,6 +36,8 @@ This file is the source of truth. The functional spec of the previous Python too
   - **COCO single file**: `annotations.json` with `split` fields + `images/<split>/`.
   - **Ultralytics NDJSON**: `<dataset>.ndjson` (local `path`) + `images/<split>/`, readable by Ultralytics' NDJSON converter.
   - Splits to include are chosen in the dialog; frames without a split are left out and counted. Two frames of a split with the same file name get an `<id>_` prefix.
+  - Boxes less tall than the *Min box height* setting (source pixels, default 10, 0 keeps all; CLI `--min-height`) are left out. In the app they stay, tagged `<N px` on GT boxes and predictions in the mosaic and the frame view.
+- **Settings** (toolbar menu, saved in the session): min box height, thumbnail GPU memory.
 - **Tabs** (toolbar): *Mosaic (M)*, *Frame (M)*, *To do (T)*, *Clusters (C)*, *Rules*; the shortcuts still work.
 - **Labeling rules** (*Rules* tab): the dataset's labeling rules as free text, editable in place (shortcuts are off while typing; Esc goes back to the mosaic). Stored in `.fastlabel/rules.md`, written when the field loses focus, on leaving the tab and on exit. A new dataset starts with: *Label the whole bib. If occulted, box only the visible part.*
 

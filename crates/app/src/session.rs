@@ -26,6 +26,9 @@ pub struct Session {
     pub auto_split: crate::cluster::AutoSplit,
     /// GPU memory budget for crop thumbnails.
     pub texture_budget_mb: usize,
+    /// Boxes less tall than this (source pixels) are tagged and left out
+    /// of exports; 0 keeps all.
+    pub min_box_height: f64,
 }
 
 impl Default for Session {
@@ -43,6 +46,7 @@ impl Default for Session {
             add_split: None,
             auto_split: crate::cluster::AutoSplit::default(),
             texture_budget_mb: 256,
+            min_box_height: 10.0,
         }
     }
 }

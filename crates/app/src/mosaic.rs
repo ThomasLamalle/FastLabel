@@ -61,6 +61,7 @@ pub fn show(
     ws: &Workspace,
     thumbs: &mut Thumbs,
     state: &mut MosaicState,
+    min_box_height: f64,
 ) -> Vec<MosaicEvent> {
     let mut events = Vec::new();
     let n = ws.crops.len();
@@ -131,6 +132,7 @@ pub fn show(
                     job.map(|(_, r)| r),
                     idx == ws.selected,
                     split_name(ws, crop),
+                    min_box_height,
                 );
             }
         }
@@ -198,6 +200,7 @@ fn paint_cell(
     region: Option<Region>,
     selected: bool,
     split: &str,
+    min_box_height: f64,
 ) {
     let img_area = Rect::from_min_size(cell.min, Vec2::new(cell.width(), img_h));
     painter.rect_filled(img_area, CornerRadius::same(3), CELL_BG);
@@ -232,14 +235,21 @@ fn paint_cell(
                     &clip,
                     r.left_bottom() + Vec2::new(0.0, 1.0),
                     Align2::LEFT_TOP,
-                    &format!("pred {:.2}", p.score),
+                    &format!("pred {:.2}{}", p.score, small_suffix(&p.bbox, min_box_height)),
                     PRED_COLOR,
                 );
             }
             if let Some(g) = &crop.gt {
                 let r = to_screen(g);
                 clip.rect_stroke(r, 0, Stroke::new(2.0, GT_COLOR), StrokeKind::Outside);
-                tag(&clip, r.left_top() - Vec2::new(0.0, 1.0), Align2::LEFT_BOTTOM, "GT", GT_COLOR);
+                let text = format!("GT{}", small_suffix(g, min_box_height));
+                tag(
+                    &clip,
+                    r.left_top() - Vec2::new(0.0, 1.0),
+                    Align2::LEFT_BOTTOM,
+                    &text,
+                    GT_COLOR,
+                );
             }
         }
         (Some(Slot::Failed(_)), _) => {
@@ -332,6 +342,11 @@ fn paint_cell(
             StrokeKind::Outside,
         );
     }
+}
+
+/// Tag suffix of boxes left out of exports for being too short.
+pub fn small_suffix(b: &BBox, min_height: f64) -> String {
+    if b.h < min_height { format!("  <{min_height}px") } else { String::new() }
 }
 
 /// Small label with a dark background.

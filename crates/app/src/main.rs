@@ -46,6 +46,9 @@ struct Cli {
     /// Downscale exported images to this long side (labels follow).
     #[arg(long, requires = "export")]
     imgsz: Option<u32>,
+    /// Leave out boxes less tall than this (source pixels).
+    #[arg(long, default_value_t = 10.0, requires = "export")]
+    min_height: f64,
 }
 
 /// `--export`: same as the Export dialog (all splits), without the GUI.
@@ -54,6 +57,7 @@ fn write_export(
     out: &std::path::Path,
     format: &str,
     imgsz: Option<u32>,
+    min_box_height: f64,
 ) -> anyhow::Result<()> {
     use fastlabel_core::export::{self, ExportFormat, ExportOptions, Target};
     let format = ExportFormat::ALL
@@ -67,7 +71,8 @@ fn write_export(
     let name = dataset.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let resize = imgsz
         .map(|max_side| export::Resize { max_side, resize: fastlabel_media::decode::resize_batch });
-    let opts = ExportOptions { format, splits: fastlabel_core::Split::ALL.to_vec(), name, resize };
+    let splits = fastlabel_core::Split::ALL.to_vec();
+    let opts = ExportOptions { format, splits, name, resize, min_box_height };
     let target = if out.extension().is_some_and(|e| e == "zip") {
         Target::Zip(out.to_path_buf())
     } else {
@@ -123,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(out) = &cli.export {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
-        return write_export(&dir, out, &cli.format, cli.imgsz);
+        return write_export(&dir, out, &cli.format, cli.imgsz, cli.min_height);
     }
     let session_path = Session::default_path();
     let session = session_path.as_deref().map(Session::load).unwrap_or_default();
