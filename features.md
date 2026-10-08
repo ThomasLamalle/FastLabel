@@ -36,7 +36,8 @@ This file is the source of truth. The functional spec of the previous Python too
   - **COCO single file**: `annotations.json` with `split` fields + `images/<split>/`.
   - **Ultralytics NDJSON**: `<dataset>.ndjson` (local `path`) + `images/<split>/`, readable by Ultralytics' NDJSON converter.
   - Splits to include are chosen in the dialog; frames without a split are left out and counted. Two frames of a split with the same file name get an `<id>_` prefix.
-
+- **Tabs** (toolbar): *Mosaic (M)*, *Frame (M)*, *To do (T)*, *Clusters (C)*, *Rules*; the shortcuts still work.
+- **Labeling rules** (*Rules* tab): the dataset's labeling rules as free text, editable in place (shortcuts are off while typing; Esc goes back to the mosaic). Stored in `.fastlabel/rules.md`, written when the field loses focus, on leaving the tab and on exit. A new dataset starts with: *Label the whole bib. If occulted, box only the visible part.*
 
 ## Mosaic mode
 
@@ -95,6 +96,7 @@ Similar to sorting, toggle buttons allow to:
 - display only FN: GT boxes overlapping no prediction
 - hide reviewed crops
 - filter by split (All / train / val / test / no split)
+- *No boxes*: frames without GT boxes, i.e. the crops of their predictions (the frames themselves are in the To do tab). Also applies to the cluster view.
 
 No thresholds to tune. Each GT box is paired with its best-overlapping prediction (any overlap); the pair is shown in one crop with its IoU, and loose boxes are found with the IoU ascending sort. An unpaired prediction overlapping an already paired GT (a duplicate) is labelled "extra".
 
@@ -130,10 +132,10 @@ Double annotations: GT boxes of the same category that overlap each other (IoU >
 
 ## To do tab
 
-Toolbar *To do* or `T` in the mosaic: frames without any GT box (typically just added) that are not confirmed as background, as whole-frame tiles, newest first (image date), with their source name, split, date and whether the model was run on them. The split filter applies (*no split* finds frames added without a split).
+Toolbar *To do* or `T` in the mosaic: frames without any GT box (typically just added) that are not confirmed as background, as whole-frame tiles, newest first (image date), with their source name, split, date and whether the model was run on them. The split filter applies (*no split* finds frames added without a split). *Show background* also lists the frames already saved as background (labelled *background*; G / F auto-advance and skipping forward in frame mode pass over them).
 
-- Enter / E / double click: frame mode restricted to the to-do frames (*To do only* in its header, on by default): h / l, arrows and right click go to the next / previous to-do frame in the same order, with the full editor (draw, zoom, categories, tags, run the model on the frame). G with no box selected marks the frame as background and moves on; F deletes it and moves on. Tab (or Esc with no box selected) goes back to the grid, on the frame reached. The tile of a frame with new boxes shows "boxes drawn".
-- G: background, nothing to annotate (toggle; persisted in `review.json`, so the frame leaves the list for good). In frame mode, G with no box selected does the same on any frame without boxes.
+- Enter / E / double click: frame mode restricted to the to-do frames (*To do only* in its header, on by default): h / l, arrows and right click go to the next / previous to-do frame in the same order, with the full editor (draw, zoom, categories, tags, run the model on the frame). Moving forward (l, →, right click) past a frame left untouched (no box drawn, not marked F) marks it as background, so skipping is enough for frames without bibs; going back marks nothing, and G on a marked frame takes the mark back. G with no box selected marks the frame as background and moves on; F deletes it and moves on. Tab (or Esc with no box selected) goes back to the grid, on the frame reached. The tile of a frame with new boxes shows "boxes drawn".
+- G: background, nothing to annotate (toggle; persisted in `review.json`, so the frame leaves the list for good). Background means no boxes: G is refused on a frame with boxes; drawing a box or accepting a prediction on a frame marked background takes the mark back (same undo step); a save records a frame as background only if it has no boxes, and a background frame that gets boxes later stops being one. Its predictions are left as they are. In frame mode, G with no box selected does the same on any frame without boxes.
 - F: delete the frame (toggle). G and F advance to the next undecided frame; both are pending until saved, U undoes.
 - Arrows / hjkl, PageUp / PageDown, Home / End: move. Esc, T, M or Tab: back to the mosaic.
 - After a save, frames with boxes or confirmed as background leave the list.
@@ -144,7 +146,7 @@ Toolbar *Clusters* or `C` in the mosaic. Every frame is a point of a 2D map buil
 
 - **Embeddings**: an ONNX image embedder (input `[N, 3, H, W]` ImageNet-normalized RGB, output `[N, D]`), DINOv2-small by default (`scripts/export_dinov2.py`). Computed in the background with progress and cancel, cached per frame in `.fastlabel/embeddings.bin` (frames moved to another split keep their vector; a different model recomputes everything). Only frames without a vector are computed.
 - **Layout**: PCA (50 dims) → UMAP 2D → HDBSCAN clusters (noise in grey), computed in the background and cached in `.fastlabel/clusters.json`. New frames: *Update layout*. *min cluster size* + *Recluster* only recomputes the clusters.
-- **Display**: points colored by split (pending moves included) or by cluster; frames marked F in dark grey. The global split filter (All/train/val/test) applies to the cloud. Wheel zooms around the cursor, middle drag (or Space + drag) pans, *Fit view* resets. Hovering a point shows the frame, its split and cluster. Counts per split are shown for the visible frames and for the selection.
+- **Display**: points colored by split (pending moves included) or by cluster; frames marked F in dark grey. The global split filter (All/train/val/test) and *No boxes* apply to the cloud. Wheel zooms around the cursor, middle drag (or Space + drag) pans, *Fit view* resets. Hovering a point shows the frame, its split and cluster. Counts per split are shown for the visible frames and for the selection.
 - **Selection**: drag a lasso around points (Shift adds, Ctrl removes), click a point (Shift/Ctrl toggles), click empty space to clear, Ctrl+A selects all visible frames. The selected frames are listed as thumbnails below the cloud; double click a point or a thumbnail to open the frame in the editor popup.
 - **Actions** (right click on the cloud, or keys), one undo step each:
   - Move to train / val / test (`1` / `2` / `3`): pending until saved (the `split` field changes; files stay where they are).
@@ -170,6 +172,7 @@ Toolbar *Clusters* or `C` in the mosaic. Every frame is a point of a 2D map buil
 ## Model inference
 
 - ONNX models run through ONNX Runtime, no Python at runtime. CPU only must be fast enough (no GPU on the dev machine); GPU execution providers are optional.
+- Ultralytics `.pt` weights can be chosen too: the first run exports them to `<name>.onnx` next to the weights (`uvx`, CPU torch, training image size) and reuses that file until the `.pt` changes.
 - Supported architectures: **YOLO26** (first), **RF-DETR** (next). The model's class names are mapped to dataset categories by name.
 - Run on all frames (in the background, with progress and cancel) or on a single frame.
 - Results are written to `predictions.json`; a failed or cancelled run never replaces the previous predictions.

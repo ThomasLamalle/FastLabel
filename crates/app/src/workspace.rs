@@ -57,6 +57,28 @@ pub struct Workspace {
     image_dates: Option<Vec<Option<f64>>>,
     /// Frame mode restricted to these frames, in this order (To do).
     pub frame_order: Option<Vec<usize>>,
+    /// Labeling rules, edited in the side panel (`.fastlabel/rules.md`).
+    pub rules: String,
+    /// Rules as last written, so unchanged text is not rewritten.
+    rules_saved: String,
+}
+
+pub const RULES_FILE: &str = "rules.md";
+const DEFAULT_RULES: &str = "- Label the whole bib. If occulted, box only the visible part.\n";
+
+/// Frames an op gives a new box to: drawn boxes and newly accepted
+/// predictions (an accept that toggles off adds nothing).
+fn boxes_added(op: &Op, st: &fastlabel_core::PendingState, out: &mut Vec<ImageId>) {
+    match op {
+        Op::AddBox { image, .. } => out.push(*image),
+        Op::PredMark { pred, mark: PredMark::Accept }
+            if st.pred_mark(pred) != Some(PredMark::Accept) =>
+        {
+            out.push(pred.image_id)
+        }
+        Op::Group { ops } => ops.iter().for_each(|o| boxes_added(o, st, out)),
+        _ => {}
+    }
 }
 
 /// What a to-do frame shows.
@@ -64,6 +86,8 @@ pub struct Workspace {
 pub struct TodoTile {
     /// G: background, nothing to annotate (pending).
     pub confirmed: bool,
+    /// Saved as background.
+    pub background: bool,
     pub deleted: bool,
     /// Boxes drawn on it (pending).
     pub drawn: usize,
@@ -80,6 +104,8 @@ impl Workspace {
     pub fn open(dir: &Path, opts: ViewOptions, columns: usize) -> anyhow::Result<Self> {
         let project = Project::open(dir)?;
         let uniformity = Uniformity::load(&project.state_dir().join(metrics::METRICS_FILE));
+        let rules = std::fs::read_to_string(project.state_dir().join(RULES_FILE))
+            .unwrap_or_else(|_| DEFAULT_RULES.into());
         let mut ws = Self {
             project,
             eval: None,
@@ -91,9 +117,25 @@ impl Workspace {
             uniformity,
             image_dates: None,
             frame_order: None,
+            rules_saved: rules.clone(),
+            rules,
         };
         ws.rebuild();
         Ok(ws)
+    }
+
+    /// Writes the rules when they changed since the last write.
+    pub fn save_rules(&mut self) -> anyhow::Result<()> {
+        if self.rules == self.rules_saved {
+            return Ok(());
+        }
+        let path = self.project.state_dir().join(RULES_FILE);
+        fastlabel_core::fsutil::write_atomic(&path, |w| {
+            std::io::Write::write_all(w, self.rules.as_bytes())
+                .map_err(|e| fastlabel_core::error::Error::io(&path, e))
+        })?;
+        self.rules_saved = self.rules.clone();
+        Ok(())
     }
 
     pub fn has_predictions(&self) -> bool {
@@ -356,7 +398,25 @@ impl Workspace {
         }
     }
 
+    /// Records an action. An action that gives a frame marked background a
+    /// box (drawn, or an accepted prediction) also takes the mark back, in
+    /// the same undo step: background means no boxes.
     pub(crate) fn record(&mut self, op: Op) -> ActionResult {
+        let st = self.project.log.state();
+        let mut gaining = Vec::new();
+        boxes_added(&op, st, &mut gaining);
+        gaining.sort_unstable();
+        gaining.dedup();
+        let unmark: Vec<Op> = gaining
+            .into_iter()
+            .filter(|i| st.confirmed_frames.contains(i))
+            .map(|image| Op::ConfirmFrame { image })
+            .collect();
+        let op = if unmark.is_empty() {
+            op
+        } else {
+            Op::Group { ops: std::iter::once(op).chain(unmark).collect() }
+        };
         self.project.record(op).map_err(|e| format!("action applied but not journaled: {e}"))
     }
 
@@ -637,10 +697,11 @@ impl Workspace {
     }
 
     /// To do: frames without GT boxes that are not confirmed as background
-    /// (saved), matching the split filter, newest first (image date).
+    /// (saved; listed too with `background`), matching the split filter,
+    /// newest first (image date).
     /// Frames being handled (boxes drawn, G or F pending) stay listed until
     /// the save.
-    pub fn todo_frames(&mut self) -> Vec<usize> {
+    pub fn todo_frames(&mut self, background: bool) -> Vec<usize> {
         if self.image_dates.is_none() {
             self.image_dates = Some(image_dates(&self.project.dataset));
         }
@@ -649,7 +710,7 @@ impl Workspace {
         let review = &self.project.review;
         let mut frames: Vec<usize> = (0..ds.images().len())
             .filter(|&i| ds.annotations_of(i).next().is_none())
-            .filter(|&i| !review.empty_frames.contains(&ds.images()[i].id))
+            .filter(|&i| background || !review.empty_frames.contains(&ds.images()[i].id))
             .filter(|&i| self.opts.split.matches(self.split_of(i)))
             .collect();
         let date = |i: usize| dates.get(i).copied().flatten().unwrap_or(f64::MIN);
@@ -664,6 +725,7 @@ impl Workspace {
         let st = self.project.log.state();
         TodoTile {
             confirmed: st.confirmed_frames.contains(&id),
+            background: self.project.review.empty_frames.contains(&id),
             deleted: st.is_frame_deleted(id),
             drawn: st.added.values().filter(|b| b.image == id).count(),
             predictions: self
@@ -680,11 +742,32 @@ impl Workspace {
     /// frame marked F is kept, in the same undo step.
     pub fn toggle_confirm_frame(&mut self, image_idx: usize) -> ActionResult {
         let id = self.project.dataset.images()[image_idx].id;
+        let confirmed = self.project.log.state().confirmed_frames.contains(&id);
+        if !confirmed && !self.frame_is_empty(image_idx) {
+            return Err("This frame has boxes: background means nothing to annotate".into());
+        }
         let mut ops = vec![Op::ConfirmFrame { image: id }];
         if self.project.log.state().is_frame_deleted(id) {
             ops.insert(0, Op::FrameDelete { image: id });
         }
         self.record_all(ops)
+    }
+
+    /// Frame mode navigation. Going forward through the to-do frames
+    /// (`frame_order` set) skips an untouched frame as background: no box
+    /// drawn, not marked F or already confirmed (pending, U undoes it).
+    pub fn next_frame(&mut self, dir: isize, annotated_only: bool) -> ActionResult {
+        let Some(next) = self.step_frame(dir, annotated_only) else { return Ok(()) };
+        let idx = self.frame.image_idx;
+        let mut result = Ok(());
+        if dir > 0 && self.frame_order.is_some() && idx < self.project.dataset.images().len() {
+            let t = self.todo_tile(idx);
+            if self.frame_is_empty(idx) && !t.deleted && !t.confirmed && !t.background {
+                result = self.toggle_confirm_frame(idx);
+            }
+        }
+        self.go_to_frame(next);
+        result
     }
 
     /// F on one frame (clears its other marks, like in the mosaic).
@@ -754,6 +837,18 @@ mod tests {
         }
         let ws = Workspace::open(dir.path(), ViewOptions::default(), columns).unwrap();
         (dir, ws)
+    }
+
+    #[test]
+    fn rules_default_then_persist() {
+        let (d, mut ws) = open_fixture(2);
+        assert!(ws.rules.contains("Label the whole bib"));
+        ws.save_rules().unwrap();
+        assert!(!d.path().join(".fastlabel").join(RULES_FILE).exists(), "unchanged: not written");
+        ws.rules = "- one rule\n".into();
+        ws.save_rules().unwrap();
+        let again = Workspace::open(d.path(), ViewOptions::default(), 2).unwrap();
+        assert_eq!(again.rules, "- one rule\n");
     }
 
     #[test]
@@ -911,7 +1006,7 @@ mod tests {
     #[test]
     fn todo_lists_unannotated_frames_newest_first_until_saved() {
         let (dir, mut ws) = open_fixture(2); // both fixture frames have boxes
-        assert!(ws.todo_frames().is_empty());
+        assert!(ws.todo_frames(false).is_empty());
         for (name, date) in
             [("old.png", "2020-01-01T00:00:00Z"), ("new.png", "2026-01-01T00:00:00Z")]
         {
@@ -931,11 +1026,11 @@ mod tests {
                 fastlabel_core::Dataset::new(dir.path().into(), coco, dir.path()).unwrap().0;
         }
         ws.image_dates = None;
-        assert_eq!(ws.todo_frames(), vec![3, 2], "newest first");
+        assert_eq!(ws.todo_frames(false), vec![3, 2], "newest first");
         ws.opts.split = crops::SplitFilter::NoSplit;
-        assert_eq!(ws.todo_frames().len(), 2);
+        assert_eq!(ws.todo_frames(false).len(), 2);
         ws.opts.split = crops::SplitFilter::Only(Split::Train);
-        assert!(ws.todo_frames().is_empty());
+        assert!(ws.todo_frames(false).is_empty());
         ws.opts.split = crops::SplitFilter::All;
 
         ws.toggle_frame_delete_idx(3).unwrap();
@@ -948,7 +1043,51 @@ mod tests {
         ws.toggle_frame_delete_idx(2).unwrap();
         ws.save().unwrap().unwrap();
         assert!(ws.project.review.empty_frames.contains(&4));
-        assert!(ws.todo_frames().is_empty(), "background confirmed, other frame deleted");
+        assert!(ws.todo_frames(false).is_empty(), "background confirmed, other frame deleted");
+        // The deleted frame left the dataset: the background one is now index 2.
+        assert_eq!(ws.todo_frames(true), vec![2], "Show background lists it again");
+        assert!(ws.todo_tile(2).background);
+    }
+
+    #[test]
+    fn background_and_boxes_exclude_each_other() {
+        let (dir, mut ws) = open_fixture(2);
+        let src = dir.path().join("new.png");
+        image::RgbImage::from_pixel(200, 100, image::Rgb([9, 9, 9])).save(&src).unwrap();
+        let r = fastlabel_core::add::copy_sources(
+            dir.path(),
+            &fastlabel_core::add::collect(std::slice::from_ref(&src)),
+            |_, _| true,
+        );
+        ws.register_added(&r.copied, None).unwrap();
+        let idx = ws.project.dataset.images().len() - 1;
+        let id = ws.project.dataset.images()[idx].id;
+
+        assert!(ws.toggle_confirm_frame(0).is_err(), "saved boxes: refused");
+        ws.toggle_confirm_frame(idx).unwrap();
+        ws.go_to_frame(idx);
+        ws.add_box(fastlabel_core::BBox::new(10.0, 10.0, 30.0, 20.0)).unwrap();
+        assert!(!ws.todo_tile(idx).confirmed, "drawing a box takes the mark back");
+        ws.undo().unwrap();
+        assert!(ws.todo_tile(idx).confirmed && ws.todo_tile(idx).drawn == 0, "one undo step");
+        ws.undo().unwrap();
+        ws.go_to_frame(idx);
+        ws.add_box(fastlabel_core::BBox::new(10.0, 10.0, 30.0, 20.0)).unwrap();
+        assert!(ws.toggle_confirm_frame(idx).is_err(), "boxes drawn: refused");
+
+        // Accepting a prediction on a background frame takes the mark back too.
+        ws.undo().unwrap();
+        ws.toggle_confirm_frame(idx).unwrap();
+        let pred = fastlabel_core::PredRef {
+            image_id: id,
+            category_id: 1,
+            bbox: fastlabel_core::BBox::new(5.0, 5.0, 20.0, 20.0),
+            score: 0.9,
+        };
+        ws.record(Op::PredMark { pred, mark: PredMark::Accept }).unwrap();
+        assert!(!ws.todo_tile(idx).confirmed);
+        ws.record(Op::PredMark { pred, mark: PredMark::Accept }).unwrap(); // toggles off
+        assert!(!ws.todo_tile(idx).confirmed, "removing an accept does not re-mark");
     }
 
     #[test]

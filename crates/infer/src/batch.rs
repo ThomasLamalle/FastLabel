@@ -22,13 +22,6 @@ pub struct Progress {
     pub cancel: AtomicBool,
 }
 
-impl Progress {
-    pub fn fraction(&self) -> f32 {
-        let total = self.total.load(Ordering::Relaxed);
-        if total == 0 { 0.0 } else { self.done.load(Ordering::Relaxed) as f32 / total as f32 }
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct BatchResult {
     pub detections: Vec<(usize, Vec<Detection>)>,

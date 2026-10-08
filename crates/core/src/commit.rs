@@ -171,12 +171,17 @@ pub fn apply(ds: &Dataset, pending: &PendingState, review: &ReviewState) -> Appl
 
     write_splits(ds, &mut coco, pending, &mut summary);
 
+    // Background means no boxes: a frame is recorded as background only if
+    // it ends up without any, and a background frame that has boxes again
+    // stops being one.
+    let with_boxes: HashSet<ImageId> = coco.annotations.iter().map(|a| a.image_id).collect();
     for &image in &pending.confirmed_frames {
-        if !frames.contains(&image) && dims.contains_key(&image) {
+        if !frames.contains(&image) && dims.contains_key(&image) && !with_boxes.contains(&image) {
             review.empty_frames.insert(image);
             summary.confirmed += 1;
         }
     }
+    review.empty_frames.retain(|i| !with_boxes.contains(i));
     let kept: HashSet<AnnId> = coco.annotations.iter().map(|a| a.id).collect();
     review.retain(|a| kept.contains(&a), |i| !frames.contains(&i));
     Applied { coco, review, trashed_files, summary }
@@ -293,7 +298,7 @@ mod tests {
         });
         log.push(Op::FrameDelete { image: 3 });
         log.push(Op::SetTags { image: 2, tags: vec!["blurry".into()] });
-        log.push(Op::ConfirmFrame { image: 2 });
+        log.push(Op::ConfirmFrame { image: 2 }); // has boxes: ignored
         log.push(Op::ConfirmFrame { image: 3 }); // deleted: ignored
 
         let out = apply(&ds, log.state(), &ReviewState::default());
@@ -317,12 +322,12 @@ mod tests {
         assert_eq!(out.trashed_files, vec!["images/train/0003.jpg"]);
         assert_eq!(out.review.reviewed.iter().copied().collect::<Vec<_>>(), vec![2, 3, 5, 6]);
         assert!(out.review.is_rejected(&pred(2, b(40.0))));
-        assert_eq!(out.review.empty_frames.iter().copied().collect::<Vec<_>>(), vec![2]);
+        assert!(out.review.empty_frames.is_empty());
         assert_eq!(
             out.summary,
             Summary {
                 deleted_annotations: 2,
-                confirmed: 2,
+                confirmed: 1,
                 replaced: 1,
                 edited: 1,
                 added: 1,
@@ -335,6 +340,21 @@ mod tests {
         );
         // The base dataset is untouched.
         assert_eq!(ds.annotations().len(), 4);
+    }
+
+    #[test]
+    fn background_frames_never_have_boxes() {
+        let ds = dataset(3, &[(1, b(0.0))]);
+        let mut review = ReviewState::default();
+        review.empty_frames.insert(2); // will get a box below
+        let mut log = EditLog::new(10);
+        log.push(Op::ConfirmFrame { image: 1 }); // has a box: ignored
+        log.push(Op::ConfirmFrame { image: 3 });
+        log.push(Op::PredMark { pred: pred(2, b(0.0)), mark: PredMark::Accept });
+        let out = apply(&ds, log.state(), &review);
+        assert_eq!(out.review.empty_frames.iter().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(out.summary.confirmed, 1);
+        assert_eq!(out.coco.annotations.len(), 2, "boxes are never removed for it");
     }
 
     #[test]

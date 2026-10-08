@@ -52,10 +52,6 @@ impl DiskCache {
         Self { dir: dir.into() }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Cache key; `None` when the source file cannot be stat'ed.
     pub fn key(source: &Path, region: Region, max_side: u32) -> Option<u64> {
         let meta = fs::metadata(source).ok()?;

@@ -59,6 +59,7 @@ pub fn cluster_color(label: i32) -> Color32 {
 }
 
 pub enum ClusterEvent {
+    BrowseModel,
     ComputeEmbeddings,
     /// Recompute the layout (new embeddings).
     Relayout,
@@ -173,13 +174,15 @@ impl ClusterView {
         v
     }
 
-    /// Frames shown with the current split filter.
+    /// Frames shown with the current split and "No boxes" filters.
     fn visible(&self, ws: &Workspace) -> Vec<(usize, [f32; 2], i32)> {
+        let ds = &ws.project.dataset;
         self.points
             .iter()
             .enumerate()
             .filter_map(|(i, p)| p.map(|(pos, l)| (i, pos, l)))
             .filter(|(i, ..)| ws.opts.split.matches(ws.split_of(*i)))
+            .filter(|(i, ..)| !ws.opts.no_boxes || ds.annotations_of(*i).next().is_none())
             .collect()
     }
 
@@ -278,11 +281,8 @@ impl ClusterView {
             {
                 *setup.model_path = (!path.is_empty()).then(|| PathBuf::from(&path));
             }
-            if ui.button("Browse…").clicked()
-                && let Some(p) =
-                    rfd::FileDialog::new().add_filter("ONNX model", &["onnx"]).pick_file()
-            {
-                *setup.model_path = Some(p);
+            if ui.button("Browse…").clicked() {
+                events.push(ClusterEvent::BrowseModel);
             }
             let idle = !setup.busy;
             if setup.missing > 0
@@ -433,7 +433,7 @@ impl ClusterView {
             let text = if self.layout.is_none() {
                 "No layout yet: choose an embedding model and compute the embeddings."
             } else {
-                "No frames to show with the current split filter."
+                "No frames to show with the current filters."
             };
             painter.text(
                 rect.center(),

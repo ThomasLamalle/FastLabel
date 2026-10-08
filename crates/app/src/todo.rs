@@ -21,6 +21,8 @@ pub struct TodoState {
     /// Image indices, newest first.
     pub frames: Vec<usize>,
     pub selected: usize,
+    /// Also list the frames saved as background.
+    pub show_background: bool,
     pub ensure_visible: bool,
     offset: f32,
     view_h: f32,
@@ -29,13 +31,15 @@ pub struct TodoState {
 pub enum TodoEvent {
     Select(usize),
     Open(usize),
+    /// The list changed (Show background toggled).
+    Refresh,
 }
 
 impl TodoState {
     /// Rebuilds the list, keeping the selected frame when it is still there.
     pub fn refresh(&mut self, ws: &mut Workspace) {
         let keep = self.frames.get(self.selected).copied();
-        self.frames = ws.todo_frames();
+        self.frames = ws.todo_frames(self.show_background);
         self.selected = keep
             .and_then(|f| self.frames.iter().position(|&x| x == f))
             .unwrap_or(self.selected)
@@ -60,7 +64,7 @@ impl TodoState {
     pub fn advance(&mut self, ws: &Workspace) {
         let next = (self.selected + 1..self.frames.len()).find(|&i| {
             let t = ws.todo_tile(self.frames[i]);
-            !t.confirmed && !t.deleted && t.drawn == 0
+            !t.confirmed && !t.background && !t.deleted && t.drawn == 0
         });
         if let Some(i) = next {
             self.selected = i;
@@ -86,6 +90,13 @@ pub fn show(
     let n = state.frames.len();
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{n} frames without boxes")).strong());
+        if ui
+            .toggle_value(&mut state.show_background, "Show background")
+            .on_hover_text("Also list the frames already saved as background")
+            .changed()
+        {
+            events.push(TodoEvent::Refresh);
+        }
         ui.label(
             RichText::new(
                 "newest first · Enter/E or double click: draw boxes · G: background (nothing to annotate) · \
@@ -201,6 +212,8 @@ fn paint(
         Some(("G background", GT_COLOR))
     } else if tile.drawn > 0 {
         Some(("boxes drawn", DRAWN_COLOR))
+    } else if tile.background {
+        Some(("background", Color32::from_gray(170)))
     } else {
         None
     };

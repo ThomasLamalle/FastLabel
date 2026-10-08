@@ -127,6 +127,8 @@ pub struct ViewOptions {
     pub fn_only: bool,
     pub hide_reviewed: bool,
     pub split: SplitFilter,
+    /// Only frames without GT boxes (their predictions, in the mosaic).
+    pub no_boxes: bool,
     /// Only crops of these frames (a cluster selection); not persisted.
     #[serde(skip)]
     pub frames: Option<Arc<BTreeSet<ImageId>>>,
@@ -252,6 +254,9 @@ pub fn build(
             continue;
         }
         if opts.frames.as_ref().is_some_and(|f| !f.contains(&img.id)) {
+            continue;
+        }
+        if opts.no_boxes && ds.annotations_of(image_idx).next().is_some() {
             continue;
         }
         let image_preds = preds.and_then(|p| p.of(image_idx));
@@ -493,6 +498,25 @@ pub(crate) mod tests {
             run(ViewOptions { hide_reviewed: true, ..Default::default() }, &review),
             vec!["#2", "#3"]
         );
+    }
+
+    #[test]
+    fn no_boxes_filter_keeps_predictions_of_frames_without_boxes() {
+        let ds = dataset(&["a.jpg", "b.jpg"], &[(1, BBox::new(0.0, 0.0, 10.0, 10.0))]);
+        let mut preds = Predictions::empty("m", 0.1);
+        preds.set_image(1, vec![pred(2, BBox::new(5.0, 5.0, 10.0, 10.0), 0.5)]);
+        let ev = evaluate(&ds, &preds);
+        let opts = ViewOptions { no_boxes: true, ..Default::default() };
+        let crops = build(
+            &ds,
+            Some(&preds),
+            Some(&ev),
+            &ReviewState::default(),
+            &Uniformity::default(),
+            FrameInfo::default(),
+            &opts,
+        );
+        assert_eq!(ids(&crops), vec!["P5"]);
     }
 
     #[test]

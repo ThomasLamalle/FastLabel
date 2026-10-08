@@ -185,10 +185,16 @@ fn real_dataset_shot() {
     h.run_steps(2);
     settle(&mut h);
     save_shot(&mut h, "real_02.png");
+    h.get_by_label("To do (T)").click();
+    h.run_steps(2);
+    h.get_by_label("Show background").click();
+    h.run_steps(2);
+    settle(&mut h);
+    save_shot(&mut h, "real_03.png");
 }
 
 /// Opt-in: runs a real model on the selected crop's frame through the app.
-/// `FASTLABEL_SHOT_DATASET=<copy> FASTLABEL_MODEL=<model.onnx> cargo test -p fastlabel model_on_frame -- --ignored`
+/// `FASTLABEL_SHOT_DATASET=<copy> FASTLABEL_MODEL=<model.onnx|best.pt> cargo test -p fastlabel model_on_frame -- --ignored`
 #[test]
 #[ignore]
 fn model_on_frame() {
@@ -201,9 +207,9 @@ fn model_on_frame() {
     h.state_mut().session_mut().model_path = Some(model);
     let ctx = h.ctx.clone();
     h.state_mut().run_model(&ctx, crate::inference::Scope::Frame(idx));
-    for _ in 0..600 {
+    for _ in 0..6000 {
         h.step();
-        if !h.state().inference.is_running() {
+        if !h.state().inference.is_running() && h.state().convert_task.is_none() {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -881,9 +887,15 @@ fn todo_tab_lists_added_frames_and_confirms_background() {
     h.key_press(Key::L);
     h.run_steps(2);
     assert_eq!(h.state().ws().frame.image_idx, second, "next to-do frame, not the next image");
-    // Right click on the frame: next to-do frame too.
+    assert!(h.state().ws().todo_tile(first).confirmed, "skipped untouched: background");
     h.key_press(Key::H);
     h.run_steps(2);
+    assert!(!h.state().ws().todo_tile(second).confirmed, "going back marks nothing");
+    h.key_press(Key::G); // G on a confirmed frame takes the mark back
+    h.run_steps(2);
+    assert!(!h.state().ws().todo_tile(first).confirmed);
+    assert_eq!(h.state().ws().frame.image_idx, first, "unmarking does not move");
+    // Right click: next frame, skipping this one as background again.
     for pressed in [true, false] {
         h.event(egui::Event::PointerButton {
             pos: egui::pos2(500.0, 400.0),
@@ -895,12 +907,10 @@ fn todo_tab_lists_added_frames_and_confirms_background() {
     }
     h.run_steps(1);
     assert_eq!(h.state().ws().frame.image_idx, second, "right click: next frame");
-    h.key_press(Key::H);
-    h.run_steps(2);
-    h.key_press(Key::G); // no box selected, empty frame: background, then next
-    h.run_steps(2);
     assert!(h.state().ws().todo_tile(first).confirmed);
-    assert_eq!(h.state().ws().frame.image_idx, second);
+    h.key_press(Key::L); // last to-do frame: no move, no mark
+    h.run_steps(2);
+    assert!(!h.state().ws().todo_tile(second).confirmed);
     settle(&mut h);
     save_shot(&mut h, "31_todo_frame.png");
     h.key_press(Key::Tab); // back to the grid, on the frame reached

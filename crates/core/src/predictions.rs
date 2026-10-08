@@ -167,10 +167,6 @@ impl Predictions {
         self.per_image.iter().all(Option::is_none)
     }
 
-    pub fn evaluated_images(&self) -> usize {
-        self.per_image.iter().filter(|p| p.is_some()).count()
-    }
-
     pub fn len(&self) -> usize {
         self.per_image.iter().flatten().map(Vec::len).sum()
     }
@@ -248,7 +244,6 @@ mod tests {
         assert!(preds.of(1).is_none(), "file name mismatch → unpredicted");
         assert!(preds.of(2).is_none());
         assert_eq!(preds.warnings.len(), 2);
-        assert_eq!(preds.evaluated_images(), 1);
     }
 
     #[test]

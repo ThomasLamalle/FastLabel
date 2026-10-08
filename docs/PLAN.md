@@ -158,7 +158,7 @@ Everywhere: `S` save new version · `Q` save and quit (closes the popup when ope
 | To do (T) | Action |
 |---|---|
 | Arrows / hjkl, PgUp / PgDn, Home / End | Move |
-| Enter / E / double click | Frame mode through the to-do frames only (h / l next / previous, G background + next, Tab / Esc back to the grid) |
+| Enter / E / double click | Frame mode through the to-do frames only (h / l next / previous; skipping forward past an untouched frame marks it background; G background + next; Tab / Esc back to the grid) |
 | G / F | Background (nothing to annotate) / delete frame (toggles, advance) |
 | Esc, T, M, Tab, Q | Back to the mosaic |
 

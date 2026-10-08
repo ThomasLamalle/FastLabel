@@ -29,6 +29,8 @@ pub enum Mode {
     Cluster,
     /// Frames without any box (e.g. just added), to annotate.
     Todo,
+    /// The dataset's labeling rules, editable.
+    Rules,
 }
 
 /// Finished embedding run: model id, (image key, vector), failures, cancelled.
@@ -55,6 +57,25 @@ struct Status {
     text: String,
     error: bool,
     at: Instant,
+}
+
+/// What a file dialog picks.
+enum Pick {
+    Open,
+    ExportZip,
+    ExportFolder,
+    Add,
+    Model,
+    EmbedModel,
+}
+
+fn pick_onnx() -> Vec<PathBuf> {
+    rfd::FileDialog::new().add_filter("ONNX model", &["onnx"]).pick_file().into_iter().collect()
+}
+
+fn pick_detector() -> Vec<PathBuf> {
+    let dialog = rfd::FileDialog::new().add_filter("ONNX or ultralytics model", &["onnx", "pt"]);
+    dialog.pick_file().into_iter().collect()
 }
 
 pub struct FastLabelApp {
@@ -86,9 +107,13 @@ pub struct FastLabelApp {
     embed_task: Option<Task<EmbedOutcome>>,
     layout_task: Option<Task<Option<SavedLayout>>>,
     report_task: Option<Task<Result<PathBuf, String>>>,
+    /// `.pt` → ONNX export, then the run it was started for.
+    pub(crate) convert_task: Option<(Scope, Task<Result<PathBuf, String>>)>,
     /// Export dialog open.
     export_dialog: bool,
     add_task: Option<Task<fastlabel_core::add::AddReport>>,
+    /// Open file dialog and what its result is for.
+    pick: Option<(Pick, Task<Vec<PathBuf>>)>,
     status: Option<Status>,
     /// Set once the exit save succeeded, so the close request goes through.
     exit_ok: bool,
@@ -128,9 +153,11 @@ impl FastLabelApp {
             embeddings: None,
             embed_task: None,
             layout_task: None,
+            convert_task: None,
             report_task: None,
             export_dialog: false,
             add_task: None,
+            pick: None,
             status: None,
             exit_ok: false,
             #[cfg(test)]
@@ -197,6 +224,11 @@ impl FastLabelApp {
                     ws.project.dataset.annotations().len()
                 );
                 self.session.last_dataset = Some(dir.to_path_buf());
+                if let Some(old) = &mut self.ws
+                    && let Err(e) = old.save_rules()
+                {
+                    tracing::warn!("rules not saved: {e:#}");
+                }
                 self.ws = Some(ws);
                 self.cluster = ClusterView::default();
                 self.cluster.min_cluster_size = self.session.min_cluster_size;
@@ -204,7 +236,7 @@ impl FastLabelApp {
                 self.embed_task = None;
                 self.layout_task = None;
                 self.todo = Default::default();
-                if matches!(self.mode, Mode::Cluster | Mode::Todo) {
+                if matches!(self.mode, Mode::Cluster | Mode::Todo | Mode::Rules) {
                     self.mode = Mode::Mosaic;
                 }
                 self.mosaic.ensure_visible = true;
@@ -226,9 +258,43 @@ impl FastLabelApp {
             return;
         }
         let start = self.session.last_dataset.clone().unwrap_or_default();
-        if let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() {
+        self.pick(ctx, Pick::Open, move || {
+            rfd::FileDialog::new().set_directory(start).pick_folder().into_iter().collect()
+        });
+    }
+
+    /// Shows a file dialog on its own thread: the blocking dialog would stop
+    /// the event loop and the compositor would report "not responding".
+    fn pick(
+        &mut self,
+        ctx: &egui::Context,
+        what: Pick,
+        dialog: impl FnOnce() -> Vec<PathBuf> + Send + 'static,
+    ) {
+        if self.pick.is_none() {
+            self.pick = Some((what, Task::spawn("file dialog", ctx, move |_| dialog())));
+        }
+    }
+
+    fn poll_pick(&mut self, ctx: &egui::Context) {
+        let Some(paths) = self.pick.as_mut().and_then(|(_, t)| t.poll()) else { return };
+        let Some((what, _)) = self.pick.take() else { return };
+        let Some(first) = paths.first().cloned() else { return };
+        match what {
             // Pending edits of the current dataset stay in its journal.
-            self.open(ctx, &dir, false);
+            Pick::Open => self.open(ctx, &first, false),
+            Pick::ExportZip => self.finish_export(ctx, fastlabel_core::export::Target::Zip(first)),
+            Pick::ExportFolder => {
+                let out = first.join(self.export_name().1);
+                if out.exists() {
+                    self.error(format!("{} already exists", out.display()));
+                } else {
+                    self.finish_export(ctx, fastlabel_core::export::Target::Folder(out));
+                }
+            }
+            Pick::Add => self.finish_add(ctx, paths),
+            Pick::Model => self.session.model_path = Some(first),
+            Pick::EmbedModel => self.session.embed_model_path = Some(first),
         }
     }
 
@@ -305,11 +371,23 @@ impl FastLabelApp {
     }
 
     pub(crate) fn run_model(&mut self, ctx: &egui::Context, scope: Scope) {
-        let Some(ws) = &self.ws else { return };
+        if self.ws.is_none() {
+            return;
+        }
         let Some(model) = self.session.model_path.clone().filter(|p| p.is_file()) else {
-            self.error("Choose an ONNX model file first (Model menu)");
+            self.error("Choose an ONNX or .pt model file first (Model menu)");
             return;
         };
+        let Some(model) = crate::inference::onnx_for(&model) else {
+            if self.convert_task.is_none() {
+                self.info(format!("Exporting {} to ONNX…", model.display()));
+                let task =
+                    Task::spawn("ONNX export", ctx, move |_| crate::inference::export_pt(&model));
+                self.convert_task = Some((scope, task));
+            }
+            return;
+        };
+        let Some(ws) = &self.ws else { return };
         let items = match scope {
             Scope::All => ws.inference_items(),
             Scope::Unpredicted => ws.unpredicted_items(),
@@ -320,6 +398,15 @@ impl FastLabelApp {
             return;
         }
         self.inference.start(ctx, &model, self.session.confidence, scope, items);
+    }
+
+    fn poll_convert(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.convert_task.as_mut().and_then(|(_, t)| t.poll()) else { return };
+        let Some((scope, _)) = self.convert_task.take() else { return };
+        match result {
+            Ok(_) => self.run_model(ctx, scope),
+            Err(e) => self.error(e),
+        }
     }
 
     fn poll_inference(&mut self) {
@@ -365,52 +452,58 @@ impl FastLabelApp {
     /// Saves pending edits, asks where to write, then exports in the
     /// background with the dialog's settings.
     fn start_export(&mut self, ctx: &egui::Context) {
-        use fastlabel_core::export::{ExportOptions, Target};
-        if self.export_task.is_some() || !self.save() {
+        if self.export_task.is_some() || self.pick.is_some() || !self.save() {
             return;
         }
-        let Some(ws) = &self.ws else { return };
-        let p = &ws.project;
-        let Some(source) = &p.source else { return };
-        let settings = self.session.export.clone();
-        let splits: Vec<Split> =
-            Split::ALL.into_iter().filter(|s| settings.splits[*s as usize]).collect();
-        if splits.is_empty() {
+        let Some(ws) = self.ws.as_ref().filter(|ws| ws.project.source.is_some()) else { return };
+        if !self.session.export.splits.contains(&true) {
             self.error("Choose at least one split to export");
             return;
         }
+        let name = self.export_name().1;
+        let start_dir = ws.project.dir.parent().unwrap_or(&ws.project.dir).to_path_buf();
+        if self.session.export.zip {
+            self.pick(ctx, Pick::ExportZip, move || {
+                rfd::FileDialog::new()
+                    .set_directory(&start_dir)
+                    .set_file_name(format!("{name}.zip"))
+                    .add_filter("zip", &["zip"])
+                    .save_file()
+                    .into_iter()
+                    .collect()
+            });
+        } else {
+            self.pick(ctx, Pick::ExportFolder, move || {
+                rfd::FileDialog::new()
+                    .set_title("Folder to create the export in")
+                    .set_directory(&start_dir)
+                    .pick_folder()
+                    .into_iter()
+                    .collect()
+            });
+        }
+    }
+
+    /// (dataset folder name, export name).
+    fn export_name(&self) -> (String, String) {
+        let Some(ws) = &self.ws else { return Default::default() };
+        let p = &ws.project;
         let dir_name =
             p.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let stem = source.file_name();
+        let stem = p.source.as_ref().map(|s| s.file_name()).unwrap_or_default();
         let stem = stem.trim_start_matches("annotations.").trim_end_matches(".json");
-        let name = format!("{dir_name}_{stem}_{}", settings.format.slug());
-        let start_dir = p.dir.parent().unwrap_or(&p.dir).to_path_buf();
-        let target = if settings.zip {
-            let Some(out) = rfd::FileDialog::new()
-                .set_directory(&start_dir)
-                .set_file_name(format!("{name}.zip"))
-                .add_filter("zip", &["zip"])
-                .save_file()
-            else {
-                return;
-            };
-            Target::Zip(out)
-        } else {
-            let Some(parent) = rfd::FileDialog::new()
-                .set_title("Folder to create the export in")
-                .set_directory(&start_dir)
-                .pick_folder()
-            else {
-                return;
-            };
-            let out = parent.join(&name);
-            if out.exists() {
-                self.error(format!("{} already exists", out.display()));
-                return;
-            }
-            Target::Folder(out)
-        };
-        let opts = ExportOptions { format: settings.format, splits, name: dir_name };
+        let name = format!("{dir_name}_{stem}_{}", self.session.export.format.slug());
+        (dir_name, name)
+    }
+
+    fn finish_export(&mut self, ctx: &egui::Context, target: fastlabel_core::export::Target) {
+        use fastlabel_core::export::{ExportOptions, Target};
+        let Some(ws) = &self.ws else { return };
+        let p = &ws.project;
+        let settings = &self.session.export;
+        let splits: Vec<Split> =
+            Split::ALL.into_iter().filter(|s| settings.splits[*s as usize]).collect();
+        let opts = ExportOptions { format: settings.format, splits, name: self.export_name().0 };
         let (root, coco) = (p.dir.clone(), p.dataset.coco.clone());
         self.export_task = Some(Task::spawn("export", ctx, move |progress| {
             use std::sync::atomic::Ordering;
@@ -437,15 +530,24 @@ impl FastLabelApp {
         }
         let dialog = rfd::FileDialog::new()
             .set_directory(ws.project.dir.parent().unwrap_or(&ws.project.dir));
-        let picked = if folders {
-            dialog.set_title("Folders of images to add").pick_folders()
-        } else {
-            dialog
-                .set_title("Images to add")
-                .add_filter("images", &fastlabel_core::yolo::IMAGE_EXTENSIONS)
-                .pick_files()
-        };
-        let Some(paths) = picked.filter(|p| !p.is_empty()) else { return };
+        self.pick(ctx, Pick::Add, move || {
+            let picked = if folders {
+                dialog.set_title("Folders of images to add").pick_folders()
+            } else {
+                dialog
+                    .set_title("Images to add")
+                    .add_filter("images", &fastlabel_core::yolo::IMAGE_EXTENSIONS)
+                    .pick_files()
+            };
+            picked.unwrap_or_default()
+        });
+    }
+
+    fn finish_add(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        let Some(ws) = &self.ws else { return };
+        if self.add_task.is_some() {
+            return;
+        }
         let dir = ws.project.dir.clone();
         self.add_task = Some(Task::spawn("adding images", ctx, move |progress| {
             use std::sync::atomic::Ordering;
@@ -604,18 +706,15 @@ impl FastLabelApp {
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut path)
-                            .hint_text("model.onnx")
+                            .hint_text("model.onnx or best.pt")
                             .desired_width(280.0),
                     )
                     .changed()
                 {
                     self.session.model_path = (!path.is_empty()).then(|| PathBuf::from(&path));
                 }
-                if ui.button("Browse…").clicked()
-                    && let Some(p) =
-                        rfd::FileDialog::new().add_filter("ONNX model", &["onnx"]).pick_file()
-                {
-                    self.session.model_path = Some(p);
+                if ui.button("Browse…").clicked() {
+                    self.pick(&ctx, Pick::Model, pick_detector);
                 }
             });
             ui.add(
@@ -710,6 +809,13 @@ impl FastLabelApp {
 
     fn set_mode(&mut self, mode: Mode) {
         let Some(ws) = &mut self.ws else { return };
+        if self.mode == Mode::Rules
+            && mode != Mode::Rules
+            && let Err(e) = ws.save_rules()
+        {
+            self.error(format!("Rules not saved: {e:#}"));
+            return;
+        }
         if mode != Mode::Frame {
             ws.frame_order = None;
             self.frame_from_todo = false;
@@ -725,7 +831,7 @@ impl FastLabelApp {
                 ws.select_crop_of_frame();
                 self.mosaic.ensure_visible = true;
             }
-            Mode::Clean | Mode::Cluster => {}
+            Mode::Clean | Mode::Cluster | Mode::Rules => {}
         }
         self.mode = mode;
     }
@@ -754,7 +860,7 @@ impl FastLabelApp {
                     self.popup = false;
                 } else if self.mode == Mode::Clean {
                     self.exit_clean();
-                } else if matches!(self.mode, Mode::Cluster | Mode::Todo) {
+                } else if matches!(self.mode, Mode::Cluster | Mode::Todo | Mode::Rules) {
                     self.set_mode(Mode::Mosaic);
                 } else {
                     self.inference.shutdown();
@@ -845,6 +951,12 @@ impl FastLabelApp {
             }
             return;
         }
+        if self.mode == Mode::Rules && !self.popup {
+            if key == Key::Escape {
+                self.set_mode(Mode::Mosaic);
+            }
+            return;
+        }
         if self.mode == Mode::Todo && !self.popup {
             if let Err(e) = self.todo_key(key, repeat, m) {
                 self.error(e);
@@ -920,10 +1032,7 @@ impl FastLabelApp {
         match key {
             Key::ArrowLeft | Key::H | Key::ArrowRight | Key::L if !popup => {
                 let dir = if matches!(key, Key::ArrowLeft | Key::H) { -1 } else { 1 };
-                if let Some(i) = ws.step_frame(dir, m.command) {
-                    ws.go_to_frame(i);
-                }
-                Ok(())
+                ws.next_frame(dir, m.command)
             }
             Key::Home | Key::End if !popup => {
                 if let Some(i) = ws.edge_frame(key == Key::End) {
@@ -1351,6 +1460,10 @@ impl FastLabelApp {
                 }
                 Ok(())
             }
+            ClusterEvent::BrowseModel => {
+                self.pick(ctx, Pick::EmbedModel, pick_onnx);
+                Ok(())
+            }
             ClusterEvent::Exit => {
                 self.set_mode(Mode::Mosaic);
                 Ok(())
@@ -1705,12 +1818,8 @@ impl FastLabelApp {
                 EditorAction::SetBox(id, b) => ws.set_box(id, b),
                 EditorAction::AddBox(b) => ws.add_box(b).map(|_| ()),
                 // Frame mode only (the popup and the cleaning view stay put).
-                EditorAction::Next => {
-                    if !popup && let Some(i) = ws.step_frame(1, false) {
-                        ws.go_to_frame(i);
-                    }
-                    Ok(())
-                }
+                EditorAction::Next if !popup => ws.next_frame(1, false),
+                EditorAction::Next => Ok(()),
             };
             if let Err(e) = r {
                 error = Some(e);
@@ -1821,25 +1930,30 @@ impl FastLabelApp {
                         ui.close();
                     }
                 });
-                if ui
-                    .selectable_label(self.mode == Mode::Todo, "To do (T)")
-                    .on_hover_text("Frames without any box (e.g. just added), newest first: draw boxes, or G for background")
-                    .clicked()
-                {
-                    let next = if self.mode == Mode::Todo { Mode::Mosaic } else { Mode::Todo };
-                    self.set_mode(next);
-                }
-                if ui
-                    .selectable_label(self.mode == Mode::Cluster, "Clusters (C)")
-                    .on_hover_text("Frames as a point cloud of image embeddings: select clusters, move them to another split")
-                    .clicked()
-                {
-                    if self.mode == Mode::Cluster {
-                        self.set_mode(Mode::Mosaic);
-                    } else {
-                        self.start_cluster_mode(&ctx);
+                ui.separator();
+                let tabs = [
+                    (Mode::Mosaic, "Mosaic (M)", "Crops of the GT boxes and predictions"),
+                    (Mode::Frame, "Frame (M)", "Frame by frame annotation"),
+                    (
+                        Mode::Todo,
+                        "To do (T)",
+                        "Frames without any box (e.g. just added), newest first: draw boxes, or G for background",
+                    ),
+                    (
+                        Mode::Cluster,
+                        "Clusters (C)",
+                        "Frames as a point cloud of image embeddings: select clusters, move them to another split",
+                    ),
+                    (Mode::Rules, "Rules", "The dataset's labeling rules, editable"),
+                ];
+                for (mode, label, hover) in tabs {
+                    if ui.selectable_label(self.mode == mode, label).on_hover_text(hover).clicked()
+                        && self.mode != mode
+                    {
+                        self.goto_tab(&ctx, mode);
                     }
                 }
+                ui.separator();
                 if ui
                     .add_enabled(self.report_task.is_none(), egui::Button::new("Report"))
                     .on_hover_text("HTML report on all frames: split balance, box statistics, input size guide, similarity between splits (opens in the browser)")
@@ -1933,6 +2047,9 @@ impl FastLabelApp {
                         .on_hover_text("FP: prediction overlapping no GT box. FN: GT box overlapping no prediction.");
                 })
             });
+            ui.toggle_value(&mut opts.no_boxes, "No boxes").on_hover_text(
+                "Frames without GT boxes: their predictions in the mosaic (whole frames: To do tab), their points in the cluster view",
+            );
             if opts.sort == SortKey::Uniformity
                 && ws.opts.sort != SortKey::Uniformity
                 && !ws.missing_uniformity().is_empty()
@@ -1953,6 +2070,38 @@ impl FastLabelApp {
         }
     }
 
+    /// Toolbar tab click: leaves the cleaning view first.
+    fn goto_tab(&mut self, ctx: &egui::Context, mode: Mode) {
+        self.popup = false;
+        if self.mode == Mode::Clean {
+            self.exit_clean();
+        }
+        if mode == Mode::Cluster {
+            self.start_cluster_mode(ctx);
+        } else {
+            self.set_mode(mode);
+        }
+    }
+
+    /// Rules tab: the dataset's labeling rules, saved when the text field
+    /// loses focus, on leaving the tab and on exit.
+    fn rules_view(&mut self, ui: &mut egui::Ui) {
+        let Some(ws) = &mut self.ws else { return };
+        ui.heading("Labeling rules");
+        ui.label(RichText::new("Saved in .fastlabel/rules.md. Esc: back to the mosaic.").weak());
+        let mut lost_focus = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let edit = egui::TextEdit::multiline(&mut ws.rules)
+                .hint_text("Write the labeling rules here")
+                .desired_width(f32::INFINITY)
+                .desired_rows(20);
+            lost_focus = ui.add(edit).lost_focus();
+        });
+        if lost_focus && let Err(e) = ws.save_rules() {
+            self.error(format!("Rules not saved: {e:#}"));
+        }
+    }
+
     fn status_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if self.mode == Mode::Clean
@@ -1968,7 +2117,7 @@ impl FastLabelApp {
             }
             if let Some(ws) = &self.ws {
                 let n = ws.crops.len();
-                let clean = matches!(self.mode, Mode::Clean | Mode::Cluster | Mode::Todo);
+                let clean = matches!(self.mode, Mode::Clean | Mode::Cluster | Mode::Todo | Mode::Rules);
                 if !clean {
                 ui.label(format!("{} / {n}", if n == 0 { 0 } else { ws.selected + 1 }));
                 if let Some(crop) = ws.selected_crop() {
@@ -2115,9 +2264,11 @@ impl eframe::App for FastLabelApp {
             t.begin_frame(&ctx);
         }
         self.poll_inference();
+        self.poll_convert(&ctx);
         self.poll_tasks(&ctx);
         self.poll_cluster_tasks(&ctx);
         self.poll_add();
+        self.poll_pick(&ctx);
         self.handle_keys(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -2152,6 +2303,10 @@ impl eframe::App for FastLabelApp {
                 self.cluster_panel(ui);
                 return;
             }
+            if self.mode == Mode::Rules {
+                self.rules_view(ui);
+                return;
+            }
             if self.mode == Mode::Todo {
                 let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
                 let mut open = None;
@@ -2159,6 +2314,7 @@ impl eframe::App for FastLabelApp {
                     match ev {
                         crate::todo::TodoEvent::Select(k) => self.todo.selected = k,
                         crate::todo::TodoEvent::Open(k) => open = Some(k),
+                        crate::todo::TodoEvent::Refresh => self.todo.refresh(ws),
                     }
                 }
                 if let Some(k) = open {
@@ -2219,6 +2375,11 @@ impl eframe::App for FastLabelApp {
     }
 
     fn on_exit(&mut self) {
+        if let Some(ws) = &mut self.ws
+            && let Err(e) = ws.save_rules()
+        {
+            tracing::warn!("rules not saved: {e:#}");
+        }
         self.inference.shutdown();
         self.save_session();
     }
