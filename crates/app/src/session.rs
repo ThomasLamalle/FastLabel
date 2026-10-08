@@ -56,11 +56,21 @@ pub struct ExportSettings {
     pub splits: [bool; 3],
     /// Zip file, else a folder (hardlinked images).
     pub zip: bool,
+    /// Downscale images to a long side of `imgsz`.
+    pub resize: bool,
+    /// `None`: the report's suggested input size.
+    pub imgsz: Option<u32>,
 }
 
 impl Default for ExportSettings {
     fn default() -> Self {
-        Self { format: Default::default(), splits: [true; 3], zip: true }
+        Self {
+            format: Default::default(),
+            splits: [true; 3],
+            zip: true,
+            resize: false,
+            imgsz: None,
+        }
     }
 }
 

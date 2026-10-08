@@ -150,6 +150,15 @@ pub fn recommend_imgsz(guide: &[(u32, f64, f64, f64)], max_native: u32) -> Optio
     capped.iter().find(|g| g.3 <= 0.02).or(capped.last()).map(|g| g.0)
 }
 
+/// The suggested input size of the report's size guide; `None` without boxes.
+pub fn suggested_imgsz(frames: &[&ReportFrame]) -> Option<u32> {
+    if frames.iter().all(|f| f.boxes.is_empty()) {
+        return None;
+    }
+    let max_native = frames.iter().map(|f| f.width.max(f.height)).max().unwrap_or(0);
+    recommend_imgsz(&input_size_guide(frames), max_native)
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -483,7 +492,7 @@ pub fn render(input: &ReportInput, neighbours: &[Neighbour]) -> String {
     // Input size guide.
     let guide = input_size_guide(&scope);
     let max_native = scope.iter().map(|f| f.width.max(f.height)).max().unwrap_or(0);
-    let rec = recommend_imgsz(&guide, max_native);
+    let rec = suggested_imgsz(&scope);
     h.push_str("<h2>Model input size guide</h2><p class=\"help\">Frames are letterboxed so their long side equals the input size. Short side of the boxes once scaled; boxes under 10 px at the input are hard for YOLO (smallest stride 8). Compute grows with the square of the size.</p><table><tr><th>imgsz</th><th>p5 short side</th><th>median short side</th><th>boxes &lt; 10 px</th><th>relative compute</th></tr>");
     for (sz, p5, med, share) in &guide {
         let cls = if Some(*sz) == rec { " class=\"rec\"" } else { "" };

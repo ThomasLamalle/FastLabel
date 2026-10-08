@@ -1,6 +1,6 @@
 //! Image decoding to RGB8.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use image::RgbImage;
 use zune_jpeg::JpegDecoder;
@@ -50,6 +50,43 @@ pub fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Export resizer ([`fastlabel_core::export::ResizeFn`]): each image decoded,
+/// resized to exactly `(w, h)` and re-encoded in its own format (JPEG at
+/// quality 95), spread over the cores.
+pub fn resize_batch(jobs: &[(PathBuf, u32, u32)]) -> Vec<Result<Vec<u8>, String>> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per = jobs.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(per)
+            .map(|c| {
+                s.spawn(move || {
+                    c.iter().map(|(p, w, h)| resize_file(p, *w, *h)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("resize thread")).collect()
+    })
+}
+
+fn resize_file(path: &Path, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    use fast_image_resize::{PixelType, Resizer, images::Image};
+    let img = decode_rgb(path).map_err(|e| e.to_string())?;
+    let src = Image::from_vec_u8(img.width(), img.height(), img.into_raw(), PixelType::U8x3)
+        .map_err(|e| e.to_string())?;
+    let mut dst = Image::new(w, h, PixelType::U8x3);
+    Resizer::new().resize(&src, &mut dst, None).map_err(|e| e.to_string())?;
+    let small = RgbImage::from_raw(w, h, dst.into_vec()).ok_or("resize buffer size mismatch")?;
+    match image::ImageFormat::from_path(path).map_err(|e| e.to_string())? {
+        image::ImageFormat::Jpeg => encode_jpeg(&small, 95),
+        format => {
+            let mut out = std::io::Cursor::new(Vec::new());
+            small.write_to(&mut out, format).map_err(|e| e.to_string())?;
+            Ok(out.into_inner())
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -78,5 +115,18 @@ pub(crate) mod tests {
         assert!(matches!(decode_rgb(&dir.path().join("missing.jpg")), Err(DecodeError::Io(..))));
         std::fs::write(dir.path().join("bad.jpg"), [0xFF, 0xD8, 0xFF, 0, 1, 2]).unwrap();
         assert!(matches!(decode_rgb(&dir.path().join("bad.jpg")), Err(DecodeError::Decode(..))));
+    }
+
+    #[test]
+    fn resize_batch_keeps_order_and_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let (png, jpg) = (dir.path().join("a.png"), dir.path().join("b.jpg"));
+        gradient(40, 20).save(&png).unwrap();
+        std::fs::write(&jpg, encode_jpeg(&gradient(30, 60), 95).unwrap()).unwrap();
+        let out = resize_batch(&[(png, 20, 10), (jpg.clone(), 15, 30), (jpg, 3, 6)]);
+        let dims: Vec<_> =
+            out.iter().map(|b| decode_bytes(b.as_ref().unwrap()).unwrap().dimensions()).collect();
+        assert_eq!(dims, [(20, 10), (15, 30), (3, 6)]);
+        assert!(out[0].as_ref().unwrap().starts_with(b"\x89PNG"));
     }
 }

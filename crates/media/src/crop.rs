@@ -45,15 +45,7 @@ impl Region {
     }
 }
 
-/// Size of a `w x h` image scaled down to fit `max_side` (never upscaled).
-pub fn fit(w: u32, h: u32, max_side: u32) -> (u32, u32) {
-    let longest = w.max(h);
-    if longest <= max_side || longest == 0 {
-        return (w, h);
-    }
-    let s = f64::from(max_side) / f64::from(longest);
-    (((f64::from(w) * s).round() as u32).max(1), ((f64::from(h) * s).round() as u32).max(1))
-}
+pub use fastlabel_core::geom::fit;
 
 /// Cuts `region` out of `img`, downscaled to fit `max_side`.
 pub fn thumbnail(img: &RgbImage, region: Region, max_side: u32) -> Option<RgbImage> {

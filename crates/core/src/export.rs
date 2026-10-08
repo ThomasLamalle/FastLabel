@@ -9,6 +9,8 @@
 //!
 //! Written to a zip (atomically) or to a new folder (built in a temporary
 //! sibling, then renamed; images hardlinked when possible, else copied).
+//! Optionally, images larger than a given long side are downscaled (labels
+//! follow), so training does not decode and resize full frames every epoch.
 //! A cancelled export leaves nothing behind.
 
 use std::collections::{BTreeMap, HashSet};
@@ -24,7 +26,7 @@ use crate::coco::{CategoryId, CocoAnnotation, CocoFile, CocoImage};
 use crate::dataset::{SPLIT_FIELD, Split};
 use crate::error::{Error, Result};
 use crate::fsutil;
-use crate::geom::BBox;
+use crate::geom::{self, BBox};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExportFormat {
@@ -70,13 +72,29 @@ pub enum Target {
     Folder(PathBuf),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Batch image resizer: `(source, width, height)` → the image at exactly
+/// that size, encoded in the source's format. Batches let the caller
+/// work in parallel (core has no threads).
+pub type ResizeFn = fn(&[(PathBuf, u32, u32)]) -> Vec<std::result::Result<Vec<u8>, String>>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Resize {
+    /// Long side of the exported images; smaller ones are exported as is.
+    pub max_side: u32,
+    pub resize: ResizeFn,
+}
+
+/// Images per [`ResizeFn`] call.
+const RESIZE_BATCH: usize = 32;
+
+#[derive(Clone, Debug)]
 pub struct ExportOptions {
     pub format: ExportFormat,
     /// Splits to export; frames of other splits (or without one) are left out.
     pub splits: Vec<Split>,
     /// Dataset name (NDJSON header and file name).
     pub name: String,
+    pub resize: Option<Resize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -102,6 +120,27 @@ struct Entry<'a> {
     split: Split,
     /// File name inside its split folder (unique per split).
     name: String,
+    /// Exported (width, height).
+    size: (u32, u32),
+}
+
+impl Entry<'_> {
+    fn resized(&self) -> bool {
+        self.size != (self.image.width, self.image.height)
+    }
+
+    /// The annotation in exported pixels.
+    fn scaled(&self, a: &CocoAnnotation) -> CocoAnnotation {
+        let mut a = a.clone();
+        if self.resized() {
+            let sx = f64::from(self.size.0) / f64::from(self.image.width);
+            let sy = f64::from(self.size.1) / f64::from(self.image.height);
+            let b = a.bbox;
+            a.bbox = BBox::new(b.x * sx, b.y * sy, b.w * sx, b.h * sy);
+            a.area *= sx * sy;
+        }
+        a
+    }
 }
 
 fn coco_dir(split: Split) -> &'static str {
@@ -142,7 +181,9 @@ fn entries<'a>(
             taken.insert((split, n.clone()));
             n
         };
-        out.push(Entry { image, split, name });
+        let (w, h) = (image.width, image.height);
+        let size = opts.resize.map_or((w, h), |r| geom::fit(w, h, r.max_side));
+        out.push(Entry { image, split, name, size });
     }
     out
 }
@@ -166,6 +207,7 @@ fn normalized(b: &BBox, w: u32, h: u32) -> Option<[f64; 4]> {
 trait Sink {
     fn text(&mut self, rel: &str, bytes: &[u8]) -> Result<()>;
     fn image(&mut self, rel: &str, src: &Path) -> Result<()>;
+    fn image_bytes(&mut self, rel: &str, bytes: &[u8]) -> Result<()>;
 }
 
 struct ZipSink<'w, W: Write + io::Seek> {
@@ -191,6 +233,14 @@ impl<W: Write + io::Seek> Sink for ZipSink<'_, W> {
             .map_err(|e| Error::Zip { path: self.out.clone(), source: e })?;
         io::copy(&mut file, &mut self.zip).map_err(|e| Error::io(src, e))?;
         Ok(())
+    }
+
+    fn image_bytes(&mut self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        self.zip
+            .start_file(rel, opts)
+            .map_err(|e| Error::Zip { path: self.out.clone(), source: e })?;
+        self.zip.write_all(bytes).map_err(|e| Error::io(&self.out, e))
     }
 }
 
@@ -221,6 +271,10 @@ impl Sink for FolderSink {
         }
         fs::copy(src, &p).map(|_| ()).map_err(|e| Error::io(&p, e))
     }
+
+    fn image_bytes(&mut self, rel: &str, bytes: &[u8]) -> Result<()> {
+        self.text(rel, bytes)
+    }
 }
 
 /// Writes the export. `progress(done, total)` returns false to cancel.
@@ -236,12 +290,30 @@ pub fn export(
     let mut write_all = |sink: &mut dyn Sink, report: &mut ExportReport| -> Result<bool> {
         write_texts(sink, coco, opts, &entries)?;
         let total = entries.len();
-        for (i, e) in entries.iter().enumerate() {
-            if !progress(i, total) {
-                return Ok(false);
+        for (c, chunk) in entries.chunks(RESIZE_BATCH).enumerate() {
+            let jobs: Vec<_> = chunk
+                .iter()
+                .filter(|e| e.resized())
+                .map(|e| (root.join(&e.image.file_name), e.size.0, e.size.1))
+                .collect();
+            let mut resized = match opts.resize {
+                Some(r) if !jobs.is_empty() => (r.resize)(&jobs),
+                _ => Vec::new(),
             }
-            sink.image(&image_path(opts.format, e), &root.join(&e.image.file_name))?;
-            report.per_split[e.split as usize] += 1;
+            .into_iter();
+            for (k, e) in chunk.iter().enumerate() {
+                if !progress(c * RESIZE_BATCH + k, total) {
+                    return Ok(false);
+                }
+                let (rel, src) = (image_path(opts.format, e), root.join(&e.image.file_name));
+                if e.resized() {
+                    let bytes = resized.next().unwrap_or_else(|| Err("not resized".into()));
+                    sink.image_bytes(&rel, &bytes.map_err(|m| Error::invalid(&src, m))?)?;
+                } else {
+                    sink.image(&rel, &src)?;
+                }
+                report.per_split[e.split as usize] += 1;
+            }
         }
         progress(total, total);
         Ok(true)
@@ -382,8 +454,8 @@ fn write_texts(
                     .map(|(c, [x, y, w, h])| json!([c, x, y, w, h]))
                     .collect();
                 let line = json!({
-                    "type": "image", "file": e.name, "width": e.image.width,
-                    "height": e.image.height, "split": e.split.name(),
+                    "type": "image", "file": e.name, "width": e.size.0,
+                    "height": e.size.1, "split": e.split.name(),
                     "annotations": {"boxes": boxes},
                 });
                 out.push_str(&serde_json::to_string(&line).expect("JSON serializes"));
@@ -402,10 +474,11 @@ fn write_texts(
             for e in entries {
                 let mut img = e.image.clone();
                 img.file_name = image_path(opts.format, e);
+                (img.width, img.height) = e.size;
                 img.extra.insert(SPLIT_FIELD.into(), e.split.name().into());
                 out.images.push(img);
                 out.annotations
-                    .extend(anns.get(&e.image.id).into_iter().flatten().map(|a| (*a).clone()));
+                    .extend(anns.get(&e.image.id).into_iter().flatten().map(|a| e.scaled(a)));
             }
             sink.text("annotations.json", &json_bytes(&out))?;
         }
@@ -417,13 +490,13 @@ fn write_texts(
                     out.images.push(CocoImage {
                         id: e.image.id,
                         file_name: e.name.clone(),
-                        width: e.image.width,
-                        height: e.image.height,
+                        width: e.size.0,
+                        height: e.size.1,
                         tags: Vec::new(),
                         extra: Map::new(),
                     });
                     out.annotations.extend(anns.get(&e.image.id).into_iter().flatten().map(|a| {
-                        let mut a = (*a).clone();
+                        let mut a = e.scaled(a);
                         a.extra.clear();
                         a
                     }));
@@ -471,7 +544,7 @@ mod tests {
     }
 
     fn opts(format: ExportFormat) -> ExportOptions {
-        ExportOptions { format, splits: Split::ALL.to_vec(), name: "Bibs".into() }
+        ExportOptions { format, splits: Split::ALL.to_vec(), name: "Bibs".into(), resize: None }
     }
 
     fn read(dir: &Path, rel: &str) -> String {
@@ -617,6 +690,27 @@ mod tests {
             let r = export(d.path(), &coco, &opts(ExportFormat::Yolo), &target, |_, _| true);
             assert!(r.is_err(), "{target:?}: {r:?}");
         }
+    }
+
+    #[test]
+    fn resize_scales_coco_boxes_and_keeps_small_images() {
+        let (d, mut coco) = fixture();
+        coco.images[0].width = 200; // 200x100, box (10, 20, 20, 10)
+        let o = ExportOptions {
+            resize: Some(Resize {
+                max_side: 100,
+                resize: |jobs| jobs.iter().map(|(_, w, h)| Ok(format!("{w}x{h}").into())).collect(),
+            }),
+            ..opts(ExportFormat::CocoPerSplit)
+        };
+        let out = d.path().join("small");
+        export(d.path(), &coco, &o, &Target::Folder(out.clone()), |_, _| true).unwrap();
+        assert_eq!(read(&out, "train/0001.jpg"), "100x50");
+        assert_eq!(read(&out, "valid/0001.jpg"), "jpeg2", "100x100: not resized");
+        let train: CocoFile =
+            serde_json::from_str(&read(&out, "train/_annotations.coco.json")).unwrap();
+        assert_eq!((train.images[0].width, train.images[0].height), (100, 50));
+        assert_eq!(train.annotations[0].bbox, BBox::new(5.0, 10.0, 10.0, 5.0));
     }
 
     #[test]

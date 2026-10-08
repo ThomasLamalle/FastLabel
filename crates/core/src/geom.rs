@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 /// Boxes narrower or shorter than this (in source pixels) are treated as invalid.
 pub const MIN_BOX_SIDE: f64 = 1.0;
 
+/// Size of a `w x h` image scaled down to fit `max_side` (never upscaled).
+pub fn fit(w: u32, h: u32, max_side: u32) -> (u32, u32) {
+    let longest = w.max(h);
+    if longest <= max_side || longest == 0 {
+        return (w, h);
+    }
+    let s = f64::from(max_side) / f64::from(longest);
+    (((f64::from(w) * s).round() as u32).max(1), ((f64::from(h) * s).round() as u32).max(1))
+}
+
 /// COCO-style box: top-left corner plus width and height.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(from = "[f64; 4]", into = "[f64; 4]")]

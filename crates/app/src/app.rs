@@ -111,6 +111,8 @@ pub struct FastLabelApp {
     pub(crate) convert_task: Option<(Scope, Task<Result<PathBuf, String>>)>,
     /// Export dialog open.
     export_dialog: bool,
+    /// The report's suggested input size, computed when the dialog opens.
+    export_suggested_imgsz: u32,
     add_task: Option<Task<fastlabel_core::add::AddReport>>,
     /// Open file dialog and what its result is for.
     pick: Option<(Pick, Task<Vec<PathBuf>>)>,
@@ -156,6 +158,7 @@ impl FastLabelApp {
             convert_task: None,
             report_task: None,
             export_dialog: false,
+            export_suggested_imgsz: 1280,
             add_task: None,
             pick: None,
             status: None,
@@ -492,8 +495,17 @@ impl FastLabelApp {
             p.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let stem = p.source.as_ref().map(|s| s.file_name()).unwrap_or_default();
         let stem = stem.trim_start_matches("annotations.").trim_end_matches(".json");
-        let name = format!("{dir_name}_{stem}_{}", self.session.export.format.slug());
+        let mut name = format!("{dir_name}_{stem}_{}", self.session.export.format.slug());
+        if let Some(sz) = self.export_imgsz() {
+            name.push_str(&format!("_{sz}"));
+        }
         (dir_name, name)
+    }
+
+    /// Long side the export downscales images to, if any.
+    fn export_imgsz(&self) -> Option<u32> {
+        let s = &self.session.export;
+        s.resize.then(|| s.imgsz.unwrap_or(self.export_suggested_imgsz))
     }
 
     fn finish_export(&mut self, ctx: &egui::Context, target: fastlabel_core::export::Target) {
@@ -503,7 +515,12 @@ impl FastLabelApp {
         let settings = &self.session.export;
         let splits: Vec<Split> =
             Split::ALL.into_iter().filter(|s| settings.splits[*s as usize]).collect();
-        let opts = ExportOptions { format: settings.format, splits, name: self.export_name().0 };
+        let resize = self.export_imgsz().map(|max_side| fastlabel_core::export::Resize {
+            max_side,
+            resize: fastlabel_media::decode::resize_batch,
+        });
+        let opts =
+            ExportOptions { format: settings.format, splits, name: self.export_name().0, resize };
         let (root, coco) = (p.dir.clone(), p.dataset.coco.clone());
         self.export_task = Some(Task::spawn("export", ctx, move |progress| {
             use std::sync::atomic::Ordering;
@@ -628,6 +645,29 @@ impl FastLabelApp {
                 ui.radio_value(&mut s.zip, true, "Zip file");
                 ui.radio_value(&mut s.zip, false, "Folder (images hardlinked)");
             });
+            ui.add_space(6.0);
+            let suggested = format!("{} (report suggestion)", self.export_suggested_imgsz);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.resize, "Downscale images to a long side of");
+                ui.add_enabled_ui(s.resize, |ui| {
+                    let text = s.imgsz.map_or(suggested.clone(), |v| v.to_string());
+                    egui::ComboBox::from_id_salt("export-imgsz").selected_text(text).show_ui(
+                        ui,
+                        |ui| {
+                            ui.selectable_value(&mut s.imgsz, None, &suggested);
+                            for sz in crate::report::IMGSZ {
+                                ui.selectable_value(&mut s.imgsz, Some(sz), sz.to_string());
+                            }
+                        },
+                    );
+                });
+            });
+            if s.resize {
+                ui.label(
+                    RichText::new("Smaller images are kept as is; labels follow. Training then skips decoding full frames every epoch.")
+                        .weak(),
+                );
+            }
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Pending edits are saved first (new version); frames marked F are not exported.")
@@ -1977,6 +2017,12 @@ impl FastLabelApp {
                 .clicked()
             {
                 self.export_dialog = true;
+                if let Some(ws) = &self.ws {
+                    let input = ws.report_input(String::new(), None, None);
+                    let frames: Vec<_> = input.frames.iter().collect();
+                    self.export_suggested_imgsz =
+                        crate::report::suggested_imgsz(&frames).unwrap_or(1280);
+                }
             }
             if ui
                 .add_enabled(has_ws && self.report_task.is_none(), egui::Button::new("Report"))

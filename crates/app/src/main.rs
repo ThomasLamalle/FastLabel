@@ -43,6 +43,9 @@ struct Cli {
     /// Export format: yolo, coco (per split), coco1 (single file) or ndjson.
     #[arg(long, default_value = "yolo", requires = "export")]
     format: String,
+    /// Downscale exported images to this long side (labels follow).
+    #[arg(long, requires = "export")]
+    imgsz: Option<u32>,
 }
 
 /// `--export`: same as the Export dialog (all splits), without the GUI.
@@ -50,6 +53,7 @@ fn write_export(
     dataset: &std::path::Path,
     out: &std::path::Path,
     format: &str,
+    imgsz: Option<u32>,
 ) -> anyhow::Result<()> {
     use fastlabel_core::export::{self, ExportFormat, ExportOptions, Target};
     let format = ExportFormat::ALL
@@ -61,7 +65,9 @@ fn write_export(
         anyhow::bail!("the dataset has unsaved edits: save them in the app first");
     }
     let name = dataset.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let opts = ExportOptions { format, splits: fastlabel_core::Split::ALL.to_vec(), name };
+    let resize = imgsz
+        .map(|max_side| export::Resize { max_side, resize: fastlabel_media::decode::resize_batch });
+    let opts = ExportOptions { format, splits: fastlabel_core::Split::ALL.to_vec(), name, resize };
     let target = if out.extension().is_some_and(|e| e == "zip") {
         Target::Zip(out.to_path_buf())
     } else {
@@ -117,7 +123,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(out) = &cli.export {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
-        return write_export(&dir, out, &cli.format);
+        return write_export(&dir, out, &cli.format, cli.imgsz);
     }
     let session_path = Session::default_path();
     let session = session_path.as_deref().map(Session::load).unwrap_or_default();
