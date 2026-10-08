@@ -13,7 +13,7 @@ use crate::editor::{EditorAction, EditorView, FrameData};
 use crate::embeddings::{self, Embeddings, SavedLayout};
 use crate::frame::Sel;
 use crate::inference::{Inference, Scope};
-use crate::mosaic::{self, Margins, MosaicEvent, MosaicState};
+use crate::mosaic::{self, MosaicEvent, MosaicState};
 use crate::session::Session;
 use crate::tasks::Task;
 use crate::thumbs::Thumbs;
@@ -1489,10 +1489,6 @@ impl FastLabelApp {
                     Err(e) => Err(e),
                 }
             }
-            ClusterEvent::ReportAll => {
-                self.start_report(ctx, "All frames".into(), "all".into(), None);
-                Ok(())
-            }
             ClusterEvent::ReportSelection => {
                 let sel = self.cluster.selection.clone();
                 let title = format!("Selection ({} frames)", sel.len());
@@ -1651,7 +1647,14 @@ impl FastLabelApp {
             return;
         };
         let digits = cs.digits.clone();
+        let index = cs.index;
         ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Overlapping GT boxes: group {} / {total}", index + 1))
+                    .strong()
+                    .color(Color32::from_rgb(255, 215, 0)),
+            );
+            ui.separator();
             let keys = if group.boxes.len() <= 9 {
                 format!("1-{}: keep that box, delete the others", group.boxes.len())
             } else {
@@ -1872,17 +1875,74 @@ impl FastLabelApp {
             });
     }
 
+    /// Top row: dataset actions, the tabs, tools.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let mut want_uniformity = false;
         ui.horizontal_wrapped(|ui| {
             if ui.button("📂 Open…").on_hover_text("Open a dataset folder (Ctrl+O)").clicked() {
                 self.pick_and_open(&ctx);
             }
             let has_ws = self.ws.is_some();
-            if ui.add_enabled(has_ws, egui::Button::new("💾 Save (S)")).clicked() {
+            let (pending, breakdown) = self.ws.as_ref().map_or((0, String::new()), pending_summary);
+            let save = if pending == 0 {
+                egui::Button::new("💾 Save (S)")
+            } else {
+                egui::Button::new(RichText::new(format!("💾 Save (S): {pending} unsaved")).color(PENDING_COLOR))
+            };
+            let resp = ui.add_enabled(has_ws, save);
+            let resp = if pending == 0 { resp } else { resp.on_hover_text(breakdown) };
+            if resp.clicked() {
                 self.save();
             }
+            if let Some(ws) = &mut self.ws {
+                if ui
+                    .add_enabled(ws.project.log.can_undo(), egui::Button::new("Undo"))
+                    .on_hover_text("Undo (U, Ctrl+Z)")
+                    .clicked()
+                {
+                    let _ = ws.undo();
+                    self.mosaic.ensure_visible = true;
+                }
+                if ui
+                    .add_enabled(ws.project.log.can_redo(), egui::Button::new("Redo"))
+                    .on_hover_text("Redo (Ctrl+Shift+Z)")
+                    .clicked()
+                {
+                    let _ = ws.redo();
+                    self.mosaic.ensure_visible = true;
+                }
+            }
+            ui.separator();
+            ui.add_enabled_ui(has_ws, |ui| {
+                let tabs = [
+                    (Mode::Mosaic, "Mosaic", "Crops of the GT boxes and predictions (M or Tab: Frame)"),
+                    (Mode::Frame, "Frame", "Frame by frame annotation (M or Tab: Mosaic)"),
+                    (
+                        Mode::Todo,
+                        "To do (T)",
+                        "Frames without any box (e.g. just added), newest first: draw boxes, or G for background",
+                    ),
+                    (
+                        Mode::Cluster,
+                        "Clusters (C)",
+                        "Frames as a point cloud of image embeddings: select clusters, move them to another split",
+                    ),
+                    (Mode::Rules, "Rules", "The dataset's labeling rules, editable"),
+                ];
+                for (mode, label, hover) in tabs {
+                    if ui.selectable_label(self.mode == mode, label).on_hover_text(hover).clicked()
+                        && self.mode != mode
+                    {
+                        self.goto_tab(&ctx, mode);
+                    }
+                    if mode == Mode::Mosaic {
+                        // One key toggles the two views.
+                        ui.label(RichText::new("↔ M").weak())
+                            .on_hover_text("M or Tab switches between Mosaic and Frame");
+                    }
+                }
+            });
+            ui.separator();
             ui.add_enabled_ui(has_ws && self.add_task.is_none(), |ui| {
                 ui.menu_button("Add", |ui| {
                     ui.label(
@@ -1918,6 +1978,13 @@ impl FastLabelApp {
             {
                 self.export_dialog = true;
             }
+            if ui
+                .add_enabled(has_ws && self.report_task.is_none(), egui::Button::new("Report"))
+                .on_hover_text("HTML report on all frames: split balance, box statistics, input size guide, similarity between splits (opens in the browser)")
+                .clicked()
+            {
+                self.start_report(&ctx, "All frames".into(), "all".into(), None);
+            }
             self.model_menu(ui);
             ui.add_enabled_ui(has_ws, |ui| {
                 ui.menu_button("Cleaning", |ui| {
@@ -1930,98 +1997,46 @@ impl FastLabelApp {
                         ui.close();
                     }
                 });
-                ui.separator();
-                let tabs = [
-                    (Mode::Mosaic, "Mosaic (M)", "Crops of the GT boxes and predictions"),
-                    (Mode::Frame, "Frame (M)", "Frame by frame annotation"),
-                    (
-                        Mode::Todo,
-                        "To do (T)",
-                        "Frames without any box (e.g. just added), newest first: draw boxes, or G for background",
-                    ),
-                    (
-                        Mode::Cluster,
-                        "Clusters (C)",
-                        "Frames as a point cloud of image embeddings: select clusters, move them to another split",
-                    ),
-                    (Mode::Rules, "Rules", "The dataset's labeling rules, editable"),
-                ];
-                for (mode, label, hover) in tabs {
-                    if ui.selectable_label(self.mode == mode, label).on_hover_text(hover).clicked()
-                        && self.mode != mode
-                    {
-                        self.goto_tab(&ctx, mode);
-                    }
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(self.report_task.is_none(), egui::Button::new("Report"))
-                    .on_hover_text("HTML report on all frames: split balance, box statistics, input size guide, similarity between splits (opens in the browser)")
-                    .clicked()
-                {
-                    self.start_report(&ctx, "All frames".into(), "all".into(), None);
-                }
             });
-            let Some(ws) = &mut self.ws else { return };
-            if ui
-                .add_enabled(ws.project.log.can_undo(), egui::Button::new("Undo"))
-                .on_hover_text("Undo (U, Ctrl+Z)")
-                .clicked()
-            {
-                let _ = ws.undo();
-                self.mosaic.ensure_visible = true;
-            }
-            if ui
-                .add_enabled(ws.project.log.can_redo(), egui::Button::new("Redo"))
-                .on_hover_text("Redo (Ctrl+Shift+Z)")
-                .clicked()
-            {
-                let _ = ws.redo();
-                self.mosaic.ensure_visible = true;
-            }
-            ui.separator();
+        });
+    }
 
-            ui.label("Columns");
-            if ui.add(egui::DragValue::new(&mut ws.columns).range(1..=20)).changed() {
-                self.mosaic.ensure_visible = true;
+    /// Second row: what the current tab shows and its filters. The split
+    /// filter also scopes To do and Clusters, "No boxes" also Clusters.
+    fn view_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mode = self.mode;
+        let Some(ws) = &mut self.ws else { return };
+        let mut want_uniformity = false;
+        let mut opts = ws.opts.clone();
+        let has_preds = ws.has_predictions();
+        let k = ws.counts;
+        ui.horizontal_wrapped(|ui| {
+            if mode == Mode::Mosaic {
+                let shown = ws.crops.len();
+                let text = if shown == k.total {
+                    format!("{shown} crops")
+                } else {
+                    format!("{shown} of {} crops", k.total)
+                };
+                ui.label(RichText::new(text).strong())
+                    .on_hover_text("Crops shown / crops in the split, cluster selection and No boxes scope");
+                ui.separator();
             }
-            ui.label("Margin W");
-            ui.add(
-                egui::DragValue::new(&mut self.session.margin_x)
-                    .range(0.0..=4096.0)
-                    .speed(1.0)
-                    .suffix(" px"),
-            );
-            ui.label("H");
-            ui.add(
-                egui::DragValue::new(&mut self.session.margin_y)
-                    .range(0.0..=4096.0)
-                    .speed(1.0)
-                    .suffix(" px"),
-            );
-            ui.separator();
-
-            let mut opts = ws.opts.clone();
-            let has_preds = ws.has_predictions();
-            egui::ComboBox::from_id_salt("sort").selected_text(opts.sort.label()).show_ui(
-                ui,
-                |ui| {
-                    for key in SortKey::ALL {
-                        let enabled = has_preds || !key.needs_predictions();
-                        ui.add_enabled_ui(enabled, |ui| {
-                            ui.selectable_value(&mut opts.sort, key, key.label())
-                        });
+            egui::ComboBox::from_id_salt("split")
+                .selected_text(opts.split.label())
+                .show_ui(ui, |ui| {
+                    for f in crate::crops::SplitFilter::choices() {
+                        ui.selectable_value(&mut opts.split, f, f.label());
                     }
-                },
-            );
-            if opts.sort == SortKey::ImageDate && ws.opts.sort != SortKey::ImageDate {
-                opts.descending = true; // newest first
-            }
-            let dir = if opts.descending { "Descending" } else { "Ascending" };
-            if ui.button(dir).clicked() {
-                opts.descending = !opts.descending;
+                });
+            if mode != Mode::Todo {
+                ui.toggle_value(&mut opts.no_boxes, format!("No boxes ({})", k.no_box_frames)).on_hover_text(
+                    "Frames without GT boxes: their predictions in the mosaic (whole frames: To do tab), their points in the cluster view",
+                );
             }
             if let Some(frames) = &opts.frames
+                && mode == Mode::Mosaic
                 && ui
                     .button(
                         RichText::new(format!("Cluster selection: {} frames ✕", frames.len()))
@@ -2032,39 +2047,80 @@ impl FastLabelApp {
             {
                 opts.frames = None;
             }
-            egui::ComboBox::from_id_salt("split")
-                .selected_text(opts.split.label())
-                .show_ui(ui, |ui| {
-                    for f in crate::crops::SplitFilter::choices() {
-                        ui.selectable_value(&mut opts.split, f, f.label());
-                    }
+            if mode == Mode::Mosaic {
+                ui.separator();
+                ui.toggle_value(&mut opts.hide_reviewed, format!("Hide reviewed ({})", k.reviewed))
+                    .on_hover_text("Crops already marked good or deleted in a saved version");
+                ui.add_enabled_ui(has_preds, |ui| {
+                    let (fp, fn_) = if has_preds {
+                        (format!("FP only ({})", k.fp), format!("FN only ({})", k.fn_))
+                    } else {
+                        ("FP only".into(), "FN only".into())
+                    };
+                    ui.toggle_value(&mut opts.fp_only, fp)
+                        .on_hover_text("FP: prediction overlapping no GT box");
+                    ui.toggle_value(&mut opts.fn_only, fn_)
+                        .on_hover_text("FN: GT box overlapping no prediction");
                 });
-            ui.toggle_value(&mut opts.hide_reviewed, "Hide reviewed");
-            ui.add_enabled_ui(has_preds, |ui| {
-                ui.horizontal(|ui| {
-                    ui.toggle_value(&mut opts.fp_only, "FP only");
-                    ui.toggle_value(&mut opts.fn_only, "FN only")
-                        .on_hover_text("FP: prediction overlapping no GT box. FN: GT box overlapping no prediction.");
-                })
-            });
-            ui.toggle_value(&mut opts.no_boxes, "No boxes").on_hover_text(
-                "Frames without GT boxes: their predictions in the mosaic (whole frames: To do tab), their points in the cluster view",
-            );
-            if opts.sort == SortKey::Uniformity
-                && ws.opts.sort != SortKey::Uniformity
-                && !ws.missing_uniformity().is_empty()
-            {
-                // Sorted once the values are computed.
-                opts.sort = ws.opts.sort;
-                want_uniformity = true;
+                ui.separator();
+                ui.label("Sort");
+                egui::ComboBox::from_id_salt("sort").selected_text(opts.sort.label()).show_ui(
+                    ui,
+                    |ui| {
+                        for key in SortKey::ALL {
+                            let enabled = has_preds || !key.needs_predictions();
+                            ui.add_enabled_ui(enabled, |ui| {
+                                ui.selectable_value(&mut opts.sort, key, key.label())
+                            });
+                        }
+                    },
+                );
+                if opts.sort == SortKey::ImageDate && ws.opts.sort != SortKey::ImageDate {
+                    opts.descending = true; // newest first
+                }
+                let dir = if opts.descending { "Descending" } else { "Ascending" };
+                if ui.button(dir).clicked() {
+                    opts.descending = !opts.descending;
+                }
             }
-            if opts != ws.opts {
-                ws.opts = opts;
-                ws.rebuild();
-                ws.select(0);
-                self.mosaic.ensure_visible = true;
+            if matches!(mode, Mode::Mosaic | Mode::Todo) {
+                ui.separator();
+                ui.label("Columns");
+                if ui.add(egui::DragValue::new(&mut ws.columns).range(1..=20)).changed() {
+                    self.mosaic.ensure_visible = true;
+                    self.todo.ensure_visible = true;
+                }
+            }
+            if mode == Mode::Mosaic
+                && let Some(crop) = ws.selected_crop()
+            {
+                ui.separator();
+                let img = &ws.project.dataset.images()[crop.image_idx];
+                let b = crop.primary();
+                ui.label(format!("#{} / {}", ws.selected + 1, ws.crops.len()));
+                ui.label(
+                    RichText::new(format!("{}  {:.0}×{:.0} px", img.file_name, b.w, b.h)).weak(),
+                );
             }
         });
+        if opts.sort == SortKey::Uniformity
+            && ws.opts.sort != SortKey::Uniformity
+            && !ws.missing_uniformity().is_empty()
+        {
+            // Sorted once the values are computed.
+            opts.sort = ws.opts.sort;
+            want_uniformity = true;
+        }
+        if opts != ws.opts {
+            let scope_changed = opts.split != ws.opts.split || opts.no_boxes != ws.opts.no_boxes;
+            ws.opts = opts;
+            ws.rebuild();
+            ws.select(0);
+            self.mosaic.ensure_visible = true;
+            if scope_changed && mode == Mode::Todo {
+                self.todo.refresh(ws);
+            }
+        }
         if want_uniformity {
             self.start_uniformity(&ctx);
         }
@@ -2104,60 +2160,21 @@ impl FastLabelApp {
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if self.mode == Mode::Clean
-                && let Some(cs) = &self.clean
-            {
-                let total = cs.groups.len();
-                ui.label(
-                    RichText::new(format!("Overlapping GT boxes {} / {total}", (cs.index + 1).min(total)))
-                        .strong()
-                        .color(Color32::from_rgb(255, 215, 0)),
-                );
-                ui.separator();
-            }
             if let Some(ws) = &self.ws {
-                let n = ws.crops.len();
-                let clean = matches!(self.mode, Mode::Clean | Mode::Cluster | Mode::Todo | Mode::Rules);
-                if !clean {
-                ui.label(format!("{} / {n}", if n == 0 { 0 } else { ws.selected + 1 }));
-                if let Some(crop) = ws.selected_crop() {
-                    let img = &ws.project.dataset.images()[crop.image_idx];
-                    let b = crop.primary();
-                    ui.label(
-                        RichText::new(format!("{}  {:.0}×{:.0}px", img.file_name, b.w, b.h)).weak(),
-                    );
-                }
-                }
-                ui.label(
-                    RichText::new(crate::cluster_view::split_shares(ws.split_totals())).weak(),
-                )
-                .on_hover_text("Frames per split, unsaved split moves included");
-                let c = ws.pending_counts();
-                let pending = [
-                    (c.delete, "D"),
-                    (c.good, "G"),
-                    (c.replace, "R"),
-                    (c.frames, "F"),
-                    (c.moves, "split moves"),
-                    (c.other, "edits"),
-                ]
-                .iter()
-                .filter(|(n, _)| *n > 0)
-                .map(|(n, l)| format!("{l} {n}"))
-                .collect::<Vec<_>>();
-                if !pending.is_empty() {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("pending: {}", pending.join("  ")))
-                            .color(Color32::from_rgb(245, 150, 30)),
-                    );
-                }
+                let totals = ws.split_totals();
+                let frames: usize = totals.iter().sum();
+                ui.label(format!("{frames} frames"));
+                ui.label(RichText::new(crate::cluster_view::split_shares(totals)).weak())
+                    .on_hover_text("Frames per split, unsaved split moves included");
                 if let Some(e) = &ws.eval {
                     ui.separator();
                     let k = e.counts;
                     ui.label(
-                        RichText::new(format!("paired {}  FP {}  FN {}  extra {}", k.matched, k.fp, k.fn_, k.extra))
-                            .weak(),
+                        RichText::new(format!(
+                            "model vs GT: paired {}  FP {}  FN {}  extra {}",
+                            k.matched, k.fp, k.fn_, k.extra
+                        ))
+                        .weak(),
                     )
                     .on_hover_text(
                         "paired: GT box with its best-overlapping prediction (IoU shown on the crop)\n\
@@ -2279,6 +2296,9 @@ impl eframe::App for FastLabelApp {
                 ui.add(egui::TextEdit::singleline(&mut text).id(id));
             }
         });
+        if self.ws.is_some() && matches!(self.mode, Mode::Mosaic | Mode::Todo | Mode::Cluster) {
+            egui::Panel::top("view-bar").show(ui, |ui| self.view_bar(ui));
+        }
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
         let mut central = egui::Rect::NOTHING;
         egui::CentralPanel::default().show(ui, |ui| {
@@ -2323,14 +2343,21 @@ impl eframe::App for FastLabelApp {
                 return;
             }
             let (Some(ws), Some(thumbs)) = (&mut self.ws, &mut self.thumbs) else { return };
-            let margins = Margins { x: self.session.margin_x, y: self.session.margin_y };
-            for ev in mosaic::show(ui, ws, thumbs, &mut self.mosaic, &margins) {
+            for ev in mosaic::show(ui, ws, thumbs, &mut self.mosaic) {
                 match ev {
                     MosaicEvent::Select(i) => ws.select(i),
                     MosaicEvent::Open(i) => {
                         ws.select(i);
                         ws.focus_selected_crop();
                         self.popup = true;
+                    }
+                    MosaicEvent::Accept(i) => {
+                        ws.select(i);
+                        let keep = ws.selected;
+                        if let Err(e) = ws.mark_selected(Mark::Good) {
+                            self.status = Some(Status { text: e, error: true, at: Instant::now() });
+                        }
+                        ws.select(keep);
                     }
                     MosaicEvent::QuickDelete(i) => {
                         ws.select(i);
@@ -2383,6 +2410,25 @@ impl eframe::App for FastLabelApp {
         self.inference.shutdown();
         self.save_session();
     }
+}
+
+const PENDING_COLOR: Color32 = Color32::from_rgb(245, 150, 30);
+
+/// Unsaved changes: their number and one line per kind.
+fn pending_summary(ws: &Workspace) -> (usize, String) {
+    let c = ws.pending_counts();
+    let kinds = [
+        (c.delete, "boxes to delete (D)"),
+        (c.good, "boxes or frames confirmed (G)"),
+        (c.replace, "boxes replaced by their prediction (R)"),
+        (c.frames, "frames to trash (F)"),
+        (c.moves, "frames moved to another split"),
+        (c.other, "other edits"),
+    ];
+    let total = kinds.iter().map(|(n, _)| n).sum();
+    let lines: Vec<_> =
+        kinds.iter().filter(|(n, _)| *n > 0).map(|(n, l)| format!("{n} {l}")).collect();
+    (total, lines.join("\n"))
 }
 
 /// J / K in the editor: next / previous box of the frame (GT, then predictions).

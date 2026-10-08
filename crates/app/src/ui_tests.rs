@@ -542,9 +542,9 @@ fn shortcuts_work_after_clicking_a_toolbar_button() {
     synthetic_dataset(tmp.path());
     let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
     settle(&mut h);
-    h.get_by_label("Hide reviewed").click();
+    h.get_by_label("Hide reviewed (0)").click();
     h.run_steps(2);
-    h.get_by_label("Hide reviewed").click();
+    h.get_by_label("Hide reviewed (0)").click();
     h.run_steps(2);
     h.key_press(Key::D);
     h.run_steps(2);
@@ -638,8 +638,8 @@ fn overlapping_gt_cleaning_workflow() {
     );
     assert_eq!(h.state().clean.as_ref().unwrap().index, 1, "moved to the next group");
 
-    // Progress is shown in the bottom status line.
-    let _ = h.get_by_label("Overlapping GT boxes 2 / 3");
+    // Progress is shown above the frame.
+    let _ = h.get_by_label("Overlapping GT boxes: group 2 / 3");
 
     // Group 2: D deletes all its boxes; Left goes back, A keeps both instead.
     let g1 = h.state().clean.as_ref().unwrap().groups[1].clone();

@@ -14,8 +14,6 @@ pub struct Session {
     /// Selected crop index in `last_dataset`.
     pub selected: usize,
     pub columns: usize,
-    pub margin_x: f64,
-    pub margin_y: f64,
     pub view: ViewOptions,
     pub model_path: Option<PathBuf>,
     pub confidence: f64,
@@ -36,8 +34,6 @@ impl Default for Session {
             last_dataset: None,
             selected: 0,
             columns: 5,
-            margin_x: 50.0,
-            margin_y: 50.0,
             view: ViewOptions::default(),
             model_path: None,
             confidence: 0.1,
@@ -97,6 +93,6 @@ mod tests {
         assert_eq!(Session::load(&path), s);
         std::fs::write(&path, r#"{"columns": 3}"#).unwrap();
         assert_eq!(Session::load(&path).columns, 3);
-        assert_eq!(Session::load(&path).margin_x, 50.0);
+        assert_eq!(Session::load(&path).confidence, 0.1);
     }
 }

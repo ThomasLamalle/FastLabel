@@ -70,8 +70,7 @@ pub enum ClusterEvent {
     ToggleDelete,
     /// Open this frame (image index) in the editor popup.
     Open(usize),
-    /// HTML report on all frames, the selection, or one cluster.
-    ReportAll,
+    /// HTML report on the selection or one cluster.
     ReportSelection,
     ReportCluster(i32),
     /// Assign whole clusters to splits (settings in the session).
@@ -368,13 +367,6 @@ impl ClusterView {
                     ui.label(RichText::new("Pending until saved; U undoes it in one step. Check the result with the report.").weak());
                 });
             });
-            if ui
-                .button("Report: all frames")
-                .on_hover_text("HTML report: split balance, box statistics, input size guide, similarity between splits")
-                .clicked()
-            {
-                events.push(ClusterEvent::ReportAll);
-            }
         });
         events
     }

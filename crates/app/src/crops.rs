@@ -143,6 +143,19 @@ pub struct FrameInfo<'a> {
     pub splits: Option<&'a [Option<Split>]>,
 }
 
+/// What each mosaic filter would show, within the split, cluster selection
+/// and "No boxes" scope (FP / FN counts also honor "Hide reviewed").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FilterCounts {
+    /// Crops in scope, before the review and FP / FN filters.
+    pub total: usize,
+    pub reviewed: usize,
+    pub fp: usize,
+    pub fn_: usize,
+    /// Frames in scope without GT boxes.
+    pub no_box_frames: usize,
+}
+
 /// Stable identity of a crop across rebuilds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CropId {
@@ -236,7 +249,8 @@ impl Crop {
 }
 
 /// Builds the crop list: one crop per GT annotation (with its matched
-/// prediction), plus one per unmatched prediction, filtered and sorted.
+/// prediction), plus one per unmatched prediction, filtered and sorted,
+/// and the counts behind each filter.
 pub fn build(
     ds: &Dataset,
     preds: Option<&Predictions>,
@@ -245,7 +259,8 @@ pub fn build(
     uniformity: &Uniformity,
     frames: FrameInfo,
     opts: &ViewOptions,
-) -> Vec<Crop> {
+) -> (Vec<Crop>, FilterCounts) {
+    let mut counts = FilterCounts::default();
     let mut crops = Vec::with_capacity(ds.annotations().len());
     let dates = frames.dates;
     let split_of = |idx: usize| frames.splits.map_or_else(|| ds.split_of(idx), |s| s[idx]);
@@ -256,7 +271,9 @@ pub fn build(
         if opts.frames.as_ref().is_some_and(|f| !f.contains(&img.id)) {
             continue;
         }
-        if opts.no_boxes && ds.annotations_of(image_idx).next().is_some() {
+        let has_boxes = ds.annotations_of(image_idx).next().is_some();
+        counts.no_box_frames += usize::from(!has_boxes);
+        if opts.no_boxes && has_boxes {
             continue;
         }
         let image_preds = preds.and_then(|p| p.of(image_idx));
@@ -310,13 +327,18 @@ pub fn build(
         }
     }
 
+    counts.total = crops.len();
     crops.retain(|c| {
         let reviewed = match c.id {
             CropId::Gt(a) => review.is_reviewed(a),
             CropId::Pred(p) => review.is_rejected(&p),
         };
+        counts.reviewed += usize::from(reviewed);
         if opts.hide_reviewed && reviewed {
             return false;
+        }
+        if c.filter_candidate {
+            *if c.is_pred() { &mut counts.fp } else { &mut counts.fn_ } += 1;
         }
         if opts.fp_only || opts.fn_only {
             let wanted = if c.is_pred() { opts.fp_only } else { opts.fn_only };
@@ -335,7 +357,7 @@ pub fn build(
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     });
-    crops
+    (crops, counts)
 }
 
 #[cfg(test)]
@@ -424,7 +446,8 @@ pub(crate) mod tests {
             &Uniformity::default(),
             FrameInfo::default(),
             &ViewOptions::default(),
-        );
+        )
+        .0;
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3", "P150"]);
         assert_eq!(crops[0].status, CropStatus::Matched);
         assert_eq!(crops[0].pred.unwrap().score, 0.9);
@@ -433,6 +456,24 @@ pub(crate) mod tests {
         assert_eq!(crops[3].status, CropStatus::Fp);
         let f = crops[0].frame_box();
         assert_eq!((f.x, f.x2()), (0.0, 11.0));
+    }
+
+    #[test]
+    fn filter_counts_ignore_the_fp_fn_filters() {
+        let (ds, preds, ev) = fixture();
+        let opts = ViewOptions { fp_only: true, ..Default::default() };
+        let (crops, counts) = build(
+            &ds,
+            Some(&preds),
+            Some(&ev),
+            &ReviewState::default(),
+            &Uniformity::default(),
+            FrameInfo::default(),
+            &opts,
+        );
+        assert_eq!(ids(&crops), vec!["P150"]);
+        let want = FilterCounts { total: 4, reviewed: 0, fp: 1, fn_: 1, no_box_frames: 0 };
+        assert_eq!(counts, want);
     }
 
     #[test]
@@ -446,7 +487,8 @@ pub(crate) mod tests {
             &Uniformity::default(),
             FrameInfo::default(),
             &ViewOptions::default(),
-        );
+        )
+        .0;
         assert_eq!(ids(&crops), vec!["#1", "#2", "#3"]);
         assert!(crops.iter().all(|c| c.status == CropStatus::Unpredicted));
     }
@@ -463,7 +505,8 @@ pub(crate) mod tests {
                 &Uniformity::default(),
                 FrameInfo::default(),
                 &opts,
-            ))
+            )
+            .0)
         };
         let none = ReviewState::default();
         assert_eq!(run(ViewOptions { fp_only: true, ..Default::default() }, &none), vec!["P150"]);
@@ -482,13 +525,13 @@ pub(crate) mod tests {
         let splits = [Some(Split::Val), Some(Split::Test)];
         let info = FrameInfo { splits: Some(&splits), ..Default::default() };
         let opts = ViewOptions { split: SplitFilter::Only(Split::Val), ..Default::default() };
-        let moved = build(&ds, None, None, &none, &Uniformity::default(), info, &opts);
+        let moved = build(&ds, None, None, &none, &Uniformity::default(), info, &opts).0;
         assert_eq!(ids(&moved), vec!["#1", "#2"]);
         let mut no_split = splits;
         no_split[1] = None;
         let info = FrameInfo { splits: Some(&no_split), ..Default::default() };
         let opts = ViewOptions { split: SplitFilter::NoSplit, ..Default::default() };
-        let none_left = build(&ds, None, None, &none, &Uniformity::default(), info, &opts);
+        let none_left = build(&ds, None, None, &none, &Uniformity::default(), info, &opts).0;
         assert_eq!(ids(&none_left), vec!["#3"]);
 
         let mut review = ReviewState::default();
@@ -515,7 +558,8 @@ pub(crate) mod tests {
             &Uniformity::default(),
             FrameInfo::default(),
             &opts,
-        );
+        )
+        .0;
         assert_eq!(ids(&crops), vec!["P5"]);
     }
 
@@ -542,7 +586,8 @@ pub(crate) mod tests {
                 &Uniformity::default(),
                 FrameInfo::default(),
                 &ViewOptions { sort, descending, ..Default::default() },
-            ))
+            )
+            .0)
         };
         assert_eq!(run(SortKey::Width, false), vec!["P150", "#1", "#2", "#3"]);
         assert_eq!(run(SortKey::Height, true), vec!["#2", "#1", "P150", "#3"]);

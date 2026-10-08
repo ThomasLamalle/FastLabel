@@ -48,6 +48,8 @@ pub struct Workspace {
     pub eval: Option<Evaluation>,
     pub opts: ViewOptions,
     pub crops: Vec<Crop>,
+    /// What each mosaic filter would show (see [`crops::FilterCounts`]).
+    pub counts: crops::FilterCounts,
     pub selected: usize,
     pub columns: usize,
     /// Frame mode / editor state.
@@ -111,6 +113,7 @@ impl Workspace {
             eval: None,
             opts,
             crops: Vec::new(),
+            counts: Default::default(),
             selected: 0,
             columns: columns.max(1),
             frame: Default::default(),
@@ -165,7 +168,7 @@ impl Workspace {
         let splits: Option<Vec<_>> =
             moved.then(|| (0..p.dataset.images().len()).map(|i| self.split_of(i)).collect());
         let info = FrameInfo { dates: self.image_dates.as_deref(), splits: splits.as_deref() };
-        self.crops = crops::build(
+        (self.crops, self.counts) = crops::build(
             &p.dataset,
             p.predictions.as_ref(),
             self.eval.as_ref(),

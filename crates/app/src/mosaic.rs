@@ -36,18 +36,19 @@ pub enum MosaicEvent {
     /// Right click: toggle D on that crop without advancing.
     QuickDelete(usize),
     Open(usize),
+    /// Alt+right click: toggle G on that crop without advancing.
+    Accept(usize),
 }
 
-pub struct Margins {
-    pub x: f64,
-    pub y: f64,
-}
+/// Context around each crop's box, in source pixels.
+const CROP_MARGIN: f64 = 50.0;
 
 /// Pixel region shown for a crop and the job loading it.
-pub fn crop_job(ws: &Workspace, crop: &Crop, m: &Margins, max_side: u32) -> Option<(Job, Region)> {
+pub fn crop_job(ws: &Workspace, crop: &Crop, max_side: u32) -> Option<(Job, Region)> {
     let ds = &ws.project.dataset;
     let img = &ds.images()[crop.image_idx];
-    let region = Region::around(&crop.frame_box(), m.x, m.y, img.width, img.height)?;
+    let region =
+        Region::around(&crop.frame_box(), CROP_MARGIN, CROP_MARGIN, img.width, img.height)?;
     Some((Job::Thumb { path: ds.image_path(img), region, max_side }, region))
 }
 
@@ -60,7 +61,6 @@ pub fn show(
     ws: &Workspace,
     thumbs: &mut Thumbs,
     state: &mut MosaicState,
-    margins: &Margins,
 ) -> Vec<MosaicEvent> {
     let mut events = Vec::new();
     let n = ws.crops.len();
@@ -111,10 +111,14 @@ pub fn show(
                 } else if resp.clicked() {
                     events.push(MosaicEvent::Select(idx));
                 } else if resp.secondary_clicked() {
-                    events.push(MosaicEvent::QuickDelete(idx));
+                    if ui.input(|i| i.modifiers.alt) {
+                        events.push(MosaicEvent::Accept(idx));
+                    } else {
+                        events.push(MosaicEvent::QuickDelete(idx));
+                    }
                 }
                 let crop = &ws.crops[idx];
-                let job = crop_job(ws, crop, margins, max_side);
+                let job = crop_job(ws, crop, max_side);
                 let slot = job.as_ref().and_then(|(j, _)| thumbs.get(j.id()));
                 resp.on_hover_text(tooltip(ws, crop, slot));
                 paint_cell(
@@ -146,10 +150,8 @@ pub fn show(
     let behind_start = (visible.start * cols).saturating_sub(PREFETCH_SCREENS_BEHIND * screen);
     order.extend(ahead);
     order.extend((behind_start..visible.start * cols).rev());
-    let jobs = order
-        .into_iter()
-        .filter_map(|i| crop_job(ws, &ws.crops[i], margins, max_side))
-        .map(|(j, _)| j);
+    let jobs =
+        order.into_iter().filter_map(|i| crop_job(ws, &ws.crops[i], max_side)).map(|(j, _)| j);
     thumbs.want(jobs.collect());
     events
 }
