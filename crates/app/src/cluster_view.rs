@@ -106,6 +106,9 @@ pub struct ClusterView {
     menu_cluster: Option<i32>,
     pub color_by: ColorBy,
     pub min_cluster_size: usize,
+    /// Only these clusters are shown (-1 = noise); empty = all.
+    cluster_filter: BTreeSet<i32>,
+    cluster_search: String,
 }
 
 impl Default for ClusterView {
@@ -123,6 +126,8 @@ impl Default for ClusterView {
             menu_cluster: None,
             color_by: ColorBy::Split,
             min_cluster_size: 20,
+            cluster_filter: BTreeSet::new(),
+            cluster_search: String::new(),
         }
     }
 }
@@ -180,6 +185,7 @@ impl ClusterView {
             .iter()
             .enumerate()
             .filter_map(|(i, p)| p.map(|(pos, l)| (i, pos, l)))
+            .filter(|(_, _, l)| self.cluster_filter.is_empty() || self.cluster_filter.contains(l))
             .filter(|(i, ..)| ws.opts.split.matches(ws.split_of(*i)))
             .filter(|(i, ..)| !ws.opts.no_boxes || ds.annotations_of(*i).next().is_none())
             .collect()
@@ -371,6 +377,45 @@ impl ClusterView {
         events
     }
 
+    /// Searchable multi-select of cluster ids; filters the cloud.
+    fn cluster_combo(&mut self, ui: &mut egui::Ui) {
+        let labels: BTreeSet<i32> = self.points.iter().flatten().map(|p| p.1).collect();
+        let text = match self.cluster_filter.len() {
+            0 => "All clusters".to_string(),
+            1 => self.cluster_filter.iter().map(|l| l.to_string()).collect(),
+            n => format!("{n} clusters"),
+        };
+        egui::ComboBox::from_id_salt("cluster-filter")
+            .selected_text(text)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cluster_search)
+                        .hint_text("Search id…")
+                        .desired_width(120.0),
+                );
+                if ui.button("Clear").clicked() {
+                    self.cluster_filter.clear();
+                }
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    for l in labels {
+                        let name = if l < 0 { "noise".to_string() } else { l.to_string() };
+                        if !name.contains(self.cluster_search.trim()) {
+                            continue;
+                        }
+                        let mut on = self.cluster_filter.contains(&l);
+                        if ui.checkbox(&mut on, name).changed() {
+                            if on {
+                                self.cluster_filter.insert(l);
+                            } else {
+                                self.cluster_filter.remove(&l);
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
     /// Counts and shares per split (pending moves included) of `frames`.
     fn split_counts(ws: &Workspace, frames: impl Iterator<Item = usize>) -> String {
         let mut counts = [0usize; 4];
@@ -400,6 +445,8 @@ impl ClusterView {
                 );
                 ui.label(RichText::new(Self::split_counts(ws, selected.iter().copied())).weak());
             }
+            ui.separator();
+            self.cluster_combo(ui);
             ui.separator();
             ui.label(
                 RichText::new(

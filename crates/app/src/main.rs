@@ -46,8 +46,8 @@ struct Cli {
     /// Downscale exported images to this long side (labels follow).
     #[arg(long, requires = "export")]
     imgsz: Option<u32>,
-    /// Leave out boxes less tall than this (source pixels).
-    #[arg(long, default_value_t = 10.0, requires = "export")]
+    /// Leave out boxes less tall than this (source pixels), in exports and reports.
+    #[arg(long, default_value_t = 10.0)]
     min_height: f64,
 }
 
@@ -93,12 +93,16 @@ fn write_export(
 }
 
 /// `--report`: the same report as the Report button, without the GUI.
-fn write_report(dataset: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
+fn write_report(
+    dataset: &std::path::Path,
+    out: &std::path::Path,
+    min_box_height: f64,
+) -> anyhow::Result<()> {
     let ws = workspace::Workspace::open(dataset, crops::ViewOptions::default(), 5)?;
     let state = ws.project.state_dir();
     let layout = embeddings::SavedLayout::load(&state.join(embeddings::LAYOUT_FILE));
     let emb = embeddings::Embeddings::load(&state.join(embeddings::EMBEDDINGS_FILE));
-    let input = ws.report_input("All frames".into(), None, layout.as_ref());
+    let input = ws.report_input("All frames".into(), None, layout.as_ref(), min_box_height);
     let neighbours = if emb.len() > 0 {
         report::cross_split_neighbours(&input.frames, &|k| emb.get(k).map(<[f32]>::to_vec))
     } else {
@@ -123,7 +127,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(out) = &cli.report {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
-        return write_report(&dir, out);
+        return write_report(&dir, out, cli.min_height);
     }
     if let Some(out) = &cli.export {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();

@@ -1311,7 +1311,7 @@ impl FastLabelApp {
                 saved_layout.as_ref()
             }
         };
-        let input = ws.report_input(title, scope.as_ref(), layout);
+        let input = ws.report_input(title, scope.as_ref(), layout, self.session.min_box_height);
         self.report_task = Some(Task::spawn("report", ctx, move |_| {
             let emb = Embeddings::load(&state.join(embeddings::EMBEDDINGS_FILE));
             crate::report::write(&input, &emb, &state.join("reports"), &slug)
@@ -2052,7 +2052,7 @@ impl FastLabelApp {
             {
                 self.export_dialog = true;
                 if let Some(ws) = &self.ws {
-                    let input = ws.report_input(String::new(), None, None);
+                    let input = ws.report_input(String::new(), None, None, self.session.min_box_height);
                     let frames: Vec<_> = input.frames.iter().collect();
                     self.export_suggested_imgsz =
                         crate::report::suggested_imgsz(&frames).unwrap_or(1280);

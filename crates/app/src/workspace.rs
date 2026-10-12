@@ -292,6 +292,7 @@ impl Workspace {
         title: String,
         scope: Option<&std::collections::BTreeSet<ImageId>>,
         layout: Option<&crate::embeddings::SavedLayout>,
+        min_box_height: f64,
     ) -> crate::report::ReportInput {
         use crate::report::{BoxEval, ReportBox, ReportFrame};
         use fastlabel_core::GtStatus;
@@ -309,7 +310,9 @@ impl Workspace {
             .map(|(i, img)| {
                 let boxes = ds
                     .annotations_of(i)
-                    .filter(|a| st.ann_mark(a.id) != Some(AnnMark::Delete))
+                    .filter(|a| {
+                        st.ann_mark(a.id) != Some(AnnMark::Delete) && a.bbox.h >= min_box_height
+                    })
                     .map(|a| {
                         let gt = ds.ann_idx(a.id).and_then(|k| self.eval.as_ref().map(|e| e.gt[k]));
                         let eval = match gt.map(|g| (g.status, g.iou)) {
