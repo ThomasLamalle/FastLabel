@@ -36,6 +36,7 @@ This file is the source of truth. The functional spec of the previous Python too
   - **COCO single file**: `annotations.json` with `split` fields + `images/<split>/`.
   - **Ultralytics NDJSON**: `<dataset>.ndjson` (local `path`) + `images/<split>/`, readable by Ultralytics' NDJSON converter.
   - Splits to include are chosen in the dialog; frames without a split are left out and counted. Two frames of a split with the same file name get an `<id>_` prefix.
+  - **Person boxes** (*Add person boxes (yolo26x)*, ticked by default; CLI `--persons`): COCO-pretrained yolo26x (ONNX Runtime, CPU, 640 input; downloaded and exported once with `uvx` to `~/.cache/fastlabel/models/`) detects people on the exported frames. Boxes scoring ≥ 0.5 are added as a `person` class (last class, or the existing `person` category) in the export only; the dataset does not change. Detections (≥ 0.25) are cached per frame in `.fastlabel/cache/persons/`, keyed by model, path, size and mtime, so a frame is detected once (about 1 s per frame). Runs as a *person detection* task with progress and cancel before the export; work done before a cancel stays cached.
   - Boxes less tall than the *Min box height* setting (source pixels, default 10, 0 keeps all; CLI `--min-height`) are left out. In the app they stay, tagged `<N px` on GT boxes and predictions in the mosaic and the frame view.
 - **Settings** (toolbar menu, saved in the session): min box height, thumbnail GPU memory.
 - **Tabs** (toolbar): *Mosaic (M)*, *Frame (M)*, *To do (T)*, *Clusters (C)*, *Rules*; the shortcuts still work.

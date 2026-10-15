@@ -71,7 +71,7 @@ pub fn export_pt(pt: &Path) -> Result<PathBuf, String> {
 }
 
 /// ONNX Runtime threads: physical cores (hyper-threads don't help).
-fn threads() -> usize {
+pub(crate) fn threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
 }
 

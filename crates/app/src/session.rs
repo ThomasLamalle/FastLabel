@@ -64,6 +64,8 @@ pub struct ExportSettings {
     pub resize: bool,
     /// `None`: the report's suggested input size.
     pub imgsz: Option<u32>,
+    /// Add yolo26x person boxes (cached per frame) to the export.
+    pub persons: bool,
 }
 
 impl Default for ExportSettings {
@@ -74,6 +76,7 @@ impl Default for ExportSettings {
             zip: true,
             resize: false,
             imgsz: None,
+            persons: true,
         }
     }
 }

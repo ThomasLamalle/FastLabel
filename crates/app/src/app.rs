@@ -98,6 +98,9 @@ pub struct FastLabelApp {
     /// Color-uniformity computation; sorts by it when done.
     uniformity_task: Option<Task<std::collections::HashMap<u64, f32>>>,
     export_task: Option<Task<Result<(fastlabel_core::export::ExportReport, PathBuf), String>>>,
+    /// Person detection run before an export to this target; `None` result
+    /// when cancelled.
+    persons_task: Option<(fastlabel_core::export::Target, Task<crate::persons::Outcome>)>,
     pub(crate) cluster: ClusterView,
     pub(crate) todo: crate::todo::TodoState,
     /// Frame mode was opened from the To do tab (Tab / Esc go back to it).
@@ -149,6 +152,7 @@ impl FastLabelApp {
             drop_focus: false,
             uniformity_task: None,
             export_task: None,
+            persons_task: None,
             cluster: ClusterView::default(),
             todo: Default::default(),
             frame_from_todo: false,
@@ -455,7 +459,11 @@ impl FastLabelApp {
     /// Saves pending edits, asks where to write, then exports in the
     /// background with the dialog's settings.
     fn start_export(&mut self, ctx: &egui::Context) {
-        if self.export_task.is_some() || self.pick.is_some() || !self.save() {
+        if self.export_task.is_some()
+            || self.persons_task.is_some()
+            || self.pick.is_some()
+            || !self.save()
+        {
             return;
         }
         let Some(ws) = self.ws.as_ref().filter(|ws| ws.project.source.is_some()) else { return };
@@ -508,25 +516,55 @@ impl FastLabelApp {
         s.resize.then(|| s.imgsz.unwrap_or(self.export_suggested_imgsz))
     }
 
+    fn export_splits(&self) -> Vec<Split> {
+        Split::ALL.into_iter().filter(|s| self.session.export.splits[*s as usize]).collect()
+    }
+
+    /// Runs person detection first when the dialog asks for it.
     fn finish_export(&mut self, ctx: &egui::Context, target: fastlabel_core::export::Target) {
+        let Some(ws) = &self.ws else { return };
+        let p = &ws.project;
+        if !self.session.export.persons {
+            let coco = p.dataset.coco.clone();
+            return self.run_export(ctx, target, coco);
+        }
+        let (root, coco, splits) = (p.dir.clone(), p.dataset.coco.clone(), self.export_splits());
+        let cache = p.state_dir().join("cache").join("persons");
+        let task = Task::spawn("person detection", ctx, move |progress| {
+            crate::persons::add(
+                &root,
+                &coco,
+                &splits,
+                &cache,
+                &crate::persons::models_dir(),
+                progress,
+            )
+        });
+        self.persons_task = Some((target, task));
+    }
+
+    fn run_export(
+        &mut self,
+        ctx: &egui::Context,
+        target: fastlabel_core::export::Target,
+        coco: fastlabel_core::coco::CocoFile,
+    ) {
         use fastlabel_core::export::{ExportOptions, Target};
         let Some(ws) = &self.ws else { return };
         let p = &ws.project;
-        let settings = &self.session.export;
-        let splits: Vec<Split> =
-            Split::ALL.into_iter().filter(|s| settings.splits[*s as usize]).collect();
+        let splits = self.export_splits();
         let resize = self.export_imgsz().map(|max_side| fastlabel_core::export::Resize {
             max_side,
             resize: fastlabel_media::decode::resize_batch,
         });
         let opts = ExportOptions {
-            format: settings.format,
+            format: self.session.export.format,
             splits,
             name: self.export_name().0,
             resize,
             min_box_height: self.session.min_box_height,
         };
-        let (root, coco) = (p.dir.clone(), p.dataset.coco.clone());
+        let root = p.dir.clone();
         self.export_task = Some(Task::spawn("export", ctx, move |progress| {
             use std::sync::atomic::Ordering;
             let (Target::Zip(out) | Target::Folder(out)) = &target;
@@ -683,6 +721,14 @@ impl FastLabelApp {
                 );
             }
             ui.add_space(6.0);
+            ui.checkbox(&mut s.persons, "Add person boxes (yolo26x)").on_hover_text(format!(
+                "Detects people (score ≥ {}) on the exported frames and adds them as a \"{}\" class \
+                 in the export only. Results are cached per frame; the first run on a frame takes \
+                 about a second on the CPU.",
+                crate::persons::CONF,
+                crate::persons::CATEGORY
+            ));
+            ui.add_space(6.0);
             ui.label(
                 RichText::new("Pending edits are saved first (new version); frames marked F are not exported.")
                     .weak(),
@@ -718,6 +764,15 @@ impl FastLabelApp {
                     Err(e) => self.error(format!("Cannot store color uniformity: {e:#}")),
                 }
                 self.mosaic.ensure_visible = true;
+            }
+        }
+        if let Some(result) = self.persons_task.as_mut().and_then(|(_, t)| t.poll())
+            && let Some((target, _)) = self.persons_task.take()
+        {
+            match result {
+                Ok(Some(coco)) => self.run_export(ctx, target, coco),
+                Ok(None) => self.info("Export cancelled"),
+                Err(e) => self.error(format!("Person detection failed: {e}")),
             }
         }
         if let Some(result) = self.export_task.as_mut().and_then(Task::poll) {
@@ -2046,7 +2101,7 @@ impl FastLabelApp {
                 });
             });
             if ui
-                .add_enabled(has_ws && self.export_task.is_none(), egui::Button::new("Export…"))
+                .add_enabled(has_ws && self.export_task.is_none() && self.persons_task.is_none(), egui::Button::new("Export…"))
                 .on_hover_text("YOLO, COCO or Ultralytics NDJSON, laid out by split, to a zip or a folder")
                 .clicked()
             {
@@ -2281,13 +2336,14 @@ impl FastLabelApp {
                     self.inference.cancel();
                 }
             }
-            let mut cancel = [false; 5];
+            let mut cancel = [false; 6];
             for (i, task) in [
                 self.add_task.as_ref().map(|t| (t.label, t.progress())),
                 self.uniformity_task.as_ref().map(|t| (t.label, t.progress())),
                 self.export_task.as_ref().map(|t| (t.label, t.progress())),
                 self.embed_task.as_ref().map(|t| (t.label, t.progress())),
                 self.layout_task.as_ref().map(|t| (t.label, t.progress())),
+                self.persons_task.as_ref().map(|(_, t)| (t.label, t.progress())),
             ]
             .into_iter()
             .enumerate()
@@ -2324,6 +2380,11 @@ impl FastLabelApp {
             }
             if cancel[4]
                 && let Some(t) = &self.layout_task
+            {
+                t.cancel();
+            }
+            if cancel[5]
+                && let Some((_, t)) = &self.persons_task
             {
                 t.cancel();
             }

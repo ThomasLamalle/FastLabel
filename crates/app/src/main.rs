@@ -11,6 +11,7 @@ mod frame;
 mod inference;
 mod metrics;
 mod mosaic;
+mod persons;
 mod report;
 mod session;
 mod tasks;
@@ -46,6 +47,9 @@ struct Cli {
     /// Downscale exported images to this long side (labels follow).
     #[arg(long, requires = "export")]
     imgsz: Option<u32>,
+    /// Add yolo26x person boxes (cached per frame), as the Export dialog does.
+    #[arg(long, requires = "export")]
+    persons: bool,
     /// Leave out boxes less tall than this (source pixels), in exports and reports.
     #[arg(long, default_value_t = 10.0)]
     min_height: f64,
@@ -58,6 +62,7 @@ fn write_export(
     format: &str,
     imgsz: Option<u32>,
     min_box_height: f64,
+    persons: bool,
 ) -> anyhow::Result<()> {
     use fastlabel_core::export::{self, ExportFormat, ExportOptions, Target};
     let format = ExportFormat::ALL
@@ -78,7 +83,15 @@ fn write_export(
     } else {
         Target::Folder(out.to_path_buf())
     };
-    let r = export::export(&project.dir, &project.dataset.coco, &opts, &target, |_, _| true)?;
+    let mut coco = std::borrow::Cow::Borrowed(&project.dataset.coco);
+    if persons {
+        let cache = project.state_dir().join("cache").join("persons");
+        let models = persons::models_dir();
+        let progress = fastlabel_infer::Progress::default();
+        let with = persons::add(&project.dir, &coco, &opts.splits, &cache, &models, &progress);
+        coco = std::borrow::Cow::Owned(with.map_err(anyhow::Error::msg)?.unwrap_or_default());
+    }
+    let r = export::export(&project.dir, &coco, &opts, &target, |_, _| true)?;
     println!(
         "{}: {} images (train {}, val {}, test {}), {} without split, {} missing",
         out.display(),
@@ -132,7 +145,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(out) = &cli.export {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
-        return write_export(&dir, out, &cli.format, cli.imgsz, cli.min_height);
+        return write_export(&dir, out, &cli.format, cli.imgsz, cli.min_height, cli.persons);
     }
     let session_path = Session::default_path();
     let session = session_path.as_deref().map(Session::load).unwrap_or_default();
