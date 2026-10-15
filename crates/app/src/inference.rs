@@ -52,13 +52,15 @@ pub fn onnx_for(model: &Path) -> Option<PathBuf> {
 }
 
 /// Exports ultralytics `.pt` weights to `<same name>.onnx` (raw head, the
-/// training image size) with `uvx`, CPU torch. Blocks for ~15 s, plus a
-/// one-time download of ultralytics and torch.
-pub fn export_pt(pt: &Path) -> Result<PathBuf, String> {
+/// training image size unless `args` has `imgsz=`) with `uvx`, CPU torch.
+/// `args`: more `yolo export` arguments. Blocks for ~15 s, plus a one-time
+/// download of ultralytics and torch.
+pub fn export_pt(pt: &Path, args: &[&str]) -> Result<PathBuf, String> {
     let out = std::process::Command::new("uvx")
         .args(["--torch-backend", "cpu", "--from", "ultralytics", "--with", "onnx"])
         .args(["--with", "onnxslim", "yolo", "export", "format=onnx"])
         .arg(format!("model={}", pt.display()))
+        .args(args)
         .output()
         .map_err(|e| format!("cannot run uvx (install uv): {e}"))?;
     let onnx = pt.with_extension("onnx");

@@ -1,5 +1,5 @@
 //! Person boxes added to exports (not to the dataset): COCO-pretrained
-//! yolo26x run with ONNX Runtime on the CPU. Each frame's detections are
+//! yolo26x run with ONNX Runtime on the CPU, at 1280 (long side). Each frame's detections are
 //! cached in one small file, so a frame is never detected twice.
 
 use std::path::{Path, PathBuf};
@@ -13,13 +13,19 @@ use fastlabel_media::cache::Fnv;
 
 /// Ultralytics asset, downloaded and exported to ONNX on first use.
 const MODEL: &str = "yolo26x.pt";
+/// Its ONNX export: dynamic shape, frames letterboxed to 1280 on the long
+/// side. At 640 yolo26x scores most people in crowded 1080p frames under
+/// 0.5 (3-6 kept per frame instead of 22-33). Also the cache key.
+const ONNX: &str = "yolo26x-1280.onnx";
+const EXPORT_ARGS: [&str; 2] = ["imgsz=1280", "dynamic=True"];
 /// COCO class index of "person".
 const PERSON: usize = 0;
 /// Detections are cached down to this score, so a higher export threshold
 /// needs no rerun.
 const CACHE_CONF: f32 = 0.25;
-/// Score of the person boxes written to exports.
-pub const CONF: f32 = 0.5;
+/// Score of the person boxes written to exports: at 1280 the boxes from
+/// 0.25 to 0.5 are people, mostly partly hidden.
+pub const CONF: f32 = 0.25;
 pub const CATEGORY: &str = "person";
 
 /// Cached detections of one frame: (box, score).
@@ -30,12 +36,14 @@ pub type Outcome = Result<Option<CocoFile>, String>;
 
 /// The yolo26x ONNX file under `dir`, exported with `uvx` when missing.
 fn model(dir: &Path) -> Result<PathBuf, String> {
-    let onnx = dir.join(MODEL).with_extension("onnx");
+    let onnx = dir.join(ONNX);
     if onnx.is_file() {
         return Ok(onnx);
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    crate::inference::export_pt(&dir.join(MODEL))
+    let exported = crate::inference::export_pt(&dir.join(MODEL), &EXPORT_ARGS)?;
+    std::fs::rename(&exported, &onnx).map_err(|e| format!("{}: {e}", onnx.display()))?;
+    Ok(onnx)
 }
 
 /// Where downloaded models are kept (shared by all datasets).
@@ -49,7 +57,7 @@ fn cache_file(cache: &Path, image: &Path) -> Option<PathBuf> {
     let meta = std::fs::metadata(image).ok()?;
     let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
     let key = Fnv::default()
-        .bytes(MODEL.as_bytes())
+        .bytes(ONNX.as_bytes())
         .bytes(image.as_os_str().as_encoded_bytes())
         .u64(meta.len())
         .u64(mtime)
@@ -157,7 +165,7 @@ mod tests {
         .unwrap();
         let cache = root.join("cache");
         let persons: Persons =
-            vec![(BBox::new(10.0, 10.0, 20.0, 40.0), 0.9), (BBox::new(0.0, 0.0, 9.0, 9.0), 0.3)];
+            vec![(BBox::new(10.0, 10.0, 20.0, 40.0), 0.9), (BBox::new(0.0, 0.0, 9.0, 9.0), 0.2)];
         let file = cache_file(&cache, &root.join("a.jpg")).unwrap();
         fsutil::write_json_atomic(&file, &persons).unwrap();
 

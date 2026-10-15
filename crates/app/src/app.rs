@@ -388,8 +388,9 @@ impl FastLabelApp {
         let Some(model) = crate::inference::onnx_for(&model) else {
             if self.convert_task.is_none() {
                 self.info(format!("Exporting {} to ONNX…", model.display()));
-                let task =
-                    Task::spawn("ONNX export", ctx, move |_| crate::inference::export_pt(&model));
+                let task = Task::spawn("ONNX export", ctx, move |_| {
+                    crate::inference::export_pt(&model, &[])
+                });
                 self.convert_task = Some((scope, task));
             }
             return;
@@ -724,7 +725,7 @@ impl FastLabelApp {
             ui.checkbox(&mut s.persons, "Add person boxes (yolo26x)").on_hover_text(format!(
                 "Detects people (score ≥ {}) on the exported frames and adds them as a \"{}\" class \
                  in the export only. Results are cached per frame; the first run on a frame takes \
-                 about a second on the CPU.",
+                 a few seconds on the CPU.",
                 crate::persons::CONF,
                 crate::persons::CATEGORY
             ));
