@@ -12,6 +12,11 @@
 //! Optionally, images larger than a given long side are downscaled (labels
 //! follow), so training does not decode and resize full frames every epoch.
 //! A cancelled export leaves nothing behind.
+//!
+//! [`TEST_SOURCES_FILE`] in the dataset folder lists source folders (the
+//! first part of `source_name`, like `41` for `41/000120s.jpg`) whose frames
+//! are always exported in test, whatever their split: frames of the videos
+//! that VideoPacer's ground truths come from never reach train or val.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -87,6 +92,18 @@ pub struct Resize {
 /// Images per [`ResizeFn`] call.
 const RESIZE_BATCH: usize = 32;
 
+/// File of the dataset folder: one source folder per line, `#` starts a comment.
+pub const TEST_SOURCES_FILE: &str = "test_sources.txt";
+
+/// The source folders listed in [`TEST_SOURCES_FILE`] of `root`; none when it is missing.
+fn test_sources(root: &Path) -> HashSet<String> {
+    let text = fs::read_to_string(root.join(TEST_SOURCES_FILE)).unwrap_or_default();
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ExportOptions {
     pub format: ExportFormat,
@@ -107,6 +124,8 @@ pub struct ExportReport {
     pub missing: Vec<String>,
     /// Frames without a split (left out).
     pub no_split: usize,
+    /// Frames of a test source moved to test from another split or none.
+    pub forced_test: usize,
     pub cancelled: bool,
 }
 
@@ -163,8 +182,15 @@ fn entries<'a>(
 ) -> Vec<Entry<'a>> {
     let mut taken: HashSet<(Split, String)> = HashSet::new();
     let mut out = Vec::new();
+    let test = test_sources(root);
     for image in &coco.images {
-        let Some(split) = Split::of_image(image) else {
+        let source = image.extra.get(crate::add::SOURCE_FIELD).and_then(|v| v.as_str());
+        let forced = source.is_some_and(|s| test.contains(s.split('/').next().unwrap_or(s)));
+        let stored = Split::of_image(image);
+        if forced && stored != Some(Split::Test) {
+            report.forced_test += 1;
+        }
+        let Some(split) = (if forced { Some(Split::Test) } else { stored }) else {
             report.no_split += 1;
             continue;
         };
@@ -594,6 +620,32 @@ mod tests {
         let err =
             export(d.path(), &coco, &opts(ExportFormat::Yolo), &Target::Folder(out), |_, _| true);
         assert!(err.is_err(), "never writes into an existing folder");
+    }
+
+    #[test]
+    fn frames_of_test_sources_always_go_to_test() {
+        let (d, mut coco) = fixture();
+        // Image 1 (train) and 4 (no split) come from video 41, image 2 (val) from video 410.
+        for (i, source) in [(0, "41/000120s.jpg"), (3, "41/000241s.jpg"), (1, "410/000120s.jpg")] {
+            coco.images[i].extra.insert(crate::add::SOURCE_FIELD.into(), source.into());
+        }
+        fs::write(
+            d.path().join(TEST_SOURCES_FILE),
+            "# Honolulu 2014: samples 1 to 3\n41 # olZnm5h-zoE\n",
+        )
+        .unwrap();
+        let out = d.path().join("export");
+        let r = export(
+            d.path(),
+            &coco,
+            &opts(ExportFormat::Yolo),
+            &Target::Folder(out.clone()),
+            |_, _| true,
+        )
+        .unwrap();
+        assert_eq!(r.per_split, [0, 1, 3]);
+        assert_eq!((r.no_split, r.forced_test), (0, 2));
+        assert!(out.join("images/test/0004.jpg").is_file());
     }
 
     #[test]

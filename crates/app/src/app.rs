@@ -787,6 +787,12 @@ impl FastLabelApp {
                         r.images(),
                         out.display()
                     );
+                    if r.forced_test > 0 {
+                        msg.push_str(&format!(
+                            "; {} moved to test by test_sources.txt",
+                            r.forced_test
+                        ));
+                    }
                     if r.no_split > 0 {
                         msg.push_str(&format!("; {} without a split left out", r.no_split));
                     }

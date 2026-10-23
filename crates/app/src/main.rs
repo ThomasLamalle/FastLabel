@@ -93,14 +93,15 @@ fn write_export(
     }
     let r = export::export(&project.dir, &coco, &opts, &target, |_, _| true)?;
     println!(
-        "{}: {} images (train {}, val {}, test {}), {} without split, {} missing",
+        "{}: {} images (train {}, val {}, test {}), {} without split, {} missing, {} moved to test by test_sources.txt",
         out.display(),
         r.images(),
         r.per_split[0],
         r.per_split[1],
         r.per_split[2],
         r.no_split,
-        r.missing.len()
+        r.missing.len(),
+        r.forced_test
     );
     Ok(())
 }
