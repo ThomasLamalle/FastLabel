@@ -1,6 +1,6 @@
 # FastLabel
 
-Fast keyboard-driven triage of bounding-box datasets. Review annotations and model predictions as a mosaic of crops: one key per decision instead of drawing boxes. Written in Rust (egui, ONNX Runtime). CPU-only machines are fully supported.
+Fast keyboard-driven triage of annotation datasets: bounding boxes, and texts (OCR) on crops. Review annotations and model predictions as a mosaic of crops: one key per decision instead of drawing boxes or typing. Written in Rust (egui, ONNX Runtime). CPU-only machines are fully supported.
 
 - What it does and why: [`features.md`](features.md)
 - Architecture, milestones, measured performance, full key map: [`docs/PLAN.md`](docs/PLAN.md)
@@ -14,7 +14,13 @@ cargo build --release
 
 Linux / Wayland first (X11 works too). ONNX Runtime is downloaded at build time by the `ort` crate.
 
-## Dataset folder
+## Projects
+
+*Project → New project…* creates a box project (with its classes) or a text project (with its text name and allowed characters) on a folder of images. Any COCO / YOLO / image folder also opens as a box project. The kind is stored in `.fastlabel/project.json`.
+
+Bib workflow: box project → *Export… → Crops* (10 % margin, boxes ≥ 26 px, like the reading pipeline) → open the export, a text project → *OCR → Read the images to do* → G / D / X on the readings, Enter to type the others → `labels.csv` (`file,bib,split,status`).
+
+## Dataset folder (box project)
 
 | File | Role |
 |---|---|
@@ -48,13 +54,17 @@ Nothing changes on disk until you save (`S`). Every action is journaled, so a cr
 python scripts/export_dinov2.py dinov2_vits14.onnx   # any Python with torch + onnx; downloads the weights once
 ```
 
-*Export…* writes YOLO (Ultralytics / YOLO26), COCO per split (Roboflow layout, RF-DETR), COCO single file or Ultralytics NDJSON, laid out by split, to a zip or a folder of hardlinks. Headless: `fastlabel --export out.zip --format yolo <dataset>`. In cluster mode, *Auto-split…* assigns whole clusters to train / val / test.
+*Export…* writes YOLO (Ultralytics / YOLO26), COCO per split (Roboflow layout, RF-DETR), COCO single file, Ultralytics NDJSON or crops of one class (a text project), laid out by split, to a zip or a folder of hardlinks. Headless: `fastlabel --export out.zip --format yolo <dataset>`. In cluster mode, *Auto-split…* assigns whole clusters to train / val / test.
 
 *Report* writes an HTML report (split balance, box distributions per split, model input size guide, per-split model results, near duplicates across splits, clusters × splits) and opens it; in cluster mode it can cover the selection or one cluster. Headless: `fastlabel --report out.html <dataset>`.
 
 Embeddings take ~140 ms per frame on a 6-core laptop CPU, computed once in the background and cached.
 
 *Cleaning → Overlapping GT boxes* reviews double annotations one group at a time: 1–9 keeps that box and deletes the others, A keeps all, D deletes all, Right/Left moves between groups, Esc goes back.
+
+## Text projects (OCR)
+
+`labels.csv` (`file,<text name>,split,status`; status `todo` / `ok` / `unreadable`) + `images/`. Grid: G reading right, D reading wrong, X unreadable, Enter to type. Typing view: Enter saves the text and moves on (empty: unreadable), Up / Down, Esc. *OCR* menu: a PaddleOCR CTC recognizer in ONNX (e.g. `PP-OCRv6_rec_small.onnx`). Details: [`features.md`](features.md).
 
 ## Models
 
@@ -76,6 +86,7 @@ This includes headless UI tests (egui_kittest, offscreen wgpu), a SIGKILL-during
 
 ```sh
 FASTLABEL_SHOT_DATASET=<copy of a dataset> FASTLABEL_SHOT_DIR=<png out dir> FASTLABEL_MODEL=<model.onnx> \
+  FASTLABEL_TEXT_DATASET=<copy of a crops export> FASTLABEL_OCR_MODEL=<rec.onnx> \
   cargo test --release -p fastlabel -- --ignored --nocapture
 ```
 

@@ -1,4 +1,4 @@
-//! FastLabel: fast bounding-box review.
+//! FastLabel: fast annotation triage (boxes, text).
 
 mod app;
 mod clean;
@@ -15,6 +15,7 @@ mod persons;
 mod report;
 mod session;
 mod tasks;
+mod text_view;
 mod thumbs;
 mod todo;
 #[cfg(test)]
@@ -30,7 +31,7 @@ use eframe::egui;
 use crate::session::Session;
 
 #[derive(Parser)]
-#[command(version, about = "Fast bounding-box annotation triage")]
+#[command(version, about = "Fast annotation triage")]
 struct Cli {
     /// Dataset folder (COCO annotations, YOLO layout or plain images).
     /// Defaults to the last opened one.
@@ -41,7 +42,8 @@ struct Cli {
     /// Export the saved dataset and exit: a `.zip` path, else a new folder.
     #[arg(long, value_name = "OUT")]
     export: Option<PathBuf>,
-    /// Export format: yolo, coco (per split), coco1 (single file) or ndjson.
+    /// Export format: yolo, coco (per split), coco1 (single file), ndjson or
+    /// crops (the first class's boxes + labels.csv, a text project for OCR).
     #[arg(long, default_value = "yolo", requires = "export")]
     format: String,
     /// Downscale exported images to this long side (labels follow).
@@ -50,9 +52,10 @@ struct Cli {
     /// Add yolo26x person boxes (cached per frame), as the Export dialog does.
     #[arg(long, requires = "export")]
     persons: bool,
-    /// Leave out boxes less tall than this (source pixels), in exports and reports.
-    #[arg(long, default_value_t = 10.0)]
-    min_height: f64,
+    /// Leave out boxes less tall than this (source pixels), in exports and
+    /// reports. Default: 10, 26 for crops.
+    #[arg(long)]
+    min_height: Option<f64>,
 }
 
 /// `--export`: same as the Export dialog (all splits), without the GUI.
@@ -68,7 +71,11 @@ fn write_export(
     let format = ExportFormat::ALL
         .into_iter()
         .find(|f| f.slug() == format)
-        .ok_or_else(|| anyhow!("unknown format {format} (yolo, coco, coco1, ndjson)"))?;
+        .ok_or_else(|| anyhow!("unknown format {format} (yolo, coco, coco1, ndjson, crops)"))?;
+    let kind = fastlabel_core::config::ProjectConfig::load(dataset)?.kind;
+    if kind != fastlabel_core::config::Kind::Boxes {
+        anyhow::bail!("only box projects export (a text project's data is its labels.csv)");
+    }
     let project = fastlabel_core::Project::open(dataset)?;
     if project.has_unsaved_changes() {
         anyhow::bail!("the dataset has unsaved edits: save them in the app first");
@@ -77,7 +84,12 @@ fn write_export(
     let resize = imgsz
         .map(|max_side| export::Resize { max_side, resize: fastlabel_media::decode::resize_batch });
     let splits = fastlabel_core::Split::ALL.to_vec();
-    let opts = ExportOptions { format, splits, name, resize, min_box_height };
+    let crops = (format == ExportFormat::Crops).then(|| export::CropOptions {
+        category: project.dataset.categories().first().map_or(1, |c| c.id),
+        margin: session::CROP_MARGIN,
+        crop: fastlabel_media::decode::crop_batch,
+    });
+    let opts = ExportOptions { format, splits, name, resize, min_box_height, crops };
     let target = if out.extension().is_some_and(|e| e == "zip") {
         Target::Zip(out.to_path_buf())
     } else {
@@ -112,6 +124,11 @@ fn write_report(
     out: &std::path::Path,
     min_box_height: f64,
 ) -> anyhow::Result<()> {
+    if fastlabel_core::config::ProjectConfig::load(dataset)?.kind
+        != fastlabel_core::config::Kind::Boxes
+    {
+        anyhow::bail!("reports are for box projects");
+    }
     let ws = workspace::Workspace::open(dataset, crops::ViewOptions::default(), 5)?;
     let state = ws.project.state_dir();
     let layout = embeddings::SavedLayout::load(&state.join(embeddings::LAYOUT_FILE));
@@ -141,12 +158,15 @@ fn main() -> anyhow::Result<()> {
     if let Some(out) = &cli.report {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
-        return write_report(&dir, out, cli.min_height);
+        return write_report(&dir, out, cli.min_height.unwrap_or(10.0));
     }
     if let Some(out) = &cli.export {
         let session = Session::default_path().map(|p| Session::load(&p)).unwrap_or_default();
         let dir = dataset.or(session.last_dataset).ok_or_else(|| anyhow!("no dataset given"))?;
-        return write_export(&dir, out, &cli.format, cli.imgsz, cli.min_height, cli.persons);
+        let crops = cli.format == fastlabel_core::export::ExportFormat::Crops.slug();
+        let min_height =
+            cli.min_height.unwrap_or(if crops { session::CROP_MIN_HEIGHT } else { 10.0 });
+        return write_export(&dir, out, &cli.format, cli.imgsz, min_height, cli.persons);
     }
     let session_path = Session::default_path();
     let session = session_path.as_deref().map(Session::load).unwrap_or_default();

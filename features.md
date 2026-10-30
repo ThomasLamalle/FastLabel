@@ -5,8 +5,8 @@ FastLabel aims to reinvent annotation tooling by focusing on fast workflows. It 
 
 Native desktop app written in Rust, built for speed and stability (Linux/Wayland first, CPU-only must be fully usable).
 
-Supports only bounding box annotations for now, but the data model supports N categories.
-First use case: annotating bibs to train a bib detector model. See examples of dataset and labels:
+Each project has one annotation kind: **boxes** (detection, N classes) or **text** (one text per image, e.g. OCR on crops). Kinds are modular: each has its own data files and views, so more kinds (polygons, keypoints, image classes) can be added later.
+First use case: annotating bibs to train a bib detector model, then the bib numbers to train or check the OCR. See examples of dataset and labels:
 [annotations](../Datasets/Ultralytics/v1_exp0/annotations.v022.json) [images](../Datasets/Ultralytics/v1_exp0/images) [predictions](../Datasets/Ultralytics/v1_exp0/predictions.json)
 
 Two possible workflows:
@@ -15,6 +15,13 @@ Two possible workflows:
 
 This file is the source of truth. The functional spec of the previous Python tool (`../BibDataset/REVIEW_FRAMES_FUNCTIONAL_SPEC.md`) is a reference for behavior not described here; where they conflict, this file wins.
 
+
+## Projects
+
+- *Project* menu (toolbar): *New project…*, *Open…* (Ctrl+O), *Settings…*.
+- **New project**: name, annotation kind, then the classes (boxes, comma separated) or the text name and the allowed characters (text), and the labeling rules; then the folder of its images (`images/` inside it, or the images themselves). A folder that is already a project is refused.
+- The kind lives in `.fastlabel/project.json` (`kind`, `name`, `classes`, `text_column`, `charset`). A folder without it opens as a box project, as before (COCO, YOLO or plain images), so existing datasets open unchanged.
+- *Settings…*: the name; for text projects also the allowed characters and the labeling rules. Classes and the text name are fixed at creation.
 
 ## Data
 
@@ -37,11 +44,12 @@ This file is the source of truth. The functional spec of the previous Python too
   - **Ultralytics NDJSON**: `<dataset>.ndjson` (local `path`) + `images/<split>/`, readable by Ultralytics' NDJSON converter.
   - Splits to include are chosen in the dialog; frames without a split are left out and counted. Two frames of a split with the same file name get an `<id>_` prefix.
   - `test_sources.txt` in the dataset folder lists source folders (the first part of `source_name`, like `41` for `41/000120s.jpg`, one per line, `#` comments): their frames are always exported in test, whatever their split. It keeps the videos that VideoPacer's ground truths come from out of train and val. The export message says how many frames it moved.
-  - **Person boxes** (*Add person boxes (yolo26x)*, ticked by default; CLI `--persons`): COCO-pretrained yolo26x (ONNX Runtime, CPU, dynamic input letterboxed to 1280 on the long side; downloaded and exported once with `uvx` to `~/.cache/fastlabel/models/yolo26x-1280.onnx`) detects people on the exported frames. At 640, yolo26x scored most people in crowded 1080p frames under 0.5. Boxes scoring ≥ 0.25 are added as a `person` class (last class, or the existing `person` category) in the export only; the dataset does not change. Detections (≥ 0.25) are cached per frame in `.fastlabel/cache/persons/`, keyed by model file, path, size and mtime, so a frame is detected once (about 3-4 s per 1080p frame on 12 cores). Runs as a *person detection* task with progress and cancel before the export; work done before a cancel stays cached.
+  - **Person boxes** (*Add person boxes (yolo26x)*, off by default; CLI `--persons`): COCO-pretrained yolo26x (ONNX Runtime, CPU, dynamic input letterboxed to 1280 on the long side; downloaded and exported once with `uvx` to `~/.cache/fastlabel/models/yolo26x-1280.onnx`) detects people on the exported frames. At 640, yolo26x scored most people in crowded 1080p frames under 0.5. Boxes scoring ≥ 0.25 are added as a `person` class (last class, or the existing `person` category) in the export only; the dataset does not change. Detections (≥ 0.25) are cached per frame in `.fastlabel/cache/persons/`, keyed by model file, path, size and mtime, so a frame is detected once (about 3-4 s per 1080p frame on 12 cores). Runs as a *person detection* task with progress and cancel before the export; work done before a cancel stays cached.
+  - **Crops** (*Crops of one class + labels.csv*, CLI `--format crops`, first class): one JPEG per box of the chosen class, `images/<annotation id>.jpg`, plus `labels.csv` and `.fastlabel/project.json`: a **text project** ready to open. Each crop is the box grown by a share of its height on every side (default 10 %), in whole pixels cut to the frame, exactly as the bib reading pipeline crops (`grown_box`). Boxes under *Skip boxes under* px high are left out (default 26: the pipeline never reads them). `labels.csv` columns: `file,<class name>,split,status,image,ann_id` (`status` `todo`; `image` and `ann_id` trace each crop back to its frame and box). The split of each crop is its frame's split (`test_sources.txt` applies). The resize and person-box options do not apply.
   - Boxes less tall than the *Min box height* setting (source pixels, default 10, 0 keeps all; CLI `--min-height`) are left out. In the app they stay, tagged `<N px` on GT boxes and predictions in the mosaic and the frame view.
 - **Settings** (toolbar menu, saved in the session): min box height, thumbnail GPU memory.
 - **Tabs** (toolbar): *Mosaic (M)*, *Frame (M)*, *To do (T)*, *Clusters (C)*, *Rules*; the shortcuts still work.
-- **Labeling rules** (*Rules* tab): the dataset's labeling rules as free text, editable in place (shortcuts are off while typing; Esc goes back to the mosaic). Stored in `.fastlabel/rules.md`, written when the field loses focus, on leaving the tab and on exit. A new dataset starts with: *Label the whole bib. If occulted, box only the visible part.*
+- **Labeling rules** (*Rules* tab): the dataset's labeling rules as free text, editable in place (shortcuts are off while typing; Esc goes back to the mosaic). Stored in `.fastlabel/rules.md`, written when the field loses focus, on leaving the tab and on exit. A new project starts with the rules given in the *New project* dialog.
 
 ## Mosaic mode
 
@@ -173,6 +181,24 @@ Toolbar *Clusters* or `C` in the mosaic. Every frame is a point of a 2D map buil
 - Similarity between splits (needs the embeddings): for each val / test frame, the most similar frame of another split; near duplicates (cosine ≥ 0.95) leak.
 - Clusters × splits (needs the layout): composition of each cluster, share of train frames in scenes val / test never see.
 
+## Text projects (OCR)
+
+One text per image, typically the crops of a *Crops* export. Data:
+
+- `labels.csv`: `file,<text name>,split,status`, then any other columns (kept as they are). `status` is `todo` (not annotated yet), `ok` (the text is right) or `unreadable` (the text is empty). A training pipeline keeps `ok` rows (and `unreadable` ones as negatives); `todo` rows are not annotated. A plain `file,<text name>` list opens too (a text means `ok`). Images under `images/` without a row are added as `todo`.
+- `text_predictions.json`: OCR readings (pseudo labels): model, and per file the text, its score (mean probability of its characters) and whether it was rejected.
+- Edits are pending until saved, like box edits: every action is journaled (`.fastlabel/text_journal.jsonl`, replayed after a crash), U / Ctrl+Z undo, Ctrl+Shift+Z / Ctrl+Y redo. S writes `labels.csv` atomically; the previous one is kept as `.fastlabel/history/labels.vNNN.csv`. Rejections are saved in `text_predictions.json`.
+- **Allowed characters** (e.g. `0123456789` for bibs): typing ignores other characters, and an OCR reading keeps its longest run of them (the first of equal runs), so words printed next to a bib number are dropped. Empty: any character, readings trimmed.
+
+**Grid** (triage, like the mosaic): every image with its text below: green when done, grey *unreadable*, red OCR reading + score while to do, grey *(rejected)*. Pending changes show G / D / X on the image. Filters: *All*, *To do*, *To do, OCR read*, *To type* (to do without a usable reading), *Done*, *Unreadable*; split filter; sorts by file, OCR score (lowest or highest first) and text; images per line. The layout only changes on filter, sort or save.
+
+- G: the reading is right (an empty reading: unreadable); again: back to to do. D: the reading is wrong (toggle; the image goes to *To type*). X: unreadable (toggle). Each advances to the next image with a reading still undecided.
+- Arrows / hjkl, PageUp / PageDown, Home / End: move. Enter, E or double click: typing view. S save, Q save and quit.
+
+**Typing view** (one image at a time): the image large, the text field below with the focus, filled with the text or the usable OCR reading (selected, so typing replaces it). Enter saves the text (an empty field: unreadable) and goes to the next image to do; Up / Down (PageUp / PageDown) go to the previous / next image without change; Ctrl+S saves; Ctrl+Z undoes; Esc goes back to the grid. The reading, its score, the position, split, file and labeling rules are shown.
+
+**OCR** menu: *Choose model…* (ONNX), *Read the images to do* (background, progress, cancel in the status line). Supported: PaddleOCR CTC text recognizers in ONNX with their alphabet in the `character` metadata, such as PP-OCRv6 small as shipped by RapidOCR (the bib reading pipeline's model): input `[N, 3, 48, W]`, crop widened 1.5 times (better on bibs, from the pipeline's measurements), blue-green-red in [-1, 1], padded to 320 px, greedy CTC decoding. About 40 ms per crop on 12 cores (326 crops in 12 s). New readings are merged over the previous ones (a rejection stays only if the reading did not change); readings done before a cancel are kept. After a run the grid shows *To do, OCR read*, lowest scores first.
+
 ## Model inference
 
 - ONNX models run through ONNX Runtime, no Python at runtime. CPU only must be fast enough (no GPU on the dev machine); GPU execution providers are optional.
@@ -184,7 +210,7 @@ Toolbar *Clusters* or `C` in the mosaic. Every frame is a point of a 2D map buil
 
 ## Session
 
-The last session is restored on launch: dataset, mode, scroll position, sort, filters, thresholds, crops per line, margins, model path, confidence, embedding model path, minimum cluster size.
+The last session is restored on launch: dataset, mode, scroll position, sort, filters, thresholds, crops per line, margins, model path, confidence, embedding model path, OCR model path, minimum cluster size, export choices.
 
 
 # TODO: ideas for later (don't implement yet)

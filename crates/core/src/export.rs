@@ -6,6 +6,10 @@
 //!   each with `_annotations.coco.json` next to its images.
 //! - COCO single file: one annotation file with `split` fields + `images/<split>/`.
 //! - Ultralytics NDJSON: `<name>.ndjson` + `images/<split>/` (local `path`).
+//! - Crops: one image per box of a class (`images/<ann id>.jpg`, the box
+//!   grown by a share of its height, as the bib reading pipeline crops) and
+//!   `labels.csv` (`file,<class>,split,status,image,ann_id`, status `todo`):
+//!   a text project (see [`crate::text`]) to annotate with an OCR.
 //!
 //! Written to a zip (atomically) or to a new folder (built in a temporary
 //! sibling, then renamed; images hardlinked when possible, else copied).
@@ -40,14 +44,16 @@ pub enum ExportFormat {
     CocoPerSplit,
     CocoSingle,
     Ndjson,
+    Crops,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 4] = [
+    pub const ALL: [ExportFormat; 5] = [
         ExportFormat::Yolo,
         ExportFormat::CocoPerSplit,
         ExportFormat::CocoSingle,
         ExportFormat::Ndjson,
+        ExportFormat::Crops,
     ];
 
     pub fn label(self) -> &'static str {
@@ -56,6 +62,7 @@ impl ExportFormat {
             ExportFormat::CocoPerSplit => "COCO per split (Roboflow layout, RF-DETR)",
             ExportFormat::CocoSingle => "COCO single file (split field)",
             ExportFormat::Ndjson => "Ultralytics NDJSON",
+            ExportFormat::Crops => "Crops of one class + labels.csv (text project, OCR)",
         }
     }
 
@@ -66,6 +73,7 @@ impl ExportFormat {
             ExportFormat::CocoPerSplit => "coco",
             ExportFormat::CocoSingle => "coco1",
             ExportFormat::Ndjson => "ndjson",
+            ExportFormat::Crops => "crops",
         }
     }
 }
@@ -87,6 +95,32 @@ pub struct Resize {
     /// Long side of the exported images; smaller ones are exported as is.
     pub max_side: u32,
     pub resize: ResizeFn,
+}
+
+/// Crop extractor: per frame, `(image, regions [x, y, w, h])` → each region
+/// as a JPEG. Batches let the caller work in parallel.
+pub type CropFn = fn(&[(PathBuf, Vec<[u32; 4]>)]) -> Vec<std::result::Result<Vec<Vec<u8>>, String>>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct CropOptions {
+    /// Class whose boxes are cropped.
+    pub category: CategoryId,
+    /// Grown on every side by this share of the box height.
+    pub margin: f64,
+    pub crop: CropFn,
+}
+
+/// The box grown on every side by `margin` times its height, in whole pixels
+/// cut to the image, as the bib reading pipeline crops (`grown_box`).
+pub fn crop_region(b: &BBox, margin: f64, img_w: u32, img_h: u32) -> Option<[u32; 4]> {
+    if !b.is_finite() {
+        return None;
+    }
+    let (x, y, w, h) = (b.x as i64, b.y as i64, b.w as i64, b.h as i64);
+    let grow = (h as f64 * margin) as i64;
+    let (x1, y1) = ((x - grow).max(0), (y - grow).max(0));
+    let (x2, y2) = ((x + w + grow).min(img_w.into()), (y + h + grow).min(img_h.into()));
+    (x2 > x1 && y2 > y1).then(|| [x1 as u32, y1 as u32, (x2 - x1) as u32, (y2 - y1) as u32])
 }
 
 /// Images per [`ResizeFn`] call.
@@ -114,6 +148,8 @@ pub struct ExportOptions {
     pub resize: Option<Resize>,
     /// Boxes less tall than this (source pixels) are left out; 0 keeps all.
     pub min_box_height: f64,
+    /// Needed by [`ExportFormat::Crops`].
+    pub crops: Option<CropOptions>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -316,6 +352,9 @@ pub fn export(
     let mut report = ExportReport::default();
     let entries = entries(root, coco, opts, &mut report);
     let mut write_all = |sink: &mut dyn Sink, report: &mut ExportReport| -> Result<bool> {
+        if opts.format == ExportFormat::Crops {
+            return write_crops(sink, root, coco, opts, &entries, report, &mut progress);
+        }
         write_texts(sink, coco, opts, &entries)?;
         let total = entries.len();
         for (c, chunk) in entries.chunks(RESIZE_BATCH).enumerate() {
@@ -394,6 +433,69 @@ pub fn export(
             }
         }
     }
+}
+
+/// [`ExportFormat::Crops`]: crops, `labels.csv` and the text project config.
+fn write_crops(
+    sink: &mut dyn Sink,
+    root: &Path,
+    coco: &CocoFile,
+    opts: &ExportOptions,
+    entries: &[Entry],
+    report: &mut ExportReport,
+    progress: &mut impl FnMut(usize, usize) -> bool,
+) -> Result<bool> {
+    use crate::text::csv_line;
+    let c = opts.crops.ok_or_else(|| Error::invalid(root, "crop options missing"))?;
+    let anns = annotations_of(coco, entries, opts.min_box_height);
+    let class = coco.categories.iter().find(|k| k.id == c.category).map(|k| k.name.trim());
+    let column = class.filter(|n| !crate::config::reserved(n)).unwrap_or("text");
+    let mut csv = csv_line(&["file", column, "split", "status", "image", "ann_id"]);
+    let total = entries.len();
+    for (n, chunk) in entries.chunks(RESIZE_BATCH).enumerate() {
+        // Frames of the chunk with boxes to crop, and their annotation ids.
+        let (mut jobs, mut items) = (Vec::new(), Vec::new());
+        for e in chunk {
+            let (mut regions, mut ids) = (Vec::new(), Vec::new());
+            let boxes = anns.get(&e.image.id).into_iter().flatten();
+            for a in boxes.filter(|a| a.category_id == c.category) {
+                if let Some(r) = crop_region(&a.bbox, c.margin, e.image.width, e.image.height) {
+                    regions.push(r);
+                    ids.push(a.id);
+                }
+            }
+            if !regions.is_empty() {
+                jobs.push((root.join(&e.image.file_name), regions));
+                items.push((e, ids));
+            }
+        }
+        if !progress(n * RESIZE_BATCH, total) {
+            return Ok(false);
+        }
+        let results = if jobs.is_empty() { Vec::new() } else { (c.crop)(&jobs) };
+        for (((e, ids), (src, _)), result) in items.iter().zip(&jobs).zip(results) {
+            let crops = result.map_err(|m| Error::invalid(src, m))?;
+            for (id, bytes) in ids.iter().zip(crops) {
+                let rel = format!("images/{id}.jpg");
+                sink.image_bytes(&rel, &bytes)?;
+                let fields =
+                    [&rel, "", e.split.name(), "todo", &e.image.file_name, &id.to_string()];
+                csv.push_str(&csv_line(&fields));
+                report.per_split[e.split as usize] += 1;
+            }
+        }
+    }
+    sink.text(crate::text::LABELS_FILE, csv.as_bytes())?;
+    let config = crate::config::ProjectConfig {
+        kind: crate::config::Kind::Text,
+        name: format!("{} {column} crops", opts.name).trim().to_string(),
+        text_column: column.to_string(),
+        ..Default::default()
+    };
+    let rel = format!("{}/{}", crate::project::STATE_DIR, crate::config::CONFIG_FILE);
+    sink.text(&rel, &json_bytes(&config))?;
+    progress(total, total);
+    Ok(true)
 }
 
 fn image_path(format: ExportFormat, e: &Entry) -> String {
@@ -534,6 +636,7 @@ fn write_texts(
                 sink.text(&format!("{}/_annotations.coco.json", coco_dir(*s)), &json_bytes(&out))?;
             }
         }
+        ExportFormat::Crops => {}
     }
     Ok(())
 }
@@ -580,7 +683,51 @@ mod tests {
             name: "Bibs".into(),
             resize: None,
             min_box_height: 0.0,
+            crops: None,
         }
+    }
+
+    /// Fake crops: the region as text.
+    fn crop_fn(
+        jobs: &[(PathBuf, Vec<[u32; 4]>)],
+    ) -> Vec<std::result::Result<Vec<Vec<u8>>, String>> {
+        jobs.iter()
+            .map(|(_, rs)| Ok(rs.iter().map(|r| format!("{r:?}").into_bytes()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn crop_region_matches_the_pipeline() {
+        let b = BBox::new(-3.5, 10.9, 20.0, 29.9);
+        assert_eq!(crop_region(&b, 0.1, 100, 50), Some([0, 8, 19, 33]));
+        assert_eq!(crop_region(&BBox::new(120.0, 10.0, 20.0, 10.0), 0.1, 100, 50), None);
+    }
+
+    #[test]
+    fn crops_make_a_text_project() {
+        let (d, coco) = fixture();
+        let out = d.path().join("crops");
+        let o = ExportOptions {
+            crops: Some(CropOptions { category: 1, margin: 0.1, crop: crop_fn }),
+            min_box_height: 15.0,
+            ..opts(ExportFormat::Crops)
+        };
+        let r = export(d.path(), &coco, &o, &Target::Folder(out.clone()), |_, _| true).unwrap();
+        // Image 1's box is 10 px high: left out. Image 2's box is cropped.
+        assert_eq!(r.per_split, [0, 1, 0]);
+        let ann = coco.annotations.iter().find(|a| a.image_id == 2).unwrap();
+        let rel = format!("images/{}.jpg", ann.id);
+        assert_eq!(
+            read(&out, "labels.csv"),
+            format!(
+                "file,bib,split,status,image,ann_id\n{rel},,val,todo,images/x/0001.jpg,{}\n",
+                ann.id
+            )
+        );
+        assert!(out.join(&rel).is_file());
+        let p = crate::text::TextProject::open(&out).unwrap();
+        assert_eq!((p.rows.len(), p.config.text_column.as_str()), (1, "bib"));
+        assert!(!p.has_unsaved_changes());
     }
 
     fn read(dir: &Path, rel: &str) -> String {

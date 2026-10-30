@@ -48,7 +48,7 @@ impl Letterbox {
     }
 }
 
-fn resize(img: &RgbImage, w: u32, h: u32) -> RgbImage {
+pub(crate) fn resize(img: &RgbImage, w: u32, h: u32) -> RgbImage {
     resize_with(img, w, h, ResizeAlg::Interpolation(FilterType::Bilinear))
 }
 

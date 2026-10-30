@@ -4,6 +4,7 @@
 pub mod add;
 pub mod coco;
 pub mod commit;
+pub mod config;
 pub mod dataset;
 pub mod dates;
 pub mod edits;
@@ -16,6 +17,7 @@ pub mod matching;
 pub mod predictions;
 pub mod project;
 pub mod review;
+pub mod text;
 pub mod versions;
 pub mod yolo;
 

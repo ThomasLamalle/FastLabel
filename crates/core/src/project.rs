@@ -70,7 +70,21 @@ impl Project {
         match versions::latest(&files) {
             Some(v) => Self::open_version(dir, v.clone()),
             None => {
-                let coco = yolo::import(dir)?;
+                let mut coco = yolo::import(dir)?;
+                let classes = crate::config::ProjectConfig::load(dir)?.classes;
+                // A new project: its classes instead of the `object` default.
+                if !classes.is_empty() && coco.annotations.is_empty() {
+                    coco.categories = classes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| crate::coco::CocoCategory {
+                            id: i as i64 + 1,
+                            name: name.clone(),
+                            supercategory: String::new(),
+                            extra: Default::default(),
+                        })
+                        .collect();
+                }
                 Self::from_coco(dir, coco, None)
             }
         }
@@ -704,9 +718,16 @@ mod tests {
         let dir = tmp.path();
         fs::create_dir_all(dir.join("images")).unwrap();
         fs::write(dir.join("images/a.png"), crate::yolo::tests::png_header(20, 10)).unwrap();
+        let cfg = crate::config::ProjectConfig {
+            classes: vec!["car".into(), "truck".into()],
+            ..Default::default()
+        };
+        cfg.save(dir).unwrap();
         let mut p = Project::open(dir).unwrap();
         assert!(p.source.is_none());
         assert!(p.has_unsaved_changes());
+        let names: Vec<_> = p.dataset.categories().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["car", "truck"]);
         let report = p.save().unwrap().unwrap();
         assert_eq!(report.path, dir.join("annotations.v001.json"));
     }

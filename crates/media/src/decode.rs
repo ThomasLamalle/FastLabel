@@ -69,6 +69,35 @@ pub fn resize_batch(jobs: &[(PathBuf, u32, u32)]) -> Vec<Result<Vec<u8>, String>
     })
 }
 
+/// Export cropper ([`fastlabel_core::export::CropFn`]): each frame decoded
+/// once, its regions (clipped to the decoded size) encoded as JPEG at
+/// quality 95, spread over the cores.
+pub fn crop_batch(jobs: &[(PathBuf, Vec<[u32; 4]>)]) -> Vec<Result<Vec<Vec<u8>>, String>> {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let per = jobs.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(per)
+            .map(|c| s.spawn(move || c.iter().map(|(p, r)| crop_file(p, r)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("crop thread")).collect()
+    })
+}
+
+fn crop_file(path: &Path, regions: &[[u32; 4]]) -> Result<Vec<Vec<u8>>, String> {
+    let img = decode_rgb(path).map_err(|e| e.to_string())?;
+    regions
+        .iter()
+        .map(|&[x, y, w, h]| {
+            let r = crate::Region { x, y, w, h }
+                .clip_to(img.width(), img.height())
+                .ok_or("box outside the decoded image")?;
+            let crop = image::imageops::crop_imm(&img, r.x, r.y, r.w, r.h).to_image();
+            encode_jpeg(&crop, 95)
+        })
+        .collect()
+}
+
 fn resize_file(path: &Path, w: u32, h: u32) -> Result<Vec<u8>, String> {
     use fast_image_resize::{PixelType, Resizer, images::Image};
     let img = decode_rgb(path).map_err(|e| e.to_string())?;
@@ -104,6 +133,19 @@ pub(crate) mod tests {
         assert_eq!(back.dimensions(), (64, 48));
         let p = back.get_pixel(30, 20);
         assert!((i32::from(p[0]) - 30).abs() < 6 && (i32::from(p[1]) - 20).abs() < 6, "{p:?}");
+    }
+
+    #[test]
+    fn crop_batch_cuts_clipped_regions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.jpg");
+        std::fs::write(&path, encode_jpeg(&gradient(64, 48), 95).unwrap()).unwrap();
+        let out = crop_batch(&[(path, vec![[10, 5, 20, 8], [60, 40, 10, 10]])]);
+        let crops = out.into_iter().next().unwrap().unwrap();
+        let sizes: Vec<_> = crops.iter().map(|b| decode_bytes(b).unwrap().dimensions()).collect();
+        assert_eq!(sizes, [(20, 8), (4, 8)]);
+        let missing = crop_batch(&[(dir.path().join("none.jpg"), vec![[0, 0, 1, 1]])]);
+        assert!(missing[0].is_err());
     }
 
     #[test]

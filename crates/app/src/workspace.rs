@@ -66,7 +66,6 @@ pub struct Workspace {
 }
 
 pub const RULES_FILE: &str = "rules.md";
-const DEFAULT_RULES: &str = "- Label the whole bib. If occulted, box only the visible part.\n";
 
 /// Frames an op gives a new box to: drawn boxes and newly accepted
 /// predictions (an accept that toggles off adds nothing).
@@ -106,8 +105,8 @@ impl Workspace {
     pub fn open(dir: &Path, opts: ViewOptions, columns: usize) -> anyhow::Result<Self> {
         let project = Project::open(dir)?;
         let uniformity = Uniformity::load(&project.state_dir().join(metrics::METRICS_FILE));
-        let rules = std::fs::read_to_string(project.state_dir().join(RULES_FILE))
-            .unwrap_or_else(|_| DEFAULT_RULES.into());
+        let rules =
+            std::fs::read_to_string(project.state_dir().join(RULES_FILE)).unwrap_or_default();
         let mut ws = Self {
             project,
             eval: None,
@@ -848,7 +847,7 @@ mod tests {
     #[test]
     fn rules_default_then_persist() {
         let (d, mut ws) = open_fixture(2);
-        assert!(ws.rules.contains("Label the whole bib"));
+        assert!(ws.rules.is_empty());
         ws.save_rules().unwrap();
         assert!(!d.path().join(".fastlabel").join(RULES_FILE).exists(), "unchanged: not written");
         ws.rules = "- one rule\n".into();

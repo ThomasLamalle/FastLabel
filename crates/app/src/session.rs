@@ -19,6 +19,8 @@ pub struct Session {
     pub confidence: f64,
     /// ONNX image embedder for cluster mode.
     pub embed_model_path: Option<PathBuf>,
+    /// OCR text recognizer for text projects.
+    pub ocr_model_path: Option<PathBuf>,
     pub min_cluster_size: usize,
     pub export: ExportSettings,
     /// Split given to added images (`None`: no split).
@@ -41,6 +43,7 @@ impl Default for Session {
             model_path: None,
             confidence: 0.1,
             embed_model_path: None,
+            ocr_model_path: None,
             min_cluster_size: 20,
             export: ExportSettings::default(),
             add_split: None,
@@ -66,7 +69,17 @@ pub struct ExportSettings {
     pub imgsz: Option<u32>,
     /// Add yolo26x person boxes (cached per frame) to the export.
     pub persons: bool,
+    /// Crops export: class cropped (name), growth on every side as a share
+    /// of the box height, boxes less tall left out (source pixels).
+    pub crop_class: Option<String>,
+    pub crop_margin: f64,
+    pub crop_min_height: f64,
 }
+
+/// Crop defaults of the bib reading pipeline: 10% of the box height on
+/// every side, and boxes under 26 px high are never read.
+pub const CROP_MARGIN: f64 = 0.1;
+pub const CROP_MIN_HEIGHT: f64 = 26.0;
 
 impl Default for ExportSettings {
     fn default() -> Self {
@@ -76,7 +89,10 @@ impl Default for ExportSettings {
             zip: true,
             resize: false,
             imgsz: None,
-            persons: true,
+            persons: false,
+            crop_class: None,
+            crop_margin: CROP_MARGIN,
+            crop_min_height: CROP_MIN_HEIGHT,
         }
     }
 }

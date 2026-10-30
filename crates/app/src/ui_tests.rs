@@ -928,3 +928,118 @@ fn todo_tab_lists_added_frames_and_confirms_background() {
     h.run_steps(2);
     assert_eq!(h.state().mode, Mode::Mosaic);
 }
+
+/// Text project of 4 crops: OCR readings on the first 3.
+fn text_project(dir: &Path) {
+    use fastlabel_core::text::{TextPrediction, TextPredictions};
+    std::fs::create_dir_all(dir.join("images")).unwrap();
+    let mut csv = String::from("file,bib,split,status\n");
+    for n in 1..=4 {
+        let img = image::RgbImage::from_fn(90, 40, |x, _| image::Rgb([(x * 2) as u8, 200, 30 * n]));
+        std::fs::write(dir.join(format!("images/{n}.jpg")), encode_jpeg(&img, 90).unwrap())
+            .unwrap();
+        csv.push_str(&format!("images/{n}.jpg,,train,todo\n"));
+    }
+    std::fs::write(dir.join("labels.csv"), csv).unwrap();
+    let cfg = fastlabel_core::config::ProjectConfig {
+        kind: fastlabel_core::config::Kind::Text,
+        name: "bibs".into(),
+        text_column: "bib".into(),
+        charset: "0123456789".into(),
+        ..Default::default()
+    };
+    cfg.save(dir).unwrap();
+    let pred = |t: &str| TextPrediction { text: t.into(), score: 0.8, rejected: false };
+    let preds = TextPredictions {
+        model: "ocr.onnx".into(),
+        texts: [("images/1.jpg", "12"), ("images/2.jpg", "34"), ("images/3.jpg", "56")]
+            .into_iter()
+            .map(|(f, t)| (f.to_string(), pred(t)))
+            .collect(),
+    };
+    fastlabel_core::fsutil::write_json_atomic(&dir.join("text_predictions.json"), &preds).unwrap();
+}
+
+#[test]
+fn text_project_triage_typing_and_save() {
+    use fastlabel_core::text::Status;
+    let tmp = tempfile::tempdir().unwrap();
+    text_project(tmp.path());
+    let mut h = harness(tmp.path().to_path_buf(), egui::vec2(1100.0, 700.0));
+    settle(&mut h);
+    assert_eq!(h.state().text.as_ref().unwrap().order.len(), 4);
+    save_shot(&mut h, "40_text_grid.png");
+
+    h.key_press(Key::G); // reading of 1 is right, advance to 2
+    h.key_press(Key::D); // reading of 2 is wrong, advance to 3
+    h.run_steps(2);
+    let t = h.state().text.as_ref().unwrap();
+    assert_eq!(t.project.label(0).text, "12");
+    assert!(t.project.label(1).rejected);
+    assert_eq!(t.selected, 2);
+
+    h.key_press(Key::End);
+    h.key_press(Key::Enter); // type the text of 4
+    h.run_steps(3);
+    assert!(h.state().text.as_ref().unwrap().typing);
+    h.event(egui::Event::Text("7a7".into()));
+    h.run_steps(2);
+    settle(&mut h);
+    save_shot(&mut h, "41_text_typing.png");
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().text.as_ref().unwrap().project.label(3).text, "77");
+    h.key_press(Key::ArrowUp); // back to 3: its reading, Enter on an emptied field = unreadable
+    h.run_steps(2);
+    h.key_press(Key::Backspace);
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().text.as_ref().unwrap().project.label(2).status, Status::Unreadable);
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().text.as_ref().unwrap().typing);
+
+    h.key_press(Key::S);
+    h.run_steps(2);
+    let csv = std::fs::read_to_string(tmp.path().join("labels.csv")).unwrap();
+    assert_eq!(
+        csv,
+        "file,bib,split,status\nimages/1.jpg,12,train,ok\nimages/2.jpg,,train,todo\n\
+         images/3.jpg,,train,unreadable\nimages/4.jpg,77,train,ok\n"
+    );
+    let preds = std::fs::read_to_string(tmp.path().join("text_predictions.json")).unwrap();
+    assert!(preds.contains("\"rejected\": true"));
+}
+
+/// Opt-in: reads a text project (e.g. a crops export) with a real OCR model
+/// through the app. `FASTLABEL_TEXT_DATASET=<copy> FASTLABEL_OCR_MODEL=<rec.onnx>
+/// FASTLABEL_SHOT_DIR=<out> cargo test -p fastlabel ocr_on_crops -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn ocr_on_crops() {
+    let dataset =
+        PathBuf::from(std::env::var("FASTLABEL_TEXT_DATASET").expect("FASTLABEL_TEXT_DATASET"));
+    let model = PathBuf::from(std::env::var("FASTLABEL_OCR_MODEL").expect("FASTLABEL_OCR_MODEL"));
+    let mut h = harness(dataset, egui::vec2(1500.0, 950.0));
+    settle(&mut h);
+    let ctx = h.ctx.clone();
+    h.state_mut().text.as_mut().unwrap().project.config.charset = "0123456789".into();
+    let start = std::time::Instant::now();
+    h.state_mut().text.as_mut().unwrap().start_ocr(&ctx, model);
+    while h.state().text.as_ref().unwrap().ocr.is_some() {
+        h.step();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let t = h.state().text.as_ref().unwrap();
+    let n = t.project.predictions.texts.len();
+    let read = t.project.predictions.texts.values().filter(|p| !p.text.is_empty()).count();
+    println!("{n} crops read in {:?}, {read} with digits", start.elapsed());
+    assert!(read * 2 > n, "most crops give digits");
+    settle(&mut h);
+    save_shot(&mut h, "ocr_01_grid.png");
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    settle(&mut h);
+    save_shot(&mut h, "ocr_02_typing.png");
+}

@@ -16,8 +16,10 @@ use crate::inference::{Inference, Scope};
 use crate::mosaic::{self, MosaicEvent, MosaicState};
 use crate::session::Session;
 use crate::tasks::Task;
+use crate::text_view::TextView;
 use crate::thumbs::Thumbs;
 use crate::workspace::{Mark, Workspace};
+use fastlabel_core::config::{Kind, ProjectConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -62,6 +64,9 @@ struct Status {
 /// What a file dialog picks.
 enum Pick {
     Open,
+    /// Folder of a new project (the New project dialog's settings).
+    NewProject,
+    OcrModel,
     ExportZip,
     ExportFolder,
     Add,
@@ -78,10 +83,38 @@ fn pick_detector() -> Vec<PathBuf> {
     dialog.pick_file().into_iter().collect()
 }
 
+/// New project dialog.
+struct NewProject {
+    config: ProjectConfig,
+    /// Box classes, comma separated.
+    classes: String,
+    rules: String,
+}
+
+impl Default for NewProject {
+    fn default() -> Self {
+        Self {
+            config: ProjectConfig::default(),
+            classes: String::new(),
+            rules: "- Box the whole object. If occluded, box only the visible part.\n".into(),
+        }
+    }
+}
+
+/// Project settings dialog: the config and the rules being edited.
+struct ProjectSettings {
+    config: ProjectConfig,
+    rules: String,
+}
+
 pub struct FastLabelApp {
     session: Session,
     session_path: Option<PathBuf>,
     ws: Option<Workspace>,
+    /// Open text project (then `ws` is `None`).
+    pub(crate) text: Option<TextView>,
+    new_project: Option<NewProject>,
+    project_settings: Option<ProjectSettings>,
     thumbs: Option<Thumbs>,
     mosaic: MosaicState,
     pub(crate) mode: Mode,
@@ -140,6 +173,9 @@ impl FastLabelApp {
             session,
             session_path,
             ws: None,
+            text: None,
+            new_project: None,
+            project_settings: None,
             thumbs: None,
             mosaic: MosaicState::default(),
             mode: Mode::Mosaic,
@@ -211,6 +247,13 @@ impl FastLabelApp {
     }
 
     fn open(&mut self, ctx: &egui::Context, dir: &Path, restore_selection: bool) {
+        let kind = match ProjectConfig::load(dir) {
+            Ok(c) => c.kind,
+            Err(e) => return self.error(format!("Cannot open {}: {e}", dir.display())),
+        };
+        if kind == Kind::Text {
+            return self.open_text(ctx, dir);
+        }
         let s = &self.session;
         match Workspace::open(dir, s.view.clone(), s.columns) {
             Ok(mut ws) => {
@@ -237,6 +280,7 @@ impl FastLabelApp {
                     tracing::warn!("rules not saved: {e:#}");
                 }
                 self.ws = Some(ws);
+                self.text = None;
                 self.cluster = ClusterView::default();
                 self.cluster.min_cluster_size = self.session.min_cluster_size;
                 self.embeddings = None;
@@ -254,6 +298,394 @@ impl FastLabelApp {
                 }
             }
             Err(e) => self.error(format!("Cannot open {}: {e:#}", dir.display())),
+        }
+    }
+
+    fn open_text(&mut self, ctx: &egui::Context, dir: &Path) {
+        if self.text.as_ref().is_some_and(|t| t.ocr.is_some()) {
+            return self
+                .error("Wait for the OCR run to finish (or cancel it) before switching projects");
+        }
+        // Pending edits of the current project stay in its journal.
+        match TextView::open(dir, self.session.columns) {
+            Ok(view) => {
+                let p = &view.project;
+                let budget = self.session.texture_budget_mb * 1024 * 1024;
+                let cache =
+                    p.dir.join(fastlabel_core::project::STATE_DIR).join("cache").join("thumbs");
+                self.thumbs = Some(Thumbs::new(ctx, cache, budget));
+                let mut msg =
+                    format!("Opened text project {} ({} images)", p.config.name, p.rows.len());
+                if !p.warnings.is_empty() {
+                    msg.push_str(&format!(" — {}", p.warnings.join(" · ")));
+                }
+                if let Some(old) = &mut self.ws
+                    && let Err(e) = old.save_rules()
+                {
+                    tracing::warn!("rules not saved: {e:#}");
+                }
+                self.session.last_dataset = Some(dir.to_path_buf());
+                self.ws = None;
+                self.text = Some(view);
+                self.mode = Mode::Mosaic;
+                self.popup = false;
+                self.info(msg);
+            }
+            Err(e) => self.error(format!("Cannot open {}: {e:#}", dir.display())),
+        }
+    }
+
+    /// Creates the project of the New project dialog in `dir`, then opens it.
+    fn create_project(&mut self, ctx: &egui::Context, dir: &Path) {
+        let Some(np) = self.new_project.take() else { return };
+        let taken = dir
+            .join(fastlabel_core::project::STATE_DIR)
+            .join(fastlabel_core::config::CONFIG_FILE)
+            .exists()
+            || dir.join(fastlabel_core::text::LABELS_FILE).exists()
+            || fastlabel_core::versions::discover(dir).is_ok_and(|v| !v.is_empty());
+        if taken {
+            self.new_project = Some(np);
+            return self.error(format!(
+                "{} is already a project: open it with Project → Open…",
+                dir.display()
+            ));
+        }
+        let mut cfg = np.config.clone();
+        if cfg.name.trim().is_empty() {
+            cfg.name =
+                dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        }
+        cfg.classes = match cfg.kind {
+            Kind::Boxes => np
+                .classes
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(String::from)
+                .collect(),
+            Kind::Text => Vec::new(),
+        };
+        let state = dir.join(fastlabel_core::project::STATE_DIR);
+        let result = (|| -> anyhow::Result<()> {
+            if !np.rules.trim().is_empty() {
+                std::fs::create_dir_all(&state)?;
+                std::fs::write(state.join(crate::workspace::RULES_FILE), &np.rules)?;
+            }
+            match cfg.kind {
+                Kind::Boxes => cfg.save(dir)?,
+                Kind::Text => drop(fastlabel_core::text::TextProject::create(dir, &cfg)?),
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.open(ctx, dir, false),
+            Err(e) => self.error(format!("Cannot create the project in {}: {e:#}", dir.display())),
+        }
+    }
+
+    /// New project: kind, name, classes or text column, rules.
+    fn new_project_dialog(&mut self, ctx: &egui::Context) {
+        let Some(np) = &mut self.new_project else { return };
+        let (mut create, mut close) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("new-project")).show(ctx, |ui| {
+            ui.set_width(480.0);
+            ui.heading("New project");
+            ui.label(RichText::new("Pick the folder of its images next (images/ inside it, or the images themselves).").weak());
+            ui.add_space(6.0);
+            egui::Grid::new("new-project-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                ui.label("Name");
+                ui.add(egui::TextEdit::singleline(&mut np.config.name).hint_text("the folder name"));
+                ui.end_row();
+                ui.label("Annotation");
+                ui.vertical(|ui| {
+                    for k in Kind::ALL {
+                        ui.radio_value(&mut np.config.kind, k, k.label());
+                    }
+                });
+                ui.end_row();
+                match np.config.kind {
+                    Kind::Boxes => {
+                        ui.label("Classes");
+                        ui.add(egui::TextEdit::singleline(&mut np.classes).hint_text("bib, person"))
+                            .on_hover_text("Comma separated; keys 1-9 pick them in the frame editor");
+                        ui.end_row();
+                    }
+                    Kind::Text => {
+                        ui.label("Text name");
+                        ui.add(egui::TextEdit::singleline(&mut np.config.text_column).hint_text("bib"))
+                            .on_hover_text("The labels.csv column holding the text");
+                        ui.end_row();
+                        ui.label("Allowed characters");
+                        ui.add(egui::TextEdit::singleline(&mut np.config.charset).hint_text("any, e.g. 0123456789"))
+                            .on_hover_text("Typing ignores other characters; an OCR reading keeps its longest run of them");
+                        ui.end_row();
+                    }
+                }
+                ui.label("Labeling rules");
+                ui.add(egui::TextEdit::multiline(&mut np.rules).desired_rows(3));
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let ok = match np.config.kind {
+                    Kind::Boxes => np.classes.split(',').any(|c| !c.trim().is_empty()),
+                    Kind::Text => !fastlabel_core::config::reserved(&np.config.text_column),
+                };
+                create = ui.add_enabled(ok, egui::Button::new("Choose the folder and create…")).clicked();
+                close = ui.button("Cancel").clicked();
+            });
+        });
+        if close || modal.should_close() {
+            self.new_project = None;
+        } else if create {
+            let start = self
+                .session
+                .last_dataset
+                .clone()
+                .and_then(|d| d.parent().map(Path::to_path_buf))
+                .unwrap_or_default();
+            self.pick(ctx, Pick::NewProject, move || {
+                rfd::FileDialog::new()
+                    .set_title("Folder of the new project")
+                    .set_directory(start)
+                    .pick_folder()
+                    .into_iter()
+                    .collect()
+            });
+        }
+    }
+
+    fn open_project_settings(&mut self) {
+        let dir = match (&self.ws, &self.text) {
+            (Some(ws), _) => ws.project.dir.clone(),
+            (_, Some(t)) => t.project.dir.clone(),
+            _ => return,
+        };
+        match ProjectConfig::load(&dir) {
+            Ok(config) => {
+                let rules = self.text.as_ref().map(|t| t.rules.clone()).unwrap_or_default();
+                self.project_settings = Some(ProjectSettings { config, rules });
+            }
+            Err(e) => self.error(format!("Cannot read the project settings: {e}")),
+        }
+    }
+
+    fn project_settings_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ps) = &mut self.project_settings else { return };
+        let classes: Vec<String> = self
+            .ws
+            .as_ref()
+            .map(|ws| ws.project.dataset.categories().iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        let (mut apply, mut close) = (false, false);
+        let modal = egui::Modal::new(egui::Id::new("project-settings")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Project settings");
+            egui::Grid::new("project-settings-grid").num_columns(2).spacing([10.0, 8.0]).show(
+                ui,
+                |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut ps.config.name);
+                    ui.end_row();
+                    ui.label("Annotation");
+                    ui.label(ps.config.kind.label());
+                    ui.end_row();
+                    match ps.config.kind {
+                        Kind::Boxes => {
+                            ui.label("Classes");
+                            ui.label(classes.join(", "))
+                                .on_hover_text("The dataset's categories (fixed at creation)");
+                            ui.end_row();
+                        }
+                        Kind::Text => {
+                            ui.label("Text name");
+                            ui.label(&ps.config.text_column)
+                                .on_hover_text("The labels.csv column (fixed at creation)");
+                            ui.end_row();
+                            ui.label("Allowed characters");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ps.config.charset).hint_text("any"),
+                            );
+                            ui.end_row();
+                            ui.label("Labeling rules");
+                            ui.add(egui::TextEdit::multiline(&mut ps.rules).desired_rows(3));
+                            ui.end_row();
+                        }
+                    }
+                },
+            );
+            if ps.config.kind == Kind::Boxes {
+                ui.label(RichText::new("Labeling rules: Rules tab.").weak());
+            }
+            ui.horizontal(|ui| {
+                apply = ui.button("Save").clicked();
+                close = ui.button("Cancel").clicked();
+            });
+        });
+        if close || modal.should_close() {
+            self.project_settings = None;
+        }
+        if !apply {
+            return;
+        }
+        let Some(ps) = self.project_settings.take() else { return };
+        let dir = match (&self.ws, &self.text) {
+            (Some(ws), _) => ws.project.dir.clone(),
+            (_, Some(t)) => t.project.dir.clone(),
+            _ => return,
+        };
+        let result = (|| -> anyhow::Result<()> {
+            ps.config.save(&dir)?;
+            if let Some(t) = &mut self.text {
+                let path =
+                    dir.join(fastlabel_core::project::STATE_DIR).join(crate::workspace::RULES_FILE);
+                fastlabel_core::fsutil::write_atomic(&path, |w| {
+                    std::io::Write::write_all(w, ps.rules.as_bytes())
+                        .map_err(|e| fastlabel_core::Error::io(&path, e))
+                })?;
+                t.rules = ps.rules.clone();
+                t.project.config = ps.config.clone();
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.info("Project settings saved"),
+            Err(e) => self.error(format!("Project settings not saved: {e:#}")),
+        }
+    }
+
+    fn project_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.menu_button("📂 Project", |ui| {
+            if ui
+                .button("New project…")
+                .on_hover_text("Boxes or text (OCR) annotation, with its classes or text name")
+                .clicked()
+            {
+                self.new_project = Some(NewProject::default());
+                ui.close();
+            }
+            if ui
+                .button("Open… (Ctrl+O)")
+                .on_hover_text("A project folder, a COCO / YOLO dataset or a folder of images")
+                .clicked()
+            {
+                self.pick_and_open(&ctx);
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    self.ws.is_some() || self.text.is_some(),
+                    egui::Button::new("Settings…"),
+                )
+                .clicked()
+            {
+                self.open_project_settings();
+                ui.close();
+            }
+        });
+    }
+
+    /// Toolbar of a text project.
+    fn text_toolbar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Some(t) = &mut self.text else { return };
+        let pending = t.project.unsaved();
+        let save = if t.project.has_unsaved_changes() {
+            egui::Button::new(
+                RichText::new(format!("💾 Save (S): {pending} unsaved")).color(PENDING_COLOR),
+            )
+        } else {
+            egui::Button::new("💾 Save (S)")
+        };
+        let mut status = None;
+        if ui
+            .add(save)
+            .on_hover_text("Writes labels.csv (the previous one goes to .fastlabel/history/)")
+            .clicked()
+        {
+            t.save_requested = true;
+        }
+        if ui
+            .add_enabled(t.project.can_undo(), egui::Button::new("Undo"))
+            .on_hover_text("Undo (U, Ctrl+Z)")
+            .clicked()
+        {
+            status = t.undo(false).err();
+        }
+        if ui
+            .add_enabled(t.project.can_redo(), egui::Button::new("Redo"))
+            .on_hover_text("Redo (Ctrl+Shift+Z)")
+            .clicked()
+        {
+            status = t.undo(true).err();
+        }
+        ui.separator();
+        let label = if t.typing { "Grid (Esc)" } else { "Type (Enter)" };
+        if ui.button(label).clicked() {
+            if t.typing { t.typing = false } else { t.start_typing() }
+        }
+        ui.separator();
+        let model = self.session.ocr_model_path.clone();
+        let running = t.ocr.is_some();
+        ui.menu_button("OCR", |ui| {
+            let name = model
+                .as_ref()
+                .and_then(|m| m.file_name())
+                .map_or("none".into(), |n| n.to_string_lossy().into_owned());
+            ui.label(format!("Model: {name}"));
+            if ui
+                .button("Choose model…")
+                .on_hover_text("PaddleOCR text recognizer in ONNX (e.g. PP-OCRv6_rec_small.onnx)")
+                .clicked()
+            {
+                self.pick(&ctx, Pick::OcrModel, || {
+                    rfd::FileDialog::new()
+                        .add_filter("ONNX model", &["onnx"])
+                        .pick_file()
+                        .into_iter()
+                        .collect()
+                });
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    model.is_some() && !running,
+                    egui::Button::new("Read the images to do"),
+                )
+                .on_hover_text(
+                    "Pseudo labels to accept (G) or reject (D); readings of other images are kept",
+                )
+                .clicked()
+            {
+                if let (Some(t), Some(m)) = (&mut self.text, model.clone()) {
+                    t.start_ocr(&ctx, m);
+                }
+                ui.close();
+            }
+        });
+        if let Some(e) = status {
+            self.error(e);
+        }
+    }
+
+    fn save_text(&mut self) -> bool {
+        let Some(t) = &mut self.text else { return true };
+        match t.project.save() {
+            Ok(Some(path)) => {
+                t.refresh();
+                self.info(format!("Saved {}", path.display()));
+                true
+            }
+            Ok(None) => {
+                self.info("Nothing to save");
+                true
+            }
+            Err(e) => {
+                self.error(format!("Save failed, nothing was lost (edits are journaled): {e}"));
+                false
+            }
         }
     }
 
@@ -290,6 +722,8 @@ impl FastLabelApp {
         match what {
             // Pending edits of the current dataset stay in its journal.
             Pick::Open => self.open(ctx, &first, false),
+            Pick::NewProject => self.create_project(ctx, &first),
+            Pick::OcrModel => self.session.ocr_model_path = Some(first),
             Pick::ExportZip => self.finish_export(ctx, fastlabel_core::export::Target::Zip(first)),
             Pick::ExportFolder => {
                 let out = first.join(self.export_name().1);
@@ -310,6 +744,9 @@ impl FastLabelApp {
         if self.inference.is_running() {
             self.error("Wait for the model run to finish (or cancel it) before saving");
             return false;
+        }
+        if self.text.is_some() {
+            return self.save_text();
         }
         let Some(ws) = &mut self.ws else { return true };
         match ws.save() {
@@ -525,7 +962,8 @@ impl FastLabelApp {
     fn finish_export(&mut self, ctx: &egui::Context, target: fastlabel_core::export::Target) {
         let Some(ws) = &self.ws else { return };
         let p = &ws.project;
-        if !self.session.export.persons {
+        let crops = self.session.export.format == fastlabel_core::export::ExportFormat::Crops;
+        if crops || !self.session.export.persons {
             let coco = p.dataset.coco.clone();
             return self.run_export(ctx, target, coco);
         }
@@ -558,12 +996,23 @@ impl FastLabelApp {
             max_side,
             resize: fastlabel_media::decode::resize_batch,
         });
+        let e = &self.session.export;
+        let crops = (e.format == fastlabel_core::export::ExportFormat::Crops).then(|| {
+            fastlabel_core::export::CropOptions {
+                category: crop_category(ws, e.crop_class.as_deref()),
+                margin: e.crop_margin,
+                crop: fastlabel_media::decode::crop_batch,
+            }
+        });
+        let min_box_height =
+            if crops.is_some() { e.crop_min_height } else { self.session.min_box_height };
         let opts = ExportOptions {
-            format: self.session.export.format,
+            format: e.format,
             splits,
             name: self.export_name().0,
-            resize,
-            min_box_height: self.session.min_box_height,
+            resize: if crops.is_some() { None } else { resize },
+            min_box_height,
+            crops,
         };
         let root = p.dir.clone();
         self.export_task = Some(Task::spawn("export", ctx, move |progress| {
@@ -689,9 +1138,40 @@ impl FastLabelApp {
                 ui.radio_value(&mut s.zip, true, "Zip file");
                 ui.radio_value(&mut s.zip, false, "Folder (images hardlinked)");
             });
+            let crops = s.format == ExportFormat::Crops;
+            if crops {
+                ui.add_space(6.0);
+                let names: Vec<String> = ws.project.dataset.categories().iter().map(|c| c.name.clone()).collect();
+                let class = s.crop_class.clone().filter(|c| names.contains(c)).or_else(|| names.first().cloned());
+                ui.horizontal(|ui| {
+                    ui.label("Class");
+                    egui::ComboBox::from_id_salt("crop-class").selected_text(class.clone().unwrap_or_default()).show_ui(ui, |ui| {
+                        for n in &names {
+                            if ui.selectable_label(class.as_ref() == Some(n), n).clicked() {
+                                s.crop_class = Some(n.clone());
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Margin (share of the box height, each side)");
+                    ui.add(egui::DragValue::new(&mut s.crop_margin).range(0.0..=1.0).speed(0.01));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Skip boxes under (px high)");
+                    ui.add(egui::DragValue::new(&mut s.crop_min_height).range(0.0..=1000.0).speed(0.5));
+                });
+                ui.label(
+                    RichText::new(
+                        "Writes images/<box id>.jpg and labels.csv (file, text, split, status): a text project to \
+                         open in FastLabel and annotate with an OCR. Defaults match the bib reading pipeline.",
+                    )
+                    .weak(),
+                );
+            }
             ui.add_space(6.0);
             let suggested = format!("{} (report suggestion)", self.export_suggested_imgsz);
-            ui.horizontal(|ui| {
+            ui.add_enabled_ui(!crops, |ui| ui.horizontal(|ui| {
                 ui.checkbox(&mut s.resize, "Downscale images to a long side of");
                 ui.add_enabled_ui(s.resize, |ui| {
                     let text = s.imgsz.map_or(suggested.clone(), |v| v.to_string());
@@ -705,14 +1185,14 @@ impl FastLabelApp {
                         },
                     );
                 });
-            });
-            if s.resize {
+            }));
+            if s.resize && !crops {
                 ui.label(
                     RichText::new("Smaller images are kept as is; labels follow. Training then skips decoding full frames every epoch.")
                         .weak(),
                 );
             }
-            if self.session.min_box_height > 0.0 {
+            if self.session.min_box_height > 0.0 && !crops {
                 ui.label(
                     RichText::new(format!(
                         "Boxes under {} px high are left out (Settings).",
@@ -722,7 +1202,7 @@ impl FastLabelApp {
                 );
             }
             ui.add_space(6.0);
-            ui.checkbox(&mut s.persons, "Add person boxes (yolo26x)").on_hover_text(format!(
+            ui.add_enabled(!crops, egui::Checkbox::new(&mut s.persons, "Add person boxes (yolo26x)")).on_hover_text(format!(
                 "Detects people (score ≥ {}) on the exported frames and adds them as a \"{}\" class \
                  in the export only. Results are cached per frame; the first run on a frame takes \
                  a few seconds on the CPU.",
@@ -971,7 +1451,29 @@ impl FastLabelApp {
     }
 
     fn handle_key(&mut self, ctx: &egui::Context, key: Key, repeat: bool, m: Modifiers) {
-        if self.export_dialog {
+        if self.export_dialog || self.new_project.is_some() || self.project_settings.is_some() {
+            return;
+        }
+        if let Some(t) = &mut self.text {
+            let plain = !m.command && !m.alt;
+            let result = match key {
+                Key::O if m.command => return self.pick_and_open(ctx),
+                Key::S if plain && !repeat => {
+                    self.save();
+                    return;
+                }
+                Key::Q if plain && !repeat => {
+                    if self.save() {
+                        self.exit_ok = true;
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                    return;
+                }
+                _ => t.key(key, m),
+            };
+            if let Some(Err(e)) = result {
+                self.error(e);
+            }
             return;
         }
         if self.ws.is_none() {
@@ -2015,8 +2517,9 @@ impl FastLabelApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal_wrapped(|ui| {
-            if ui.button("📂 Open…").on_hover_text("Open a dataset folder (Ctrl+O)").clicked() {
-                self.pick_and_open(&ctx);
+            self.project_menu(ui);
+            if self.text.is_some() {
+                return self.text_toolbar(ui);
             }
             let has_ws = self.ws.is_some();
             let (pending, breakdown) = self.ws.as_ref().map_or((0, String::new()), pending_summary);
@@ -2331,6 +2834,22 @@ impl FastLabelApp {
                     ui.spinner();
                 }
             }
+            if let Some(t) = &self.text {
+                ui.label(format!("{} images", t.project.rows.len()));
+                if self.thumbs_busy() > 0 {
+                    ui.separator();
+                    ui.spinner();
+                }
+                if let Some(task) = &t.ocr {
+                    let (done, total) = task.progress();
+                    ui.separator();
+                    let frac = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                    ui.add(egui::ProgressBar::new(frac).text(format!("OCR {done}/{total}")).desired_width(200.0));
+                    if ui.button("Cancel").clicked() {
+                        task.cancel();
+                    }
+                }
+            }
             if let Some((scope, done, total)) = self.inference.progress() {
                 ui.separator();
                 let label = match scope {
@@ -2435,7 +2954,16 @@ impl eframe::App for FastLabelApp {
         self.poll_cluster_tasks(&ctx);
         self.poll_add();
         self.poll_pick(&ctx);
+        if let Some(msg) = self.text.as_mut().and_then(|t| t.poll_ocr()) {
+            match msg {
+                Ok(m) => self.info(m),
+                Err(e) => self.error(e),
+            }
+        }
         self.handle_keys(&ctx);
+        if self.text.as_mut().is_some_and(|t| std::mem::take(&mut t.save_requested)) {
+            self.save();
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(ui);
@@ -2448,14 +2976,29 @@ impl eframe::App for FastLabelApp {
         if self.ws.is_some() && matches!(self.mode, Mode::Mosaic | Mode::Todo | Mode::Cluster) {
             egui::Panel::top("view-bar").show(ui, |ui| self.view_bar(ui));
         }
+        if let Some(t) = &mut self.text {
+            egui::Panel::top("view-bar").show(ui, |ui| t.view_bar(ui));
+        }
         egui::Panel::bottom("status").show(ui, |ui| self.status_line(ui));
+        self.new_project_dialog(&ctx);
+        self.project_settings_dialog(&ctx);
         let mut central = egui::Rect::NOTHING;
         egui::CentralPanel::default().show(ui, |ui| {
             central = ui.max_rect();
+            if let (Some(t), Some(thumbs)) = (&mut self.text, &mut self.thumbs) {
+                if let Err(e) = t.show(ui, thumbs) {
+                    self.status = Some(Status { text: e, error: true, at: Instant::now() });
+                }
+                return;
+            }
             if self.ws.is_none() {
-                ui.centered_and_justified(|ui| {
-                    if ui.button("Open a dataset folder (Ctrl+O)").clicked() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 3.0);
+                    if ui.button("Open a project or dataset folder (Ctrl+O)").clicked() {
                         self.pick_and_open(&ctx);
+                    }
+                    if ui.button("New project…").clicked() {
+                        self.new_project = Some(NewProject::default());
                     }
                 });
                 return;
@@ -2562,6 +3105,12 @@ impl eframe::App for FastLabelApp {
 }
 
 const PENDING_COLOR: Color32 = Color32::from_rgb(245, 150, 30);
+
+/// The category cropped by a crops export: `class` by name, else the first.
+fn crop_category(ws: &Workspace, class: Option<&str>) -> fastlabel_core::CategoryId {
+    let cats = ws.project.dataset.categories();
+    class.and_then(|n| cats.iter().find(|c| c.name == n)).or(cats.first()).map_or(1, |c| c.id)
+}
 
 /// Unsaved changes: their number and one line per kind.
 fn pending_summary(ws: &Workspace) -> (usize, String) {
