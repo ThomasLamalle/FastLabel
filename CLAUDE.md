@@ -28,3 +28,8 @@ Rust rebuild of a bounding-box annotation triage tool. Functional source of trut
 - Never run the app or opt-in tests on `../Datasets/...` directly: use the hardlinked copy in `target/test-data/v1_exp0` (saves create versions, F moves images to trash). Model: `~/Downloads/exp-10.onnx` (YOLO26s, raw head, 1280 input, FP16 weights, NMS needed).
 - egui is 0.36: `App::ui(&mut self, ui, frame)`, `egui::Panel::top(..).show(ui, ..)`. Check APIs in `~/.cargo/registry/src/*/egui-0.36*` rather than guessing.
 - Machine: 12 cores, 5 GB RAM, no GPU. Keep memory bounded.
+
+<!-- claude-reflect: learned rules (saved from the band; edit freely) -->
+## Learned rules
+- In the FastLabel repo, commit changes automatically once implementation is finished, without asking first.
+<!-- end claude-reflect -->
